@@ -84,7 +84,7 @@ public final class ClientStructureInteraction {
         // While the attack key is held, keep vanilla block breaking suppressed
         // (otherwise the real block behind a structure would be mined), but only
         // send a structure edit on the initial click.
-        if (clickCount != 0) {
+        if (clickCount == 0) {
             send(player, structureTarget ? StructureAction.MINE : StructureAction.SHOVEL_WATER);
         }
         return true;

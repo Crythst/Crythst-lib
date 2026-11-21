@@ -110,13 +110,13 @@ public record Aabb(Vector3d min, Vector3d max) {
                     (i & 2) == 0 ? min.y : max.y,
                     (i & 4) == 0 ? min.z : max.z
             );
-            transform.transformPoint(corner);
-            minX = Math.min(minX, corner.x);
-            minY = Math.min(minY, corner.y);
-            minZ = Math.min(minZ, corner.z);
-            maxX = Math.max(maxX, corner.x);
-            maxY = Math.max(maxY, corner.y);
-            maxZ = Math.max(maxZ, corner.z);
+            final Vector3d transformed = transform.transformPoint(corner);
+            minX = Math.min(minX, transformed.x);
+            minY = Math.min(minY, transformed.y);
+            minZ = Math.min(minZ, transformed.z);
+            maxX = Math.max(maxX, transformed.x);
+            maxY = Math.max(maxY, transformed.y);
+            maxZ = Math.max(maxZ, transformed.z);
         }
 
         return new Aabb(new Vector3d(minX, minY, minZ), new Vector3d(maxX, maxY, maxZ));
