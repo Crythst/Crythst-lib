@@ -2,6 +2,7 @@ package io.mikaple.crythst.client.render.structure.batch;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
+import io.mikaple.crythst.client.render.light.StructureLightOccluder;
 import io.mikaple.crythst.math.Transform3d;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.resources.ResourceKey;
@@ -167,7 +168,8 @@ final class StructureBatchCache {
             }
 
             final SectionMesh[] meshes = SectionMesh.build(
-                    section.states, section.sizeX, section.sizeY, section.sizeZ);
+                    section.states, section.sizeX, section.sizeY, section.sizeZ,
+                    section.originX, section.originY, section.originZ, body);
             section.install(meshes);
             built += required;
         }
@@ -226,6 +228,16 @@ final class StructureBatchCache {
             }
         }
         return count;
+    }
+
+    /**
+     * Returns the current solid-occupancy mask for a cached body. Used by the
+     * public renderer API so other systems can later share the same occlusion
+     * data without touching the mesh caches.
+     */
+    static StructureLightOccluder occluder(ResourceKey<Level> dimension, long bodyId) {
+        final Body body = BODIES.get(new BodyKey(dimension, bodyId));
+        return body == null ? StructureLightOccluder.EMPTY : body.occluder;
     }
 
     static long vertexCount() {
@@ -294,7 +306,7 @@ final class StructureBatchCache {
     /**
      * One structure body's section grid.
      */
-    static final class Body {
+    static final class Body implements StructureVoxelView {
         final BodyKey key;
         final int minX;
         final int minY;
@@ -302,11 +314,15 @@ final class StructureBatchCache {
         final int sizeX;
         final int sizeY;
         final int sizeZ;
+        final int sectionsX;
+        final int sectionsY;
+        final int sectionsZ;
         final double blockScale;
         final long generation;
         final Section[] sections;
 
         StructureBatchSnapshots.Snapshot snapshot;
+        StructureLightOccluder occluder = StructureLightOccluder.EMPTY;
         long contentRevision;
         long lastSeenNanos;
         long vertexCount;
@@ -321,7 +337,8 @@ final class StructureBatchCache {
 
         private Body(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
                      Transform3d pose, double blockScale,
-                     long generation, Section[] sections) {
+                     long generation, Section[] sections,
+                     int sectionsX, int sectionsY, int sectionsZ) {
             this.key = key;
             this.snapshot = snapshot;
             this.contentRevision = snapshot.contentRevision();
@@ -331,6 +348,9 @@ final class StructureBatchCache {
             this.sizeX = snapshot.sizeX();
             this.sizeY = snapshot.sizeY();
             this.sizeZ = snapshot.sizeZ();
+            this.sectionsX = sectionsX;
+            this.sectionsY = sectionsY;
+            this.sectionsZ = sectionsZ;
             this.blockScale = blockScale;
             this.generation = generation;
             this.sections = sections;
@@ -366,11 +386,60 @@ final class StructureBatchCache {
             }
 
             final Body body = new Body(key, snapshot, pose, blockScale,
-                    generation, sections.toArray(Section[]::new));
+                    generation, sections.toArray(Section[]::new),
+                    sectionsX, sectionsY, sectionsZ);
             for (Section section : body.sections) {
                 section.body = body;
             }
+            body.rebuildOccluder();
             return body;
+        }
+
+        /**
+         * Rebuilds the solid-occupancy mask from the current section states.
+         * The mask is the shared source of truth for face culling and AO, and
+         * is exposed for future entity/light-engine consumers.
+         */
+        void rebuildOccluder() {
+            final StructureLightOccluder.Builder builder =
+                    StructureLightOccluder.builder(minX, minY, minZ, sizeX, sizeY, sizeZ);
+            for (Section section : sections) {
+                final int layerStride = section.sizeX * section.sizeZ;
+                for (int index = 0; index < section.states.length; index++) {
+                    final BlockState state = section.states[index];
+                    if (state == null || state.isAir() || !state.canOcclude()) {
+                        continue;
+                    }
+                    final int x = index % section.sizeX;
+                    final int z = (index / section.sizeX) % section.sizeZ;
+                    final int y = index / layerStride;
+                    builder.setSolid(section.originX + x, section.originY + y,
+                            section.originZ + z, true);
+                }
+            }
+            occluder = builder.build();
+        }
+
+        @Override
+        public boolean isOccluded(int x, int y, int z) {
+            return occluder.isSolid(x, y, z);
+        }
+
+        @Override
+        public BlockState stateAt(int x, int y, int z) {
+            if (x < minX || y < minY || z < minZ
+                    || x >= minX + sizeX || y >= minY + sizeY || z >= minZ + sizeZ) {
+                return null;
+            }
+            final int sectionX = (x - minX) / SECTION_SIZE;
+            final int sectionY = (y - minY) / SECTION_SIZE;
+            final int sectionZ = (z - minZ) / SECTION_SIZE;
+            final Section section = sections[(sectionY * sectionsZ + sectionZ) * sectionsX + sectionX];
+            final int localX = x - section.originX;
+            final int localY = y - section.originY;
+            final int localZ = z - section.originZ;
+            final int index = (localY * section.sizeZ + localZ) * section.sizeX + localX;
+            return section.states[index];
         }
 
         boolean matches(StructureBatchSnapshots.Snapshot snapshot,
@@ -402,8 +471,61 @@ final class StructureBatchCache {
             }
             this.snapshot = snapshot;
             this.contentRevision = snapshot.contentRevision();
+
+            int[] changed = null;
+            int changedCount = 0;
+            for (int i = 0; i < sections.length; i++) {
+                if (!sections[i].refresh(snapshot)) {
+                    continue;
+                }
+                if (changed == null) {
+                    changed = new int[Math.min(16, sections.length)];
+                } else if (changedCount == changed.length) {
+                    changed = Arrays.copyOf(changed, Math.min(sections.length, changedCount * 2));
+                }
+                changed[changedCount++] = i;
+            }
+            if (changedCount == 0) {
+                return;
+            }
+
+            rebuildOccluder();
+            // Culling and AO read one cell across a section border, so a
+            // changed border block also invalidates its neighbours. For a
+            // large simultaneous edit, rebuilding everything is cheaper than
+            // testing every changed section against every section.
+            if (changedCount > 16) {
+                for (Section section : sections) {
+                    section.markDirty();
+                }
+                return;
+            }
+            for (int i = 0; i < changedCount; i++) {
+                markNeighboursDirty(sections[changed[i]]);
+            }
+        }
+
+        /**
+         * Marks all sections whose voxel range is within one cell of the source
+         * section (including the source itself).
+         */
+        private void markNeighboursDirty(Section source) {
+            final int minBlockX = source.originX - 1;
+            final int minBlockY = source.originY - 1;
+            final int minBlockZ = source.originZ - 1;
+            final int maxBlockX = source.originX + source.sizeX;
+            final int maxBlockY = source.originY + source.sizeY;
+            final int maxBlockZ = source.originZ + source.sizeZ;
             for (Section section : sections) {
-                section.refresh(snapshot);
+                if (section.originX > maxBlockX
+                        || section.originY > maxBlockY
+                        || section.originZ > maxBlockZ
+                        || section.originX + section.sizeX <= minBlockX
+                        || section.originY + section.sizeY <= minBlockY
+                        || section.originZ + section.sizeZ <= minBlockZ) {
+                    continue;
+                }
+                section.markDirty();
             }
         }
 
@@ -501,7 +623,7 @@ final class StructureBatchCache {
             return section;
         }
 
-        void refresh(StructureBatchSnapshots.Snapshot snapshot) {
+        boolean refresh(StructureBatchSnapshots.Snapshot snapshot) {
             boolean changed = false;
             for (int index = 0; index < states.length; index++) {
                 final int x = index % sizeX;
@@ -514,7 +636,7 @@ final class StructureBatchCache {
                 }
             }
             if (!changed) {
-                return;
+                return false;
             }
             for (int index = 0; index < states.length; index++) {
                 final int x = index % sizeX;
@@ -523,6 +645,12 @@ final class StructureBatchCache {
                 states[index] = snapshot.stateAt(originX + x, originY + y, originZ + z);
             }
             collectSpecialCells();
+            markDirty();
+            return true;
+        }
+
+        /** Drops the built mesh and queues a rebuild. */
+        void markDirty() {
             pendingVertices = -1L;
             invalidate();
             dirty = true;
@@ -573,14 +701,32 @@ final class StructureBatchCache {
         long countVertices() {
             long count = 0L;
             final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
-            for (BlockState state : states) {
+            final StructureVoxelView view = body;
+            final int layerStride = sizeX * sizeZ;
+            for (int index = 0; index < states.length; index++) {
+                final BlockState state = states[index];
                 if (state == null || state.isAir()
                         || (anySpecial && SpecialBlockRenderers.isRegistered(state.getBlock()))) {
                     continue;
                 }
                 final BlockGeometry geometry = BlockGeometryCache.get(state);
-                if (!geometry.empty) {
-                    count += geometry.vertexCount;
+                if (geometry.empty) {
+                    continue;
+                }
+                final int x = index % sizeX;
+                final int z = (index / sizeX) % sizeZ;
+                final int y = index / layerStride;
+                final int worldX = originX + x;
+                final int worldY = originY + y;
+                final int worldZ = originZ + z;
+                for (BlockGeometry.Layer layer : BlockGeometry.LAYERS) {
+                    final BlockGeometry.Quads quads = geometry.quads(layer);
+                    for (int quad = 0; quad < quads.quadCount; quad++) {
+                        if (!SectionMesh.isCulled(view, state, quads, quad,
+                                worldX, worldY, worldZ)) {
+                            count += 4L;
+                        }
+                    }
                 }
             }
             return count;

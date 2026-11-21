@@ -132,7 +132,7 @@ private volatile Snapshot snapshot = new Snapshot(Transform3d.IDENTITY, Transfor
 
 ```java
 accumulator += realSeconds;
-steps = min((int) (accumulator / fixedTimeStep), maxSubSteps);
+steps = min((int) floor(accumulator / fixedTimeStep + 1e-9), maxSubSteps);
 accumulator -= steps * fixedTimeStep;
 ```
 
@@ -140,7 +140,8 @@ accumulator -= steps * fixedTimeStep;
 
 - `maxSubSteps` 防止“死亡螺旋”：一帧掉到很慢时不会无限补步；
 - 超出 `maxSubSteps` 的时间被丢弃；
-- `alpha() = accumulator / fixedTimeStep`，用于渲染插值；
+- `1e-9` 的步数容差避免 `0.3 / 0.1 = 2.9999999999999996` 这类浮点边界少跑一步（表现为 2/4 步交替抖动）；
+- `alpha() = accumulator / fixedTimeStep`，保留给手动步进/诊断；
 - `alpha` 不会达到 1.0；如果累加器仍然大于等于一个步长，会被压到 `0.999 * fixedTimeStep`；
 - `reset()` 清空累加器，用于暂停/恢复。
 
@@ -155,27 +156,28 @@ accumulator -= steps * fixedTimeStep;
 
 ### 3.3 Minecraft 层
 
-`LevelPhysics.tick()`：
+`LevelPhysics.tick()` 每个 `END_SERVER_TICK` 只推进**一个服务端 tick 的游戏时间**
+（默认 `1 / tickRate = 50 ms`，而不是两次回调之间的墙钟时间）：
 
 ```java
-long now = System.nanoTime();
-double delta = (now - lastTickNanos) / 1e9;
-lastTickNanos = now;
-delta = Math.min(delta, config.maxFrameSeconds); // 默认 0.25s
-world.advance(delta);
+TickRateManager tickRate = level.getServer().tickRateManager();
+boolean frozen = tickRate.isFrozen() && !tickRate.isSteppingForward();
+double simDelta = frozen ? 0.0 : 1.0 / Math.max(1.0, tickRate.tickrate());
+int steps = world.advance(simDelta);
 for (PhysicsStructure structure : structures) {
-    structure.syncRenderPose();
-}
-world.setDebugContactCapture(config.debug);
-if (config.debug) {
-    renderDebugSnapshot = world.debugSnapshot();
+    structure.syncRenderPose(); // exactly once per server tick
 }
 ```
 
-- 用墙钟时间而不是固定 1/20 秒，因此物理步进频率与 Minecraft tick 率解耦；
-- `maxFrameSeconds` 限制单次追赶的最大真实时间；
-- 即使这一 tick 没有运行物理步，也会 `syncRenderPose()`，让插值缓冲推进到当前姿态（前后帧相同）；
-- `setDebugContactCapture(config.debug)` 决定是否在调试快照中保留最近一步的接触流形；关闭时不付 manifold 提取成本；
+原因：
+
+- 渲染器用 Minecraft 的 tick partial tick（`DeltaTracker#getGameTimeDeltaPartialTick`）在两次服务端 tick 姿态之间插值；
+- 如果物理步数由墙钟决定，`END_SERVER_TICK` 的调度抖动会让同一 tick 跑 2/3/4 个 1/60 步，而渲染 alpha 仍按固定 50 ms 扫过，于是速度忽快忽慢，看起来就是抖动/颤抖；
+- 按固定 tick 时间推进后，20 TPS + 1/60 s 固定步长稳定得到每 tick 3 步；1/120 s 则稳定 6 步（`maxSubSteps` 会自动预留至少 6+1 步）；
+- **不要**在 `world.advance` 内部每个 substep 都 `syncRenderPose`：substep 是在 tick 内成批执行的，插值缓冲应该保存 tick 边界姿态，而不是最后一个 substep 的姿态；
+- `serverTickTiming = false` 可恢复旧的墙钟追赶模式，仅用于 A/B 测试；
+- tick rate 被冻结时跳过物理推进和 block logic，但保留当前 render pose；
+- `/crythst timing` 输出 `wallDt`、`simDt`、`steps`、`fixedAlpha`、`poseDelta`、`stepJitter`、`poseJitter`；
 - `/crythst step <count>` 调用 `LevelPhysics#step(int)`，直接运行 `world.step(settings.fixedTimeStep())`，用于暂停时逐步检查。
 
 > 注意：`WorldSettings.contactTolerance` 目前保存在设置中，但 Bullet 的扫掠查询使用的是 `SweepQuery#tolerance`，而不是这个全局字段。修改它不会改变 `SweepQuery` 的默认容差。
@@ -586,7 +588,7 @@ PhysicsStructure structure = new PhysicsStructure(world, definition);
 - `pose()`：当前结构姿态（结构局部原点，不是质心）；
 - `setPose(Transform3d)`：设置结构姿态并唤醒刚体，同时把姿态 `push` 到渲染缓冲；
 - `teleport(Transform3d)`：设置姿态、清速度、清力、唤醒，并 `reset` 渲染缓冲（不插值跨越传送）；
-- `syncRenderPose()`：把当前 `pose()` 推入 `InterpolatedPose`；每固定步或每服务端 tick 调用；
+- `syncRenderPose()`：把当前 `pose()` 推入 `InterpolatedPose`；每个服务端 tick 调用一次（不是每个固定 substep）；
 - `interpolatedPose(alpha)`：取插值姿态；
 - `renderState(alpha)`：返回不可变的 `StructureRenderState`，包含 body id、插值姿态、collider、质心偏移、blockScale。
 

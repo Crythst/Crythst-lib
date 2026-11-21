@@ -807,6 +807,7 @@ for (BodyDebugInfo info : debug.bodies()) {
 CrythstConfig config = MinecraftPhysics.config();
 config.fixedTimeStep = 1.0 / 120.0;
 config.maxSubSteps = 8;
+config.serverTickTiming = true; // one server tick of game time per tick
 config.solverIterations = 12;
 config.allowSleep = true;
 config.deterministic = true;
@@ -818,7 +819,7 @@ config.defaultFriction = 0.7;
 config.defaultRestitution = 0.0;
 ```
 
-> `fixedTimeStep`、`maxSubSteps`、`solverIterations`、`allowSleep`、`deterministic` 在 `LevelPhysics` 构造时读取；已经创建的维度不会自动应用这些改动，需要重新加载世界或重建 `LevelPhysics`。`debug`、`maxFrameSeconds`、`rebaseDistance` 等则在每次 tick 时动态读取。
+> `fixedTimeStep`、`maxSubSteps`、`solverIterations`、`allowSleep`、`deterministic` 在 `LevelPhysics` 构造时读取；已经创建的维度不会自动应用这些改动，需要重新加载世界或重建 `LevelPhysics`。`serverTickTiming`、`debug`、`maxFrameSeconds`、`rebaseDistance` 等则在每次 tick 时动态读取。`serverTickTiming` 默认开启：每个服务端 tick 只推进一个 tick 的游戏时间，使 20 TPS + 1/60 s 稳定为每 tick 3 个固定步，渲染插值才不会因墙钟抖动而颤抖。详见 `docs/physics-timing.md`。
 
 ### 12.2 每维度世界
 

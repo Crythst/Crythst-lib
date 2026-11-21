@@ -22,6 +22,9 @@ Fabric integration, mixins or config.
 | `.../batch/BlockGeometryCache.java` | Palette cache: `BlockState` → baked quads with atlas UVs, tint and emission. |
 | `.../batch/FallbackCuboids.java` | Bounded coloured-cuboid fallback for bodies with no snapshot. |
 | `.../batch/BatchStats.java` | Immutable per-frame counter record. |
+| `.../batch/StructureVoxelView.java` | Read-only cross-section occupancy/state view used by meshing. |
+| `.../light/StructureLightOccluder.java` | Immutable bitset of solid voxels; public occlusion API. |
+| `.../light/VoxelLighting.java` | Pure face-culling and vertex-AO rules, shared with tests. |
 | `docs/batched-structure-rendering.md` | This document. |
 
 ## Registration
@@ -73,10 +76,11 @@ own `register()` does not re-enable it.
    at a time.
 3. **Section mesh** (`SectionMesh`): one flat vertex array per section and
    render layer. A vertex stores position (3 floats), UV (2 floats), ARGB colour
-   (1 int), light emission (1 byte) and a 16-bit index into a small per-mesh
-   normal palette. Positions are section-local, around the section origin. The
-   palette lets the frame path rotate a handful of normals per section instead
-   of one per vertex.
+   with baked vertex AO (1 int), light emission (1 byte) and a 16-bit index into
+   a small per-mesh normal palette. Positions are section-local, around the
+   section origin. The palette lets the frame path rotate a handful of normals
+   per section instead of one per vertex. Per quad the mesh also stores the
+   adjacent voxel cell and a cached lightmap value.
 
 ### Frame path
 
@@ -96,8 +100,51 @@ are then distance- and frustum-culled individually):
    `MAX_BATCHES_PER_FRAME`.
 
 The vertex replay uses a cached `CustomGeometryRenderer` per `SectionMesh`; the
-per-frame light value is written into the mesh immediately before submission.
-No lambda is allocated per batch per frame.
+per-frame fallback light value is written into the mesh immediately before
+submission. No lambda is allocated per batch per frame.
+
+### Internal faces, AO and face light
+
+Structures are meshed like small voxel chunks, not like independent blocks:
+
+* **Face culling.** While building a section, every quad with a cull direction
+  tests the adjacent voxel in the same body (`Block.shouldRenderFace`). The
+  lookup crosses section borders, so a wall spanning two sections loses the
+  hidden seam faces. Cells outside the snapshot are air, so the outer shell is
+  never culled. `Block.shouldRenderFace` handles full cubes, slabs, glass and
+  modded shape occlusion instead of only checking `isSolid()`.
+* **Vertex AO.** For full-cube states (`isSolidRender()`), each quad vertex asks
+  the occupancy mask about the two edge neighbours and the diagonal corner
+  around the adjacent air cell. The classic rule gives AO levels 0–3; the
+  resulting shade (`0.55 / 0.70 / 0.85 / 1.00`) is multiplied into the vertex
+  ARGB colour at build time. It costs nothing per frame and darkens corners
+  even when the section light is uniform. Shaped models stay flat-shaded rather
+  than getting incorrect mid-face darkness.
+* **Face light sampling.** Each quad remembers the packed voxel of the adjacent
+  cell. During submission, the section pose and block scale map that cell to a
+  world position, and `LightCoordsUtil.getLightCoords(level, pos)` samples the
+  lightmap there — not at the solid block centre. Emission is still applied
+  with `lightCoordsWithEmission`. Samples are cached per quad and re-used while
+  the face stays in the same world cell; a slow refresh every 16 frames picks
+  up light changes. If the cell is unloaded, no budget remains, or sampling
+  fails, the mesh falls back to the section light value.
+* **Occupancy API.** `Body` owns an immutable `StructureLightOccluder` built
+  from `BlockState.canOcclude()`. It is the same mask used for culling and AO
+  and is exposed through
+  `BatchedStructureRenderer.lightOccluder(dimension, bodyId)`:
+  ```java
+  StructureLightOccluder mask =
+          BatchedStructureRenderer.lightOccluder(level.dimension(), bodyId);
+  boolean solid = mask.isSolid(voxelX, voxelY, voxelZ);
+  ```
+  Coordinates are structure-local voxels (before the pose/block scale), and
+  out-of-bounds cells read as air. Minecraft's global light engine is not
+  modified.
+
+Rebuilds stay cheap and correct at section borders: a changed section marks all
+sections within one voxel of its bounds dirty, because culling and AO read one
+cell across a border. A body with more than 16 simultaneously changed sections
+invalidates all of its sections instead of doing a quadratic neighbourhood walk.
 
 ### Transform and precision
 
@@ -182,7 +229,7 @@ baked quad, so no faces are dropped and no black/default quads are introduced.
 | Event | Action |
 | --- | --- |
 | New snapshot object every few server ticks | Per-section content comparison; only changed sections are invalidated. An unchanged snapshot object does not rebuild anything. |
-| Block edited in a structure | The changed section(s) fail the content compare and are rebuilt on the next build budget slot. |
+| Block edited in a structure | The changed section(s) fail the content compare and are rebuilt on the next build budget slot. Sections within one voxel of a changed section are also invalidated so border culling/AO stays correct; more than 16 changed sections invalidates the whole body. The occupancy mask is rebuilt from the refreshed section states. |
 | Block scale changed | The whole body cache is recreated. Centre-of-mass changes only move the per-frame structure pose; section geometry is unshifted and does not need a rebuild. |
 | Snapshot bounds changed | The whole body cache is recreated. |
 | Client resource reload (textures/models) | Reload listener clears all body meshes first, then the palette; a palette generation counter also forces a clear if a body is touched before the listener runs. |
@@ -220,6 +267,18 @@ number of render layers a section uses (1–3). For a typical structure:
 The remaining per-frame costs are section culling (8 corner transforms + one
 AABB test per visible section), the vertex replay, and one `ConcurrentHashMap`
 lookup per block state during cache builds (not per frame).
+
+Structure lighting adds bounded work:
+
+* Face culling and AO run only on section rebuilds. A rebuild walks each quad
+  once and performs at most three occupancy lookups per cube-face vertex.
+* Face light sampling is capped at `MAX_FACE_LIGHT_SAMPLES_PER_FRAME`
+  (16,384) successful/attempted level lookups per frame. Quads cache the world
+  cell they sampled, so a stationary or slowly moving structure re-samples only
+  a small fraction of faces per frame. Nearest sections are submitted first and
+  therefore get the budget first.
+* No per-vertex level lookups are made in the frame path; the replay loop only
+  reads the per-quad light array.
 
 ### Difference from sable's terrain path
 
@@ -293,15 +352,21 @@ the per-block renderer.
   centre is supplied by the additive
   `SpecialBlockRenderer.submit(context, worldCenter, ...)` overload; existing
   renderers that rely only on the pose are already exact.
-* **No neighbour-face culling.** The cache reuses the baked block model quads, so
-  hidden faces between two solid blocks are still submitted, exactly as in the
-  per-block path. The win is node/model work, not triangle count. A future
-  version could run a section mesher and drop interior faces.
-* **No per-vertex ambient occlusion.** Light is sampled once per section centre
-  per frame and combined with each quad's emission. Vanilla's smooth AO needs
-  neighbour lookups and a moving structure has no stable world neighbours;
-  the result is flat but correctly lit. This is the main visual difference from
-  the vanilla chunk renderer.
+* **AO is voxel-grid AO, not smooth interpolated AO.** It is computed from the
+  structure's own occupancy grid for full-cube states. Shaped models (stairs,
+  fences, plants) stay flat-shaded, and AO does not bleed onto neighbouring
+  world terrain.
+* **No sky-light propagation inside structures.** Faces sample the world
+  lightmap at the adjacent cell, but the structure does not write shadow
+  columns into Minecraft's light engine. An interior room therefore inherits
+  the world light of its adjacent cells; it is not recomputed as a closed
+  cavity. Adding that would require a structure-local light propagation pass
+  and a way to feed it back into the vanilla engine.
+* **Face-light cache is approximate over time.** A cached face light is reused
+  while the face stays in one world cell, refreshed at most every 16 frames and
+  capped by `MAX_FACE_LIGHT_SAMPLES_PER_FRAME`. Rapid world light changes can
+  lag by a fraction of a second; when the per-frame budget is exhausted the
+  previous value or the section fallback is used.
 * **Tint uses the client tint source without a world position.** Grass/leaves
   get their default tint; biome-specific tints are not resolved because the
   snapshot has no world position for each block. Unresolvable tint sources fall

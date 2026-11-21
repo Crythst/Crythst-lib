@@ -8,6 +8,7 @@ import io.mikaple.crythst.client.render.block.SpecialBlockLight;
 import io.mikaple.crythst.client.render.block.SpecialBlockRenderContext;
 import io.mikaple.crythst.client.render.block.SpecialBlockRenderer;
 import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
+import io.mikaple.crythst.client.render.light.StructureLightOccluder;
 import io.mikaple.crythst.client.render.structure.RealStructureBlockRenderer;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
@@ -108,6 +109,13 @@ public final class BatchedStructureRenderer {
     private static final int MAX_FALLBACK_BODIES = 64;
     /** Maximum special block renderer calls per frame. */
     private static final int MAX_SPECIAL_BLOCKS_PER_FRAME = 1_024;
+    /**
+     * Maximum per-face world lightmap lookups per frame. Faces keep their
+     * previous sample and only re-sample when the structure moves them into a
+     * new world cell or on the slow refresh, so steady-state cost is far below
+     * this cap.
+     */
+    private static final int MAX_FACE_LIGHT_SAMPLES_PER_FRAME = 16_384;
     /** Default distance cut-off in blocks. */
     private static final double DEFAULT_RENDER_DISTANCE = 512.0;
 
@@ -208,6 +216,20 @@ public final class BatchedStructureRenderer {
         return StructureBatchCache.vertexBudget();
     }
 
+    /**
+     * Returns the current solid-occupancy mask for a structure body, or
+     * {@link StructureLightOccluder#EMPTY} when the body is not cached.
+     *
+     * <p>This is the same mask the mesher uses for internal face culling and
+     * vertex AO. It is read-only and independent of the camera; consumers such
+     * as entity shading can query {@link StructureLightOccluder#isSolid} in
+     * structure-local voxel coordinates. Minecraft's global light engine is not
+     * modified.</p>
+     */
+    public static StructureLightOccluder lightOccluder(ResourceKey<Level> dimension, long bodyId) {
+        return StructureBatchCache.occluder(dimension, bodyId);
+    }
+
     /** Most recent frame's counters. */
     public static BatchStats stats() {
         return stats;
@@ -263,6 +285,7 @@ public final class BatchedStructureRenderer {
 
         final double maxDistanceSq = renderDistance * renderDistance;
         long buildBudget = MAX_BUILD_VERTICES_PER_FRAME;
+        final int[] lightBudget = {MAX_FACE_LIGHT_SAMPLES_PER_FRAME};
         final long buildStart = System.nanoTime();
 
         // Singleplayer/unintegrated path: live physics render states plus the
@@ -347,7 +370,7 @@ public final class BatchedStructureRenderer {
             if (submittedBatches >= MAX_BATCHES_PER_FRAME) {
                 break;
             }
-            submitOpaque(section, collector);
+            submitOpaque(section, collector, client.level, lightBudget);
         }
 
         TRANSLUCENT.sort(FAR_FIRST);
@@ -355,7 +378,7 @@ public final class BatchedStructureRenderer {
             if (submittedBatches >= MAX_BATCHES_PER_FRAME) {
                 break;
             }
-            submitTranslucent(section, collector);
+            submitTranslucent(section, collector, client.level, lightBudget);
         }
 
         if (!FALLBACK_SECTIONS.isEmpty()) {
@@ -444,7 +467,8 @@ public final class BatchedStructureRenderer {
     }
 
     private static void submitOpaque(StructureBatchCache.Section section,
-                                     SubmitNodeCollector collector) {
+                                     SubmitNodeCollector collector, ClientLevel level,
+                                     int[] lightBudget) {
         section.applyPose(FRAME_POSE);
         final int light = lightAt(section.frameCenterX, section.frameCenterY, section.frameCenterZ);
         for (BlockGeometry.Layer layer : BlockGeometry.LAYERS) {
@@ -459,6 +483,8 @@ public final class BatchedStructureRenderer {
                 return;
             }
             mesh.setFrameLight(light);
+            mesh.updateFaceLights(level, section.body.framePose, section.body.blockScale,
+                    StructureBatchCache.frame(), lightBudget);
             collector.submitCustomGeometry(FRAME_POSE, layer.renderType(), mesh.renderer());
             submittedBatches++;
             submittedVertices += mesh.vertexCount();
@@ -466,13 +492,17 @@ public final class BatchedStructureRenderer {
     }
 
     private static void submitTranslucent(StructureBatchCache.Section section,
-                                          SubmitNodeCollector collector) {
+                                          SubmitNodeCollector collector, ClientLevel level,
+                                          int[] lightBudget) {
         final SectionMesh mesh = section.meshes[BlockGeometry.Layer.TRANSLUCENT.index()];
         if (mesh == null) {
             return;
         }
         section.applyPose(FRAME_POSE);
-        mesh.setFrameLight(lightAt(section.frameCenterX, section.frameCenterY, section.frameCenterZ));
+        final int light = lightAt(section.frameCenterX, section.frameCenterY, section.frameCenterZ);
+        mesh.setFrameLight(light);
+        mesh.updateFaceLights(level, section.body.framePose, section.body.blockScale,
+                StructureBatchCache.frame(), lightBudget);
         collector.submitCustomGeometry(FRAME_POSE,
                 BlockGeometry.Layer.TRANSLUCENT.renderType(), mesh.renderer());
         submittedBatches++;
@@ -622,7 +652,17 @@ public final class BatchedStructureRenderer {
             return LightCoordsUtil.FULL_BRIGHT;
         }
         try {
-            return LightCoordsUtil.getLightCoords(client.level, BlockPos.containing(x, y, z));
+            final BlockPos pos = BlockPos.containing(x, y, z);
+            // A section centre is often inside a solid block (the structure
+            // itself), where the lightmap stores 0. Vanilla samples the
+            // neighbouring air face for a block; take the maximum of the six
+            // neighbours as a cheap, smooth approximation.
+            int light = LightCoordsUtil.getLightCoords(client.level, pos);
+            for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
+                light = LightCoordsUtil.max(light,
+                        LightCoordsUtil.getLightCoords(client.level, pos.relative(direction)));
+            }
+            return light;
         } catch (RuntimeException ignored) {
             return LightCoordsUtil.FULL_BRIGHT;
         }

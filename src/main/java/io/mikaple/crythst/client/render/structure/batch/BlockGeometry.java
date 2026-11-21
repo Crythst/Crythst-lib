@@ -67,26 +67,32 @@ final class BlockGeometry {
      *   <li>{@code normals}: 12 floats (4 * xyz)</li>
      *   <li>{@code colors}: 1 ARGB value, shared by the four vertices</li>
      *   <li>{@code lightEmission}: 1 value in {@code [0,15]}</li>
+     *   <li>{@code faces}: 1 {@code Direction} ordinal, or {@code -1} when the
+     *       quad has no cull direction (cross/flat model)</li>
      * </ul>
      */
     static final class Quads {
         static final Quads EMPTY = new Quads(
-                new float[0], new float[0], new float[0], new int[0], new int[0], 0);
+                new float[0], new float[0], new float[0], new int[0], new int[0],
+                new byte[0], 0);
 
         final float[] positions;
         final float[] uvs;
         final float[] normals;
         final int[] colors;
         final int[] lightEmission;
+        /** Face direction ordinal per quad, or {@code -1} for no culling/AO. */
+        final byte[] faces;
         final int quadCount;
 
         Quads(float[] positions, float[] uvs, float[] normals,
-              int[] colors, int[] lightEmission, int quadCount) {
+              int[] colors, int[] lightEmission, byte[] faces, int quadCount) {
             this.positions = positions;
             this.uvs = uvs;
             this.normals = normals;
             this.colors = colors;
             this.lightEmission = lightEmission;
+            this.faces = faces;
             this.quadCount = quadCount;
         }
 

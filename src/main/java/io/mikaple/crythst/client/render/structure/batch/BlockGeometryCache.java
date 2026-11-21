@@ -181,8 +181,9 @@ final class BlockGeometryCache {
 
             final int tintIndex = material == null ? -1 : material.tintIndex();
             final int emission = material == null ? 0 : Math.max(0, material.lightEmission());
+            final byte face = normalDirection == null ? -1 : (byte) normalDirection.ordinal();
             builders[layer.index()].add(positions, uvs, normals,
-                    tintColor(state, tintIndex), emission);
+                    tintColor(state, tintIndex), emission, face);
             appended = true;
         }
         return appended;
@@ -257,9 +258,10 @@ final class BlockGeometryCache {
         private float[] normals = new float[48];
         private int[] colors = new int[4];
         private int[] lightEmission = new int[4];
+        private byte[] faces = new byte[4];
         private int quadCount;
 
-        private void add(float[] p, float[] u, float[] n, int color, int emission) {
+        private void add(float[] p, float[] u, float[] n, int color, int emission, byte face) {
             if (quadCount == colors.length) {
                 final int capacity = Math.max(4, colors.length * 2);
                 positions = Arrays.copyOf(positions, capacity * 12);
@@ -267,12 +269,14 @@ final class BlockGeometryCache {
                 normals = Arrays.copyOf(normals, capacity * 12);
                 colors = Arrays.copyOf(colors, capacity);
                 lightEmission = Arrays.copyOf(lightEmission, capacity);
+                faces = Arrays.copyOf(faces, capacity);
             }
             System.arraycopy(p, 0, positions, quadCount * 12, 12);
             System.arraycopy(u, 0, uvs, quadCount * 8, 8);
             System.arraycopy(n, 0, normals, quadCount * 12, 12);
             colors[quadCount] = color;
             lightEmission[quadCount] = emission;
+            faces[quadCount] = face;
             quadCount++;
         }
 
@@ -286,6 +290,7 @@ final class BlockGeometryCache {
                     Arrays.copyOf(normals, quadCount * 12),
                     Arrays.copyOf(colors, quadCount),
                     Arrays.copyOf(lightEmission, quadCount),
+                    Arrays.copyOf(faces, quadCount),
                     quadCount);
         }
     }
