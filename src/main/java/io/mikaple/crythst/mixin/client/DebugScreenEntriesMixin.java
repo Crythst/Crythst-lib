@@ -3,42 +3,55 @@ package io.mikaple.crythst.mixin.client;
 import io.mikaple.crythst.integration.fabric.client.CrythstDebugEntries;
 import net.minecraft.client.gui.components.debug.DebugScreenEntries;
 import net.minecraft.client.gui.components.debug.DebugScreenEntry;
-import net.minecraft.client.gui.components.debug.DebugScreenEntryStatus;
 import net.minecraft.resources.Identifier;
-import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Registers Crythst's debug entries in the vanilla debug-entry registry.
+ * Adds Crythst entries to vanilla's debug-entry views without mutating its
+ * immutable registry.
  *
- * <p>Running at the tail of the static initializer means all vanilla entries
- * and the profile maps exist first. Physics renderer entries are left out of
- * the profiles (default {@code NEVER}); the structure-target text entry is
- * added to every profile as {@code IN_OVERLAY}, so it appears in F3 unless the
- * player disables it in F3 + F6.</p>
+ * <p>{@code DebugScreenEntries.ENTRIES_BY_ID} is an unmodifiable map after
+ * class initialization, so a direct {@code put} is not possible. The options
+ * screen and entry list consume {@link DebugScreenEntries#allEntries()} and
+ * {@link DebugScreenEntries#getEntry(Identifier)}, which this mixin extends
+ * with a merged view. Physics renderers stay unassigned (default
+ * {@code NEVER}); the structure-target text entry defaults through
+ * {@code DebugScreenEntryListMixin}.</p>
  */
 @Mixin(DebugScreenEntries.class)
 public abstract class DebugScreenEntriesMixin {
-    @Shadow
-    @Final
-    private static Map<Identifier, DebugScreenEntry> ENTRIES_BY_ID;
-
-    @Inject(method = "<clinit>", at = @At("TAIL"))
-    private static void crythst$registerDebugEntries(CallbackInfo ci) {
+    @Inject(method = "allEntries", at = @At("RETURN"), cancellable = true)
+    private static void crythst$includeDebugEntries(
+            CallbackInfoReturnable<Map<Identifier, DebugScreenEntry>> cir) {
+        final Map<Identifier, DebugScreenEntry> merged =
+                new LinkedHashMap<>(cir.getReturnValue());
         for (Identifier id : CrythstDebugEntries.ALL_RENDERERS) {
-            ENTRIES_BY_ID.put(id, CrythstDebugEntries.ENTRY);
+            merged.put(id, CrythstDebugEntries.ENTRY);
         }
-        ENTRIES_BY_ID.put(CrythstDebugEntries.STRUCTURE_TARGET,
+        merged.put(CrythstDebugEntries.STRUCTURE_TARGET,
                 CrythstDebugEntries.STRUCTURE_TARGET_ENTRY);
-        for (Map<Identifier, DebugScreenEntryStatus> profile : DebugScreenEntries.PROFILES.values()) {
-            profile.putIfAbsent(CrythstDebugEntries.STRUCTURE_TARGET,
-                    DebugScreenEntryStatus.IN_OVERLAY);
+        cir.setReturnValue(Collections.unmodifiableMap(merged));
+    }
+
+    @Inject(method = "getEntry", at = @At("HEAD"), cancellable = true)
+    private static void crythst$getDebugEntry(Identifier id,
+                                              CallbackInfoReturnable<DebugScreenEntry> cir) {
+        if (id == null) {
+            return;
+        }
+        if (id.equals(CrythstDebugEntries.STRUCTURE_TARGET)) {
+            cir.setReturnValue(CrythstDebugEntries.STRUCTURE_TARGET_ENTRY);
+            return;
+        }
+        if (CrythstDebugEntries.ALL_RENDERERS.contains(id)) {
+            cir.setReturnValue(CrythstDebugEntries.ENTRY);
         }
     }
 }
