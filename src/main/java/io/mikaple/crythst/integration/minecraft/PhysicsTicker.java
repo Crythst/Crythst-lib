@@ -15,9 +15,8 @@ public final class PhysicsTicker {
 
     public static void register() {
         ServerTickEvents.END_SERVER_TICK.register(MinecraftPhysics::tick);
-        // Registered after the physics tick so entity correction sees the pose
-        // produced by the current step.
-        EntityPhysicsCollisionManager.register();
+        // Structure collision now runs inside Entity.move; only the filter is
+        // still needed by the movement-integrated path.
         // Create contraption entities are carried by their own movement/riding
         // layer; do not also push them around as ordinary entities.
         EntityPhysicsCollisionManager.setEntityFilter(entity -> !CreateCompat.shouldStayOnStructure(entity));
