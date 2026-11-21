@@ -52,9 +52,6 @@ final class FallbackCuboids {
                 (float) transform.rotation().x(), (float) transform.rotation().y(),
                 (float) transform.rotation().z(), (float) transform.rotation().w()).normalize();
         final double scale = state.blockScale();
-        final double comX = state.centerOfMassOffset().x;
-        final double comY = state.centerOfMassOffset().y;
-        final double comZ = state.centerOfMassOffset().z;
 
         POSE.setIdentity();
         POSE.translate(
@@ -72,12 +69,12 @@ final class FallbackCuboids {
                         final float green = ((color >> 8) & 0xFF) / 255.0f;
                         final float blue = (color & 0xFF) / 255.0f;
 
-                        final float x0 = (float) (box.minX() * scale - comX);
-                        final float y0 = (float) (box.minY() * scale - comY);
-                        final float z0 = (float) (box.minZ() * scale - comZ);
-                        final float x1 = (float) ((box.minX() + box.sizeX()) * scale - comX);
-                        final float y1 = (float) ((box.minY() + box.sizeY()) * scale - comY);
-                        final float z1 = (float) ((box.minZ() + box.sizeZ()) * scale - comZ);
+                        final float x0 = (float) (box.minX() * scale);
+                        final float y0 = (float) (box.minY() * scale);
+                        final float z0 = (float) (box.minZ() * scale);
+                        final float x1 = (float) ((box.minX() + box.sizeX()) * scale);
+                        final float y1 = (float) ((box.minY() + box.sizeY()) * scale);
+                        final float z1 = (float) ((box.minZ() + box.sizeZ()) * scale);
 
                         quad(pose, consumer, red, green, blue, 0.80f,
                                 x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1);

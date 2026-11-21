@@ -211,7 +211,6 @@ public final class RealStructureBlockRenderer {
         final Transform3d transform = state.pose();
         final Vector3d position = transform.position();
         final Quaterniondc rotation = transform.rotation();
-        final Vector3d centerOfMass = state.centerOfMassOffset();
         final double scale = state.blockScale();
 
         final double m00 = rotationMatrix00(rotation);
@@ -256,9 +255,11 @@ public final class RealStructureBlockRenderer {
                     }
 
                     // Structure-local minimum corner of this voxel, in metres.
-                    final double localX = x * scale - centerOfMass.x;
-                    final double localY = y * scale - centerOfMass.y;
-                    final double localZ = z * scale - centerOfMass.z;
+                    // The structure pose already accounts for the centre of
+                    // mass, so no COM subtraction belongs here.
+                    final double localX = x * scale;
+                    final double localY = y * scale;
+                    final double localZ = z * scale;
 
                     // Full pose in double precision, then subtract the camera so
                     // only small camera-relative floats reach the PoseStack.
@@ -366,7 +367,6 @@ public final class RealStructureBlockRenderer {
         final Transform3d transform = state.pose();
         final Vector3d position = transform.position();
         final Quaterniondc rotation = transform.rotation();
-        final Vector3d centerOfMass = state.centerOfMassOffset();
         final double scale = state.blockScale();
         final double m00 = rotationMatrix00(rotation);
         final double m01 = rotationMatrix01(rotation);
@@ -379,9 +379,11 @@ public final class RealStructureBlockRenderer {
         final double m22 = rotationMatrix22(rotation);
 
         for (VoxelBox box : state.collider().boxes()) {
-            final double localX = (box.minX() + box.sizeX() * 0.5) * scale - centerOfMass.x;
-            final double localY = (box.minY() + box.sizeY() * 0.5) * scale - centerOfMass.y;
-            final double localZ = (box.minZ() + box.sizeZ() * 0.5) * scale - centerOfMass.z;
+            // Structure-local box centre in metres. The structure pose already
+            // includes the centre-of-mass offset.
+            final double localX = (box.minX() + box.sizeX() * 0.5) * scale;
+            final double localY = (box.minY() + box.sizeY() * 0.5) * scale;
+            final double localZ = (box.minZ() + box.sizeZ() * 0.5) * scale;
             final double worldX = position.x + m00 * localX + m01 * localY + m02 * localZ;
             final double worldY = position.y + m10 * localX + m11 * localY + m12 * localZ;
             final double worldZ = position.z + m20 * localX + m21 * localY + m22 * localZ;

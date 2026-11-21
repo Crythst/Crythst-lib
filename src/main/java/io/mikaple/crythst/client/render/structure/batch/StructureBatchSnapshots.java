@@ -13,8 +13,10 @@ import org.joml.Vector3d;
  * <p>Singleplayer and multiplayer both end up here: the server-thread
  * {@link StructureBlockSnapshots.Snapshot} and the network
  * {@link ClientStructureSnapshot} are adapted to the same immutable interface.
- * Pose, block scale and centre-of-mass offset stay per-frame inputs, so the
- * cached meshes only depend on block geometry.</p>
+ * Pose and block scale stay per-frame inputs, so the cached meshes only depend
+ * on block geometry. The pose is the structure pose (not the body pose), so
+ * voxel coordinates map directly through it; the wire COM is retained for
+ * diagnostics and physics consumers but must not be subtracted again.</p>
  */
 final class StructureBatchSnapshots {
     private StructureBatchSnapshots() {
@@ -59,20 +61,18 @@ final class StructureBatchSnapshots {
 
     /**
      * World-space AABB for a network snapshot. The local box is the voxel
-     * bounds converted to metres and shifted by the centre-of-mass offset,
-     * matching {@link StructureBatchCache.Section}'s layout.
+     * bounds converted to metres and mapped through the structure pose.
+     * Structure pose already accounts for the centre-of-mass offset.
      */
-    static Aabb worldBounds(Snapshot snapshot, Transform3d pose,
-                            double blockScale, Vector3d centerOfMassOffset) {
-        final double comX = centerOfMassOffset.x;
-        final double comY = centerOfMassOffset.y;
-        final double comZ = centerOfMassOffset.z;
-        final double localMinX = snapshot.minX() * blockScale - comX;
-        final double localMinY = snapshot.minY() * blockScale - comY;
-        final double localMinZ = snapshot.minZ() * blockScale - comZ;
-        final double localMaxX = (snapshot.minX() + snapshot.sizeX()) * blockScale - comX;
-        final double localMaxY = (snapshot.minY() + snapshot.sizeY()) * blockScale - comY;
-        final double localMaxZ = (snapshot.minZ() + snapshot.sizeZ()) * blockScale - comZ;
+    static Aabb worldBounds(Snapshot snapshot, Transform3d pose, double blockScale) {
+        // Pose is the structure pose, not the body pose, so the local box does
+        // not subtract the centre-of-mass offset.
+        final double localMinX = snapshot.minX() * blockScale;
+        final double localMinY = snapshot.minY() * blockScale;
+        final double localMinZ = snapshot.minZ() * blockScale;
+        final double localMaxX = (snapshot.minX() + snapshot.sizeX()) * blockScale;
+        final double localMaxY = (snapshot.minY() + snapshot.sizeY()) * blockScale;
+        final double localMaxZ = (snapshot.minZ() + snapshot.sizeZ()) * blockScale;
 
         double minX = Double.POSITIVE_INFINITY;
         double minY = Double.POSITIVE_INFINITY;

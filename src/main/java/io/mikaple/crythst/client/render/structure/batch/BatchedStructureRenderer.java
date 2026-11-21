@@ -284,9 +284,8 @@ public final class BatchedStructureRenderer {
                 if (network != null && network.nonAirBlocks() > 0) {
                     final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
                     final double blockScale = network.blockScale();
-                    final Vector3d centerOfMassOffset = network.centerOfMassOffset();
                     final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
-                            dimension, geometry, state.pose(), blockScale, centerOfMassOffset);
+                            dimension, geometry, state.pose(), blockScale);
                     body.beginFrame(state.pose(), blockScale, camera);
 
                     if (buildBudget > 0L) {
@@ -305,8 +304,7 @@ public final class BatchedStructureRenderer {
                     dimension,
                     StructureBatchSnapshots.fromServer(snapshot),
                     state.pose(),
-                    state.blockScale(),
-                    state.centerOfMassOffset());
+                    state.blockScale());
             body.beginFrame(state.pose(), state.blockScale(), camera);
 
             if (buildBudget > 0L) {
@@ -326,14 +324,13 @@ public final class BatchedStructureRenderer {
             final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
             final Transform3d pose = network.pose();
             final double blockScale = network.blockScale();
-            final Vector3d centerOfMassOffset = network.centerOfMassOffset();
             if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
-                    geometry, pose, blockScale, centerOfMassOffset))) {
+                    geometry, pose, blockScale))) {
                 continue;
             }
 
             final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
-                    dimension, geometry, pose, blockScale, centerOfMassOffset);
+                    dimension, geometry, pose, blockScale);
             body.beginFrame(pose, blockScale, camera);
 
             if (buildBudget > 0L) {
@@ -513,9 +510,9 @@ public final class BatchedStructureRenderer {
                     continue;
                 }
 
-                final double localX = (section.originX + cell.x() + 0.5) * scale - body.centerOfMassX;
-                final double localY = (section.originY + cell.y() + 0.5) * scale - body.centerOfMassY;
-                final double localZ = (section.originZ + cell.z() + 0.5) * scale - body.centerOfMassZ;
+                final double localX = (section.originX + cell.x() + 0.5) * scale;
+                final double localY = (section.originY + cell.y() + 0.5) * scale;
+                final double localZ = (section.originZ + cell.z() + 0.5) * scale;
                 body.framePose.transformPoint(SCRATCH.set(localX, localY, localZ), SCRATCH);
 
                 final Vec3 worldCenter = new Vec3(SCRATCH.x, SCRATCH.y, SCRATCH.z);

@@ -26,8 +26,24 @@ public record StructureRenderState(
         return new Vector3d(centerOfMassOffset);
     }
 
+    /**
+     * The internal rigid-body pose. The collider and its
+     * {@link VoxelColliderData#localBounds()} are centred on the centre of
+     * mass, so bounds and collision queries must use this pose rather than the
+     * structure-origin {@link #pose()}.
+     */
+    public Transform3d bodyPose() {
+        final Vector3d bodyPosition = new Vector3d(pose.position())
+                .add(new Vector3d(centerOfMassOffset).rotate(pose.rotation()));
+        return Transform3d.of(bodyPosition, pose.rotation());
+    }
+
+    /**
+     * World-space oriented bounds of the collider. This is the same transform
+     * the physics shape uses: body pose plus COM-centred collider-local boxes.
+     */
     public OrientedBox bounds() {
-        return OrientedBox.fromAabb(collider.localBounds(), pose);
+        return OrientedBox.fromAabb(collider.localBounds(), bodyPose());
     }
 
     public Aabb aabb() {

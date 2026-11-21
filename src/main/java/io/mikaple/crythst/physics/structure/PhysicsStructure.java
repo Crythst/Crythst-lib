@@ -29,7 +29,7 @@ import org.joml.Vector3dc;
 public final class PhysicsStructure implements AutoCloseable {
     private final PhysicsWorld world;
     private final BodyHandle body;
-    private final VoxelVolume volume;
+    private VoxelVolume volume;
     private final io.mikaple.crythst.physics.voxel.VoxelColliderOptions colliderOptions;
     private final double blockScale;
     private final double massScale;
@@ -196,6 +196,9 @@ public final class PhysicsStructure implements AutoCloseable {
 
         this.collider = newCollider;
         this.centerOfMassOffset = newCollider.centerOfMass().mul(blockScale);
+        // Keep volume() in sync with the new grid. Snapshot producers and
+        // auxiliary level refreshes read this field after reindexing.
+        this.volume = newVolume;
         final double newMass = newCollider.mass() * massScale;
         body.setShape(newCollider.toCompoundShape(), body.type() == BodyType.DYNAMIC ? newMass : 0.0);
 

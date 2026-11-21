@@ -1,11 +1,13 @@
 package io.mikaple.crythst.integration.fabric.client;
 
-import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureRay;
 import io.mikaple.crythst.math.Transform3d;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.Gizmos;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
@@ -29,6 +31,21 @@ public final class StructureSelectionRenderer {
         if (hit == null || hit.pose() == null || hit.point() == null) {
             return;
         }
+
+        // Do not draw a selection box through a closer vanilla block. The
+        // structure raycast itself only compares structures; this mirrors the
+        // player's normal block pick for occlusion.
+        final Vec3 eye = minecraft.player.getEyePosition();
+        final Vec3 hitPoint = new Vec3(hit.point().x, hit.point().y, hit.point().z);
+        final BlockHitResult blockHit = minecraft.level.clip(new ClipContext(
+                eye, hitPoint, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, minecraft.player));
+        if (blockHit.getType() != HitResult.Type.MISS) {
+            final double blockDistance = Math.sqrt(blockHit.getLocation().distanceToSqr(eye));
+            if (blockDistance + 0.01 < hit.distance()) {
+                return;
+            }
+        }
+
         final Transform3d pose = hit.pose();
         final double scale = hit.blockScale();
         final Vector3d local = pose.inverseTransformPoint(hit.point());

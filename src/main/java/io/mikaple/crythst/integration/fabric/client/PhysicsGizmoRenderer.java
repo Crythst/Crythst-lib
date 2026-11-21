@@ -1,12 +1,10 @@
 package io.mikaple.crythst.integration.fabric.client;
 
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
-import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.OrientedBox;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.collision.ContactEvent;
 import io.mikaple.crythst.physics.collision.ContactPoint;
-import io.mikaple.crythst.physics.debug.BodyDebugInfo;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -16,14 +14,11 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.GizmoStyle;
 import net.minecraft.gizmos.Gizmos;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
  * Debug-only gizmo renderer used to validate the physics integration.
@@ -41,8 +36,6 @@ import java.util.Set;
 public final class PhysicsGizmoRenderer {
     private static final int COLOR_CYAN = 0xFF00FFFF;
     private static final int FILL_CYAN = 0x1800FFFF;
-    private static final int COLOR_WHITE = 0xFFFFFFFF;
-    private static final int COLOR_GRAY = 0xFF505050;
     private static final int COLOR_YELLOW = 0xFFFFFF00;
     private static final int COLOR_GREEN = 0xFF00FF00;
     private static final int COLOR_MAGENTA = 0xFFFF00FF;
@@ -72,17 +65,15 @@ public final class PhysicsGizmoRenderer {
         final float alpha = Minecraft.getInstance().getDeltaTracker()
                 .getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
-        final Set<Long> structureBodyIds = new HashSet<>(Math.max(16, structures.size() * 2));
 
         for (PhysicsStructure structure : structures) {
             final StructureRenderState state = structure.renderState(alpha);
-            structureBodyIds.add(state.bodyId());
             drawStructure(state);
         }
 
         final PhysicsDebugSnapshot debug = ClientPhysicsView.debug();
         if (debug != null) {
-            drawDebugSnapshot(debug, structureBodyIds);
+            drawDebugSnapshot(debug);
         }
     }
 
@@ -96,11 +87,13 @@ public final class PhysicsGizmoRenderer {
         final double blockScale = state.blockScale();
 
         for (VoxelBox box : state.collider().boxes()) {
+            // The structure pose already includes the centre-of-mass offset;
+            // collider boxes are unshifted voxel coordinates here.
             final Vector3d localCenter = new Vector3d(
                     (box.minX() + box.sizeX() * 0.5) * blockScale,
                     (box.minY() + box.sizeY() * 0.5) * blockScale,
                     (box.minZ() + box.sizeZ() * 0.5) * blockScale
-            ).sub(centerOfMassOffset);
+            );
             final Vector3d center = pose.transformPoint(localCenter);
             final Vector3d halfExtents = new Vector3d(
                     box.sizeX() * blockScale * 0.5,
@@ -119,18 +112,11 @@ public final class PhysicsGizmoRenderer {
     }
 
     /**
-     * Draws bodies that do not belong to a structure, plus the world origin and
-     * the gravity/up axes.
+     * Draws the world origin, gravity/up axes and contact points. Loose bodies
+     * are drawn by {@link LooseBodyRenderer}, which stays active even when the
+     * debug overlay is off, so they are deliberately not duplicated here.
      */
-    private static void drawDebugSnapshot(PhysicsDebugSnapshot debug, Set<Long> structureBodyIds) {
-        for (BodyDebugInfo body : debug.bodies()) {
-            if (body.terrain() || structureBodyIds.contains(body.id())) {
-                continue;
-            }
-            drawOrientedBox(body.obb(), COLOR_WHITE, 0x40A0A0A0, 1.0f);
-            Gizmos.cuboid(toAabb(body.aabb()), GizmoStyle.stroke(COLOR_GRAY, 1.0f));
-        }
-
+    private static void drawDebugSnapshot(PhysicsDebugSnapshot debug) {
         final Vector3d origin = debug.origin();
         final Vec3 originPoint = toVec3(origin);
         Gizmos.point(originPoint, COLOR_ORIGIN, 0.35f);
@@ -216,10 +202,5 @@ public final class PhysicsGizmoRenderer {
 
     private static Vec3 toVec3(Vector3dc vector) {
         return new Vec3(vector.x(), vector.y(), vector.z());
-    }
-
-    private static AABB toAabb(Aabb aabb) {
-        return new AABB(aabb.min().x, aabb.min().y, aabb.min().z,
-                aabb.max().x, aabb.max().y, aabb.max().z);
     }
 }

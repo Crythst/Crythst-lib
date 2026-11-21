@@ -106,19 +106,18 @@ final class StructureBatchCache {
     static Body getOrCreate(ResourceKey<Level> dimension,
                             StructureBatchSnapshots.Snapshot snapshot,
                             Transform3d pose,
-                            double blockScale,
-                            Vector3d centerOfMassOffset) {
+                            double blockScale) {
         final BodyKey key = new BodyKey(dimension, snapshot.bodyId());
         final long generation = BlockGeometryCache.generation();
         Body body = BODIES.get(key);
 
-        if (body != null && !body.matches(snapshot, blockScale, centerOfMassOffset, generation)) {
+        if (body != null && !body.matches(snapshot, blockScale, generation)) {
             remove(key, body);
             body = null;
         }
 
         if (body == null) {
-            body = Body.create(key, snapshot, pose, blockScale, centerOfMassOffset, generation);
+            body = Body.create(key, snapshot, pose, blockScale, generation);
             BODIES.put(key, body);
         } else {
             body.refresh(snapshot);
@@ -304,9 +303,6 @@ final class StructureBatchCache {
         final int sizeY;
         final int sizeZ;
         final double blockScale;
-        final double centerOfMassX;
-        final double centerOfMassY;
-        final double centerOfMassZ;
         final long generation;
         final Section[] sections;
 
@@ -324,7 +320,7 @@ final class StructureBatchCache {
         double frameCameraZ;
 
         private Body(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
-                     Transform3d pose, double blockScale, Vector3d centerOfMassOffset,
+                     Transform3d pose, double blockScale,
                      long generation, Section[] sections) {
             this.key = key;
             this.snapshot = snapshot;
@@ -336,9 +332,6 @@ final class StructureBatchCache {
             this.sizeY = snapshot.sizeY();
             this.sizeZ = snapshot.sizeZ();
             this.blockScale = blockScale;
-            this.centerOfMassX = centerOfMassOffset.x;
-            this.centerOfMassY = centerOfMassOffset.y;
-            this.centerOfMassZ = centerOfMassOffset.z;
             this.generation = generation;
             this.sections = sections;
             this.framePose = pose;
@@ -346,7 +339,7 @@ final class StructureBatchCache {
         }
 
         static Body create(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
-                           Transform3d pose, double blockScale, Vector3d centerOfMassOffset,
+                           Transform3d pose, double blockScale,
                            long generation) {
             final int sectionsX = (snapshot.sizeX() + SECTION_SIZE - 1) / SECTION_SIZE;
             final int sectionsY = (snapshot.sizeY() + SECTION_SIZE - 1) / SECTION_SIZE;
@@ -367,12 +360,12 @@ final class StructureBatchCache {
                         sections.add(Section.create(snapshot,
                                 originX, originY, originZ,
                                 sectionSizeX, sectionSizeY, sectionSizeZ,
-                                blockScale, centerOfMassOffset));
+                                blockScale));
                     }
                 }
             }
 
-            final Body body = new Body(key, snapshot, pose, blockScale, centerOfMassOffset,
+            final Body body = new Body(key, snapshot, pose, blockScale,
                     generation, sections.toArray(Section[]::new));
             for (Section section : body.sections) {
                 section.body = body;
@@ -381,12 +374,9 @@ final class StructureBatchCache {
         }
 
         boolean matches(StructureBatchSnapshots.Snapshot snapshot,
-                        double blockScale, Vector3d centerOfMassOffset, long generation) {
+                        double blockScale, long generation) {
             return this.generation == generation
                     && this.blockScale == blockScale
-                    && this.centerOfMassX == centerOfMassOffset.x
-                    && this.centerOfMassY == centerOfMassOffset.y
-                    && this.centerOfMassZ == centerOfMassOffset.z
                     && this.minX == snapshot.minX()
                     && this.minY == snapshot.minY()
                     && this.minZ == snapshot.minZ()
@@ -489,13 +479,16 @@ final class StructureBatchCache {
         static Section create(StructureBatchSnapshots.Snapshot snapshot,
                               int originX, int originY, int originZ,
                               int sizeX, int sizeY, int sizeZ,
-                              double blockScale, Vector3d centerOfMass) {
-            final double localMinX = originX * blockScale - centerOfMass.x();
-            final double localMinY = originY * blockScale - centerOfMass.y();
-            final double localMinZ = originZ * blockScale - centerOfMass.z();
-            final double localMaxX = (originX + sizeX) * blockScale - centerOfMass.x();
-            final double localMaxY = (originY + sizeY) * blockScale - centerOfMass.y();
-            final double localMaxZ = (originZ + sizeZ) * blockScale - centerOfMass.z();
+                              double blockScale) {
+            // Section coordinates are structure-local metres. The structure
+            // pose (not the body pose) already handles centre-of-mass offset;
+            // subtracting it here would double-shift the rendering.
+            final double localMinX = originX * blockScale;
+            final double localMinY = originY * blockScale;
+            final double localMinZ = originZ * blockScale;
+            final double localMaxX = (originX + sizeX) * blockScale;
+            final double localMaxY = (originY + sizeY) * blockScale;
+            final double localMaxZ = (originZ + sizeZ) * blockScale;
 
             final BlockState[] states = new BlockState[sizeX * sizeY * sizeZ];
             final Section section = new Section(originX, originY, originZ,

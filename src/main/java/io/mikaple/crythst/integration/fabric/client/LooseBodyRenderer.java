@@ -4,6 +4,7 @@ import io.mikaple.crythst.math.OrientedBox;
 import io.mikaple.crythst.physics.body.BodyType;
 import io.mikaple.crythst.physics.debug.BodyDebugInfo;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
+import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.GizmoStyle;
@@ -34,9 +35,11 @@ public final class LooseBodyRenderer {
         if (debug == null) {
             return;
         }
+        final float alpha = minecraft.getDeltaTracker()
+                .getGameTimeDeltaPartialTick(false);
         final Set<Long> structureIds = new HashSet<>();
-        for (var structure : ClientPhysicsView.structures()) {
-            structureIds.add(structure.body().id());
+        for (PhysicsStructure structure : ClientPhysicsView.structures()) {
+            structureIds.add(structure.renderState(alpha).bodyId());
         }
         for (BodyDebugInfo body : debug.bodies()) {
             if (body.terrain() || structureIds.contains(body.id())

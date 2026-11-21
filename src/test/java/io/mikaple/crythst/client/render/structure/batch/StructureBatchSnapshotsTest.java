@@ -9,6 +9,7 @@ import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
+import net.minecraft.resources.Identifier;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Block;
@@ -78,7 +79,7 @@ class StructureBatchSnapshotsTest {
                 1.0,
                 100.0,
                 new Vector3d(0.5, 0.5, 0.5));
-        ClientStructureCache.apply(new StructureSnapshotPayload(List.of(wire), 0, 1, true));
+        ClientStructureCache.apply(new StructureSnapshotPayload(1L, Identifier.fromNamespaceAndPath("minecraft", "overworld"), List.of(wire), 0, 1, true));
 
         final ClientStructureSnapshot source = ClientStructureCache.get(42L);
         final StructureBatchSnapshots.Snapshot view =
@@ -93,13 +94,15 @@ class StructureBatchSnapshotsTest {
         assertTrue(view.stateAt(1, 0, 0).isAir());
 
         final Aabb world = StructureBatchSnapshots.worldBounds(
-                view, source.pose(), source.blockScale(), source.centerOfMassOffset());
-        assertEquals(0.5, world.min().x, 1.0e-12);
-        assertEquals(1.5, world.min().y, 1.0e-12);
-        assertEquals(2.5, world.min().z, 1.0e-12);
-        assertEquals(2.5, world.max().x, 1.0e-12);
-        assertEquals(2.5, world.max().y, 1.0e-12);
-        assertEquals(3.5, world.max().z, 1.0e-12);
+                view, source.pose(), source.blockScale());
+        // Pose is the structure pose; no centre-of-mass offset is applied to
+        // the rendered local bounds.
+        assertEquals(1.0, world.min().x, 1.0e-12);
+        assertEquals(2.0, world.min().y, 1.0e-12);
+        assertEquals(3.0, world.min().z, 1.0e-12);
+        assertEquals(3.0, world.max().x, 1.0e-12);
+        assertEquals(3.0, world.max().y, 1.0e-12);
+        assertEquals(4.0, world.max().z, 1.0e-12);
     }
 
     @Test
@@ -115,14 +118,14 @@ class StructureBatchSnapshotsTest {
                 1.0,
                 10.0,
                 new Vector3d(0.5, 0.5, 0.5));
-        ClientStructureCache.apply(new StructureSnapshotPayload(List.of(firstWire), 0, 1, true));
+        ClientStructureCache.apply(new StructureSnapshotPayload(2L, Identifier.fromNamespaceAndPath("minecraft", "overworld"), List.of(firstWire), 0, 1, true));
 
         final NetworkStructureSource source = new NetworkStructureSource();
         source.beginFrame();
         final StructureBatchSnapshots.Snapshot first =
                 source.geometry(ClientStructureCache.get(5L));
 
-        ClientStructureCache.applyPose(new StructurePosePayload(List.of(
+        ClientStructureCache.applyPose(new StructurePosePayload(2L, List.of(
                 new StructurePosePayload.PoseUpdate(5L,
                         Transform3d.of(new Vector3d(10, 0, 0))))));
         source.beginFrame();
@@ -140,7 +143,7 @@ class StructureBatchSnapshotsTest {
                 1.0,
                 10.0,
                 new Vector3d(0.5, 0.5, 0.5));
-        ClientStructureCache.apply(new StructureSnapshotPayload(List.of(secondWire), 0, 1, true));
+        ClientStructureCache.apply(new StructureSnapshotPayload(3L, Identifier.fromNamespaceAndPath("minecraft", "overworld"), List.of(secondWire), 0, 1, true));
         source.beginFrame();
         final StructureBatchSnapshots.Snapshot afterGeometry =
                 source.geometry(ClientStructureCache.get(5L));

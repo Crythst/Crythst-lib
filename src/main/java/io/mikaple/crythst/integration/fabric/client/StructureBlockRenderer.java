@@ -4,11 +4,7 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.math.Aabb;
-import io.mikaple.crythst.math.OrientedBox;
 import io.mikaple.crythst.math.Transform3d;
-import io.mikaple.crythst.physics.body.BodyType;
-import io.mikaple.crythst.physics.debug.BodyDebugInfo;
-import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
@@ -24,22 +20,19 @@ import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 
 /**
- * Draws physics structures and simple dynamic bodies as solid block-form
- * cuboids so the simulation can be validated without the wireframe overlay.
+ * Draws physics structures as solid block-form cuboids so the simulation can be
+ * validated without the wireframe overlay.
  *
  * <p>Every solid voxel of a {@link StructureRenderState} is rendered as its own
  * shaded cube (merged colliders are expanded back into cells), using the
- * structure's interpolated render pose and centre-of-mass offset. Bodies that
- * do not belong to a structure are drawn from the {@link PhysicsDebugSnapshot}
- * as filled oriented boxes. Geometry is submitted through the vanilla
- * {@link SubmitNodeCollector} with {@link RenderTypes#debugFilledBox()}, so it
- * is depth-tested against terrain and participates in the normal 26.3 render
- * pipeline.</p>
+ * structure's interpolated render pose. Loose bodies that do not belong to a
+ * structure are drawn by {@link LooseBodyRenderer}, not here. Geometry is
+ * submitted through the vanilla {@link SubmitNodeCollector} with
+ * {@link RenderTypes#debugFilledBox()}, so it is depth-tested against terrain
+ * and participates in the normal 26.3 render pipeline.</p>
  *
  * <p>This class only reads immutable snapshots produced on the server thread.
  * It never calls {@code body()}, {@code pose()} or {@code obb()} on a
@@ -65,12 +58,6 @@ public final class StructureBlockRenderer {
     private static final int COLOR_ICE = 0x8FD0EF;
     private static final int COLOR_RUBBER = 0x4C4C4C;
     private static final int COLOR_DEFAULT = 0xB0A18C;
-
-    private static final int COLOR_DYNAMIC = 0xD6D6D6;
-    private static final int COLOR_KINEMATIC = 0xA6C6E4;
-    private static final int COLOR_STATIC = 0x8C8C8C;
-
-    private static final Vector3d ORIGIN = new Vector3d();
 
     private static volatile boolean blockRenderingEnabled = true;
 
@@ -118,14 +105,11 @@ public final class StructureBlockRenderer {
         final float alpha = Minecraft.getInstance().getDeltaTracker()
                 .getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
-        final PhysicsDebugSnapshot debug = ClientPhysicsView.debug();
 
         final List<Cuboid> cuboids = new ArrayList<>();
-        final Set<Long> structureBodyIds = new HashSet<>(Math.max(16, structures.size() * 2));
 
         for (PhysicsStructure structure : structures) {
             final StructureRenderState state = structure.renderState(alpha);
-            structureBodyIds.add(state.bodyId());
             if (!isVisible(camera, state.aabb())) {
                 continue;
             }
@@ -133,13 +117,6 @@ public final class StructureBlockRenderer {
             if (cuboids.size() >= MAX_CUBOIDS_PER_FRAME) {
                 break;
             }
-        }
-
-        // The debug snapshot is only refreshed while debug output is enabled,
-        // so only consume it then (otherwise it may be one tick stale forever).
-        if (debug != null && CrythstFabric.config().debug
-                && cuboids.size() < MAX_CUBOIDS_PER_FRAME) {
-            collectBodies(debug, structureBodyIds, camera, cuboids);
         }
 
         if (cuboids.isEmpty()) {
@@ -175,7 +152,6 @@ public final class StructureBlockRenderer {
     private static void collectStructure(StructureRenderState state, CameraRenderState camera,
                                          List<Cuboid> out) {
         final Transform3d pose = state.pose();
-        final Vector3d centerOfMass = state.centerOfMassOffset();
         final double scale = state.blockScale();
         final double half = scale * 0.5;
         final Vector3d position = pose.position();
@@ -206,9 +182,9 @@ public final class StructureBlockRenderer {
             final int rgb = colorFor(box.material());
             if (!perVoxel) {
                 // One solid cuboid for the whole merged box.
-                final double localX = (box.minX() + box.sizeX() * 0.5) * scale - centerOfMass.x;
-                final double localY = (box.minY() + box.sizeY() * 0.5) * scale - centerOfMass.y;
-                final double localZ = (box.minZ() + box.sizeZ() * 0.5) * scale - centerOfMass.z;
+                final double localX = (box.minX() + box.sizeX() * 0.5) * scale;
+                final double localY = (box.minY() + box.sizeY() * 0.5) * scale;
+                final double localZ = (box.minZ() + box.sizeZ() * 0.5) * scale;
                 addCuboid(out, position, m00, m01, m02, m10, m11, m12, m20, m21, m22,
                         localX, localY, localZ,
                         box.sizeX() * half, box.sizeY() * half, box.sizeZ() * half,
@@ -220,9 +196,9 @@ public final class StructureBlockRenderer {
             for (int dy = 0; dy < box.sizeY(); dy++) {
                 for (int dz = 0; dz < box.sizeZ(); dz++) {
                     for (int dx = 0; dx < box.sizeX(); dx++) {
-                        final double localX = (box.minX() + dx + 0.5) * scale - centerOfMass.x;
-                        final double localY = (box.minY() + dy + 0.5) * scale - centerOfMass.y;
-                        final double localZ = (box.minZ() + dz + 0.5) * scale - centerOfMass.z;
+                        final double localX = (box.minX() + dx + 0.5) * scale;
+                        final double localY = (box.minY() + dy + 0.5) * scale;
+                        final double localZ = (box.minZ() + dz + 0.5) * scale;
                         final int variation = (box.minX() + dx) * 31
                                 + (box.minY() + dy) * 17
                                 + (box.minZ() + dz) * 13;
@@ -234,37 +210,6 @@ public final class StructureBlockRenderer {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    private static void collectBodies(PhysicsDebugSnapshot debug, Set<Long> structureBodyIds,
-                                      CameraRenderState camera, List<Cuboid> out) {
-        final double camX = camera.pos.x;
-        final double camY = camera.pos.y;
-        final double camZ = camera.pos.z;
-
-        for (BodyDebugInfo body : debug.bodies()) {
-            if (body.terrain() || structureBodyIds.contains(body.id())) {
-                continue;
-            }
-            final OrientedBox obb = body.obb();
-            final Vector3d center = obb.center();
-            final Vector3d halfExtents = obb.halfExtents();
-            if (!isVisible(camera, body.aabb())) {
-                continue;
-            }
-            final Quaterniondc rotation = obb.rotation();
-            final int rgb = colorFor(body.type());
-            addCuboid(out, ORIGIN,
-                    rotationMatrix00(rotation), rotationMatrix01(rotation), rotationMatrix02(rotation),
-                    rotationMatrix10(rotation), rotationMatrix11(rotation), rotationMatrix12(rotation),
-                    rotationMatrix20(rotation), rotationMatrix21(rotation), rotationMatrix22(rotation),
-                    center.x, center.y, center.z,
-                    halfExtents.x, halfExtents.y, halfExtents.z,
-                    shade(rgb, body.id()), camX, camY, camZ);
-            if (out.size() >= MAX_CUBOIDS_PER_FRAME) {
-                return;
             }
         }
     }
@@ -332,14 +277,6 @@ public final class StructureBlockRenderer {
             return COLOR_RUBBER;
         }
         return COLOR_DEFAULT;
-    }
-
-    private static int colorFor(BodyType type) {
-        return switch (type) {
-            case DYNAMIC -> COLOR_DYNAMIC;
-            case KINEMATIC -> COLOR_KINEMATIC;
-            case STATIC -> COLOR_STATIC;
-        };
     }
 
     /**
