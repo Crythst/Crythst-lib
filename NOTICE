@@ -1,0 +1,23 @@
+Crythst
+Copyright (c) 2026 mikaple
+
+This project is an independent implementation.
+
+The design of the physics layer is *inspired by* the problem space explored by
+Sable (https://github.com/ryanhcode/sable) -- namely, rigid-body simulation of
+moving block structures built from voxel collision shapes. No source code,
+class layout, comment text, or resource file from Sable or from any Sable port
+was copied into this repository. Ideas, public Minecraft/Fabric APIs, and
+general physics techniques (greedy voxel meshing, compound colliders,
+fixed-timestep integration, interpolated rendering poses) are not copyrightable
+and were implemented from scratch.
+
+Third-party components keep their own licenses; see THIRD_PARTY_NOTICES.md.
+
+Special rendering notice
+------------------------
+The item/block special-rendering pieces under io.mikaple.crythst.client.render
+are adapted from EnderTech, Copyright (c) 2026 Mikaple, the copyright holder of
+this repository. They are relicensed here under the MIT License together with
+the rest of Crythst. The original EnderTech project remains All-Rights-Reserved
+for third parties.

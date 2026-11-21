@@ -1,0 +1,180 @@
+plugins {
+    id 'java-library'
+    id 'net.fabricmc.fabric-loom' version '1.18-SNAPSHOT'
+}
+
+group = 'io.mikaple.crythst'
+version = project.mod_version
+
+base {
+    archivesName = "crythst-${minecraft_version}"
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(java_version as int)
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+    maven {
+        name = 'JitPack'
+        url = 'https://jitpack.io'
+    }
+}
+
+configurations {
+    // Native libraries are unpacked into our own jar, so the loader can pick the
+    // right binary for desktops *and* Android launchers (FCL, PojavLauncher, ...).
+    bulletNatives
+    bulletAndroidNatives
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+
+    implementation "net.fabricmc:fabric-loader:${fabric_loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${fabric_version}"
+
+    // JOML ships with Minecraft; it is part of our public API.
+    api "org.joml:joml:1.10.8"
+
+    // Create-Fly is optional. Compile against the local build when present so
+    // the Create compatibility layer can use direct types; never bundle it.
+    // Override with -Pcreate_fly_jar=/absolute/path/create-fly.jar.
+    def createFlyJar = providers.gradleProperty('create_fly_jar').getOrElse(
+            "${rootDir}/../Create-Fly/build/libs/create-fly-26.3-6.0.9-1.jar")
+    if (file(createFlyJar).isFile()) {
+        compileOnly files(createFlyJar)
+    } else {
+        compileOnly("com.github.LyXith:create-fly-fly:pack-26.3-latest") {
+            transitive = false
+        }
+    }
+
+    // libbulletjme JVM library. All seven desktop artifact IDs contain the same
+    // classes; Linux64 is used as the canonical one.
+    implementation("com.github.stephengold:Libbulletjme-Linux64:${libbulletjme_version}") {
+        transitive = false
+    }
+    include("com.github.stephengold:Libbulletjme-Linux64:${libbulletjme_version}")
+
+    // Desktop natives (release builds). Extract every supported platform.
+    bulletNatives "com.github.stephengold:Libbulletjme-Linux64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+    bulletNatives "com.github.stephengold:Libbulletjme-Linux_ARM64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+    bulletNatives "com.github.stephengold:Libbulletjme-Windows64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+    bulletNatives "com.github.stephengold:Libbulletjme-Windows_ARM64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+    bulletNatives "com.github.stephengold:Libbulletjme-MacOSX64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+    bulletNatives "com.github.stephengold:Libbulletjme-MacOSX_ARM64:${libbulletjme_version}:${libbulletjme_native_flavour}"
+
+    // Android ABIs (FCL/Pojav-style launchers). The AAR exposes jni/<abi>/*.so.
+    bulletAndroidNatives "com.github.stephengold:Libbulletjme-Android:${libbulletjme_version}:${libbulletjme_native_flavour}@aar"
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+loom {
+    mods {
+        crythst {
+            sourceSet sourceSets.main
+        }
+    }
+    runs {
+        client {
+            client()
+            name = 'Crythst Client'
+            runDir = 'runs/client'
+        }
+        server {
+            server()
+            name = 'Crythst Server'
+            runDir = 'runs/server'
+        }
+    }
+}
+
+def generatedNativeResources = layout.buildDirectory.dir('generated/native-resources')
+def unpackedAndroidAar = layout.buildDirectory.dir('tmp/android-aar')
+
+tasks.register('unpackAndroidAar', Copy) {
+    from({ configurations.bulletAndroidNatives.collect { zipTree(it) } }) {
+        include 'jni/**'
+    }
+    into unpackedAndroidAar
+}
+
+tasks.register('collectNativeLibraries', Copy) {
+    dependsOn tasks.named('unpackAndroidAar')
+
+    from({ configurations.bulletNatives.collect { zipTree(it) } }) {
+        include 'native/**'
+    }
+    from(unpackedAndroidAar) {
+        include 'jni/**'
+        eachFile { details ->
+            details.path = details.path.replaceFirst('^jni/', 'native/android/')
+        }
+    }
+    into generatedNativeResources
+}
+
+sourceSets {
+    main {
+        resources {
+            srcDir generatedNativeResources
+        }
+    }
+}
+
+tasks.named('processResources').configure {
+    dependsOn tasks.named('collectNativeLibraries')
+    def properties = [
+            version            : project.version,
+            mod_id             : project.mod_id,
+            mod_name           : project.mod_name,
+            mod_author         : project.mod_author,
+            description        : project.description,
+            license            : project.license,
+            minecraft_version  : project.minecraft_version,
+            fabric_loader_version: project.fabric_loader_version,
+            fabric_version     : project.fabric_version
+    ]
+    inputs.properties(properties)
+    filesMatching(['fabric.mod.json']) {
+        expand properties
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = java_version as int
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('sourcesJar').configure {
+    dependsOn tasks.named('collectNativeLibraries')
+    // Sources jars never need platform binaries.
+    exclude 'native/**'
+}
+
+jar {
+    from('LICENSE') {
+        rename { 'LICENSE-crythst' }
+    }
+    from('NOTICE') {
+        rename { 'NOTICE-crythst' }
+    }
+    from('THIRD_PARTY_NOTICES.md')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+test {
+    useJUnitPlatform()
+    // Native smoke tests need the unpacked bulletjme binaries.
+    dependsOn tasks.named('collectNativeLibraries')
+}

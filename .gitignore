@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+out/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Minecraft / Loom dev runs
+runs/
+logs/
+crash-reports/
+*.log
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# OS / Python
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local native/secret overrides
+local.properties
