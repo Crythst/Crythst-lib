@@ -37,6 +37,7 @@ public final class CrythstClient implements ClientModInitializer {
         StructureSync.registerClient();
         PortalRenderer.register();
         ClientTickEvents.END_CLIENT_TICK.register(ClientPhysicsView::tick);
+        io.mikaple.crythst.integration.minecraft.entity.client.ClientPlayerStructureCollision.register();
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (TOGGLE_BLOCKS.consumeClick()) {
                 final boolean enabled = StructureBlockRenderer.toggleBlockRendering();
