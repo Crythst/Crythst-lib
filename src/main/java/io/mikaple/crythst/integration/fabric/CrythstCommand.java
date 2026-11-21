@@ -109,7 +109,19 @@ public final class CrythstCommand {
                     "Crythst timing: no physics world for this dimension yet"), false);
             return 0;
         }
-        source.sendSuccess(() -> Component.literal(physics.timingText()), false);
+        // Pose diagnostics live in the client renderer, which is absent on a
+        // dedicated server. Resolve them reflectively so this command still
+        // works server-side.
+        String poseDiagnostics = "";
+        try {
+            final Class<?> renderer = Class.forName(
+                    "io.mikaple.crythst.client.render.structure.batch.BatchedStructureRenderer");
+            poseDiagnostics = String.valueOf(renderer.getMethod("poseDiagnosticsText").invoke(null));
+        } catch (ReflectiveOperationException | LinkageError ignored) {
+            poseDiagnostics = "";
+        }
+        final String suffix = poseDiagnostics.isEmpty() ? "" : " | " + poseDiagnostics;
+        source.sendSuccess(() -> Component.literal(physics.timingText() + suffix), false);
         return 1;
     }
 

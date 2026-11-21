@@ -8,6 +8,7 @@ import io.mikaple.crythst.physics.body.BodyDef;
 import io.mikaple.crythst.physics.body.BodyHandle;
 import io.mikaple.crythst.physics.body.BodyType;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
+import io.mikaple.crythst.physics.tick.PoseTimeline;
 import io.mikaple.crythst.physics.voxel.VoxelColliderBuilder;
 import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
@@ -34,6 +35,13 @@ public final class PhysicsStructure implements AutoCloseable {
     private final double blockScale;
     private final double massScale;
     private final InterpolatedPose renderPose = new InterpolatedPose();
+    /**
+     * Timestamped render timeline used by renderers. The legacy
+     * {@link InterpolatedPose} above is kept for the public alpha API and for
+     * diagnostics; render sampling is driven by wall time because server-tick
+     * publishes and the client partial tick are not phase-locked.
+     */
+    private final PoseTimeline renderTimeline = new PoseTimeline();
 
     private volatile VoxelColliderData collider;
     private volatile Vector3d centerOfMassOffset;
@@ -66,7 +74,9 @@ public final class PhysicsStructure implements AutoCloseable {
 
         this.body = world.createBody(builder.build());
         this.body.setUserData(this);
-        this.renderPose.reset(pose());
+        final Transform3d initialPose = pose();
+        this.renderPose.reset(initialPose);
+        this.renderTimeline.reset(initialPose, System.nanoTime());
     }
 
     private Transform3d bodyTransformFor(Transform3d structurePose) {
@@ -108,40 +118,60 @@ public final class PhysicsStructure implements AutoCloseable {
     }
 
     /**
-     * Samples the render pose between the last two published server ticks.
+     * Samples the legacy alpha-based render pose between the last two
+     * published server ticks.
+     *
+     * <p>This method is retained for API compatibility and for deterministic
+     * tests. Renderers should use {@link #interpolatedPoseAt(long)} or
+     * {@link #renderState(double)}: the server tick boundary is not
+     * phase-locked to the client partial tick, so sampling a server-tick pose
+     * pair with the client alpha can jump whenever a server tick lands inside
+     * a client tick.</p>
      *
      * <p>{@code alpha} is expected to be Minecraft's tick partial tick
-     * ({@code DeltaTracker#getGameTimeDeltaPartialTick}) because
-     * {@link #syncRenderPose()} is called exactly once per server tick. The
-     * physics clock's own accumulator is intentionally <em>not</em> used here:
-     * a server tick may run several fixed substeps in a burst, so its remainder
-     * does not describe how far the render clock has advanced between ticks.</p>
+     * ({@code DeltaTracker#getGameTimeDeltaPartialTick}). The physics clock's
+     * own accumulator is intentionally <em>not</em> used here: a server tick
+     * may run several fixed substeps in a burst, so its remainder does not
+     * describe how far the render clock has advanced between ticks.</p>
      */
     public Transform3d interpolatedPose(double alpha) {
         return renderPose.sample(alpha);
     }
 
+    /**
+     * Samples the timestamped render timeline at {@code nowNanos}. The newest
+     * pose is delayed by one smoothed publish interval, so motion is smooth at
+     * frame rate regardless of server/client tick phase.
+     */
+    public Transform3d interpolatedPoseAt(long nowNanos) {
+        return renderTimeline.sample(nowNanos);
+    }
+
     public void setPose(Transform3d structurePose) {
         body.setTransform(bodyTransformFor(structurePose));
         body.activate();
-        renderPose.push(structurePose);
+        // A direct pose set is a discontinuity, not a tick-to-tick movement.
+        renderPose.reset(structurePose);
+        renderTimeline.reset(structurePose, System.nanoTime());
     }
 
     public void teleport(Transform3d structurePose) {
         body.teleport(bodyTransformFor(structurePose));
         renderPose.reset(structurePose);
+        renderTimeline.reset(structurePose, System.nanoTime());
     }
 
     /**
-     * Copies the body pose into the render interpolation buffer. Call exactly
-     * once per server tick, after simulation, so the two buffered poses line up
-     * with Minecraft's tick-based partial-tick interpolation. Do not call once
-     * per physics substep: substeps run in a burst inside one server tick, and
-     * the renderer would then interpolate only the last substep over the whole
-     * tick.
+     * Copies the body pose into the render interpolation buffers. Call exactly
+     * once per server tick, after simulation, so each timestamp marks the end
+     * of that tick's substep batch. Do not call once per physics substep:
+     * substeps run in a burst inside one server tick, and the renderer would
+     * then see every substep as a separate tick.
      */
     public void syncRenderPose() {
-        renderPose.push(pose());
+        final Transform3d current = pose();
+        renderPose.push(current);
+        renderTimeline.push(current, System.nanoTime());
     }
 
     /**
@@ -166,6 +196,16 @@ public final class PhysicsStructure implements AutoCloseable {
         return 2.0 * Math.acos(Math.min(1.0, dot));
     }
 
+    /** One-tick render delay currently used by the timestamped timeline. */
+    public long renderTimelineDelayNanos() {
+        return renderTimeline.delayNanos();
+    }
+
+    /** Number of render-timeline teleport/split/stale-gap snaps so far. */
+    public long renderTimelineSnapCount() {
+        return renderTimeline.snapCount();
+    }
+
     public OrientedBox obb() {
         return body.obb();
     }
@@ -176,9 +216,23 @@ public final class PhysicsStructure implements AutoCloseable {
 
     /**
      * Render-thread-safe snapshot. Does not touch native physics state.
+     *
+     * <p>The {@code alpha} argument is retained for source compatibility but is
+     * no longer used to sample the pose. Physics poses are published on the
+     * server tick boundary, which is not phase-locked to the client partial
+     * tick; callers therefore get the timestamped frame-time sample instead.
+     * Use {@link #renderStateAt(long)} when several structures must be sampled
+     * at exactly the same frame time.</p>
      */
     public StructureRenderState renderState(double alpha) {
-        return new StructureRenderState(body.id(), interpolatedPose(alpha),
+        return renderStateAt(System.nanoTime());
+    }
+
+    /**
+     * Render-thread-safe snapshot sampled at an explicit monotonic frame time.
+     */
+    public StructureRenderState renderStateAt(long nowNanos) {
+        return new StructureRenderState(body.id(), renderTimeline.sample(nowNanos),
                 collider, centerOfMassOffset, blockScale);
     }
 
@@ -243,6 +297,10 @@ public final class PhysicsStructure implements AutoCloseable {
         body.setTransform(Transform3d.of(newBodyPosition, oldBodyPose.rotation()));
         body.activate();
         syncRenderPose();
+        // Reindexing can move the origin when the centre of mass changes. The
+        // block world pose is preserved, but the structure pose itself may have
+        // shifted; do not interpolate across that re-anchor.
+        renderTimeline.reset(pose(), System.nanoTime());
     }
 
     public void setMaterial(PhysicsMaterial material) {

@@ -129,6 +129,7 @@ public final class BatchedStructureRenderer {
     private static final List<StructureBatchCache.Section> SPECIAL_SECTIONS = new ArrayList<>();
     private static final List<StructureRenderState> FALLBACK_BODIES = new ArrayList<>();
     private static final NetworkStructureSource NETWORK = new NetworkStructureSource();
+    private static final StructurePoseMonitor POSE_MONITOR = new StructurePoseMonitor();
     private static final Comparator<StructureBatchCache.Section> NEAR_FIRST =
             Comparator.comparingDouble(section -> section.frameDistanceSq);
     private static final Comparator<StructureBatchCache.Section> FAR_FIRST = NEAR_FIRST.reversed();
@@ -241,6 +242,18 @@ public final class BatchedStructureRenderer {
     }
 
     /**
+     * Rate-limited render pose-delta diagnostics. Intended to be appended to
+     * {@code /crythst timing} by the command owner:
+     * <pre>{@code
+     * source.sendSuccess(() -> Component.literal(physics.timingText()
+     *         + " | " + BatchedStructureRenderer.poseDiagnosticsText()), false);
+     * }</pre>
+     */
+    public static String poseDiagnosticsText() {
+        return POSE_MONITOR.summary();
+    }
+
+    /**
      * Collects this frame's structure geometry. Invoked from
      * {@code LevelRenderEvents.BEFORE_GIZMOS}.
      */
@@ -265,10 +278,17 @@ public final class BatchedStructureRenderer {
         }
 
         final long frameStart = System.nanoTime();
+        // Structure poses are published on the server tick boundary and network
+        // poses arrive at ~20 Hz. Sampling them with the client partial tick
+        // makes the mesh jump whenever a server update lands mid-client-tick,
+        // so both the local and network paths use the same timestamped,
+        // one-tick-delayed frame time instead.
+        final long frameNanos = frameStart;
         final float alpha = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
         final Set<Long> serverBodyIds = new HashSet<>(Math.max(16, structures.size() * 2));
 
+        POSE_MONITOR.beginFrame(frameNanos);
         StructureBatchCache.beginFrame(dimension);
         NETWORK.beginFrame();
         OPAQUE.clear();
@@ -291,8 +311,9 @@ public final class BatchedStructureRenderer {
         // Singleplayer/unintegrated path: live physics render states plus the
         // server-thread block snapshots. These body ids win over network data.
         for (PhysicsStructure structure : structures) {
-            final StructureRenderState state = structure.renderState(alpha);
+            final StructureRenderState state = structure.renderStateAt(frameNanos);
             serverBodyIds.add(state.bodyId());
+            POSE_MONITOR.observe(state.bodyId(), state.pose());
             if (!isVisible(camera, state.aabb())) {
                 continue;
             }
@@ -345,7 +366,9 @@ public final class BatchedStructureRenderer {
             }
 
             final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
-            final Transform3d pose = network.pose();
+            final Transform3d pose = ClientStructureCache.interpolatedPose(
+                    network.bodyId(), frameNanos);
+            POSE_MONITOR.observe(network.bodyId(), pose);
             final double blockScale = network.blockScale();
             if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
                     geometry, pose, blockScale))) {
@@ -412,6 +435,8 @@ public final class BatchedStructureRenderer {
                 }
             }
         }
+
+        POSE_MONITOR.endFrame(frameNanos);
 
         final long frameEnd = System.nanoTime();
         final double buildMillis = (buildEnd - buildStart) / 1_000_000.0;

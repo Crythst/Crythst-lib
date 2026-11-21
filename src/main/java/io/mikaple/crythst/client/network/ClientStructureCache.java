@@ -1,15 +1,18 @@
 package io.mikaple.crythst.client.network;
 
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
 import io.mikaple.crythst.network.structure.StructureSyncDebug;
+import io.mikaple.crythst.physics.tick.PoseTimeline;
 import net.minecraft.resources.Identifier;
 
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Client-side cache of physics structures received from the server.
@@ -29,6 +32,14 @@ import java.util.Map;
  */
 public final class ClientStructureCache {
     private static volatile Map<Long, ClientStructureSnapshot> snapshots = Map.of();
+    /**
+     * Timestamped pose timelines for network structures. Pose packets arrive
+     * at roughly 20 Hz (and only when the server pose changed), so the renderer
+     * must not read {@link ClientStructureSnapshot#pose()} directly. Entries
+     * are mutated in place by {@link #applyPose}; {@link PoseTimeline} is
+     * internally immutable/volatile and safe to sample from the render thread.
+     */
+    private static final Map<Long, PoseTimeline> POSE_TIMELINES = new ConcurrentHashMap<>();
     private static volatile long revision;
     private static volatile long activeSyncId;
     private static volatile Identifier activeDimension;
@@ -51,6 +62,15 @@ public final class ClientStructureCache {
      * @return {@code false} when the packet belongs to a stale session
      */
     public static synchronized boolean apply(StructureSnapshotPayload payload) {
+        return apply(payload, System.nanoTime());
+    }
+
+    /**
+     * Timed overload used by tests and by callers that already have a receive
+     * timestamp. Full snapshots are treated as snap points: a resync must not
+     * interpolate from a pose that may be seconds old.
+     */
+    static synchronized boolean apply(StructureSnapshotPayload payload, long receivedNanos) {
         final boolean reset = payload.replaceAll() && payload.firstBatch();
         if (!reset && payload.syncId() != activeSyncId) {
             stalePackets++;
@@ -73,7 +93,12 @@ public final class ClientStructureCache {
                 reset ? new HashMap<>() : new HashMap<>(snapshots);
         for (StructureSnapshot wire : payload.structures()) {
             next.put(wire.bodyId(), ClientStructureSnapshot.fromWire(wire));
+            timeline(wire.bodyId()).reset(wire.pose(), receivedNanos);
         }
+        // Drop timelines for bodies that are no longer present. On a batched
+        // full sync this only removes bodies from the previous session; later
+        // batches create their own timelines when they arrive.
+        POSE_TIMELINES.keySet().retainAll(next.keySet());
         snapshots = Map.copyOf(next);
         revision++;
         appliedBatches++;
@@ -92,6 +117,16 @@ public final class ClientStructureCache {
      * @return {@code false} when the packet belongs to a stale session
      */
     public static synchronized boolean applyPose(StructurePosePayload payload) {
+        return applyPose(payload, System.nanoTime());
+    }
+
+    /**
+     * Timed overload used by tests and by callers that already have a receive
+     * timestamp. Poses are pushed into the per-body render timeline; the
+     * snapshot's raw pose is only kept as a fallback for callers that have no
+     * timeline yet.
+     */
+    static synchronized boolean applyPose(StructurePosePayload payload, long receivedNanos) {
         if (payload.syncId() != activeSyncId) {
             stalePackets++;
             StructureSyncDebug.log("client ignored pose sync={} active={} updates={}",
@@ -107,6 +142,7 @@ public final class ClientStructureCache {
             final ClientStructureSnapshot existing = next.get(update.bodyId());
             if (existing != null) {
                 next.put(update.bodyId(), existing.withPose(update.pose()));
+                timeline(update.bodyId()).push(update.pose(), receivedNanos);
                 changed = true;
             } else {
                 unknownPoseUpdates++;
@@ -146,6 +182,7 @@ public final class ClientStructureCache {
             } else {
                 unknownRemovals++;
             }
+            POSE_TIMELINES.remove(bodyId);
         }
         if (changed) {
             snapshots = Map.copyOf(next);
@@ -167,6 +204,32 @@ public final class ClientStructureCache {
 
     public static ClientStructureSnapshot get(long bodyId) {
         return snapshots.get(bodyId);
+    }
+
+    /**
+     * Returns the interpolated render pose for a network structure at an
+     * explicit monotonic frame time.
+     *
+     * <p>The newest pose is delayed by one smoothed receive interval. The
+     * result falls back to the snapshot pose when no timeline exists yet (for
+     * example a body that arrived before interpolation was enabled).</p>
+     */
+    public static Transform3d interpolatedPose(long bodyId, long nowNanos) {
+        final PoseTimeline timeline = POSE_TIMELINES.get(bodyId);
+        if (timeline != null) {
+            return timeline.sample(nowNanos);
+        }
+        final ClientStructureSnapshot snapshot = snapshots.get(bodyId);
+        return snapshot == null ? Transform3d.IDENTITY : snapshot.pose();
+    }
+
+    /** Number of bodies currently carrying a render pose timeline. */
+    public static int interpolatedBodyCount() {
+        return POSE_TIMELINES.size();
+    }
+
+    private static PoseTimeline timeline(long bodyId) {
+        return POSE_TIMELINES.computeIfAbsent(bodyId, ignored -> new PoseTimeline());
     }
 
     public static int size() {
@@ -191,6 +254,7 @@ public final class ClientStructureCache {
     /** Human-readable diagnostics for a debug command/overlay. */
     public static String statusText() {
         return "client structures=" + snapshots.size()
+                + " interpolated=" + POSE_TIMELINES.size()
                 + " revision=" + revision
                 + " syncId=" + activeSyncId
                 + " dimension=" + (activeDimension == null ? "none" : activeDimension)
@@ -206,6 +270,7 @@ public final class ClientStructureCache {
 
     public static synchronized void clear() {
         snapshots = Map.of();
+        POSE_TIMELINES.clear();
         activeSyncId = 0L;
         activeDimension = null;
         lastBatchIndex = -1;

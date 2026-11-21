@@ -22,7 +22,9 @@ Fabric integration, mixins or config.
 | `.../batch/BlockGeometryCache.java` | Palette cache: `BlockState` → baked quads with atlas UVs, tint and emission. |
 | `.../batch/FallbackCuboids.java` | Bounded coloured-cuboid fallback for bodies with no snapshot. |
 | `.../batch/BatchStats.java` | Immutable per-frame counter record. |
+| `.../batch/StructurePoseMonitor.java` | Rate-limited frame-to-frame pose-delta diagnostics. |
 | `.../batch/StructureVoxelView.java` | Read-only cross-section occupancy/state view used by meshing. |
+| `.../physics/tick/PoseTimeline.java` | Timestamped, one-tick-delayed pose sampler shared by local and network paths. |
 | `.../light/StructureLightOccluder.java` | Immutable bitset of solid voxels; public occlusion API. |
 | `.../light/VoxelLighting.java` | Pure face-culling and vertex-AO rules, shared with tests. |
 | `docs/batched-structure-rendering.md` | This document. |
@@ -145,6 +147,18 @@ Rebuilds stay cheap and correct at section borders: a changed section marks all
 sections within one voxel of its bounds dirty, because culling and AO read one
 cell across a border. A body with more than 16 simultaneously changed sections
 invalidates all of its sections instead of doing a quadratic neighbourhood walk.
+
+### Pose interpolation and precision
+
+The section transform is sampled from a timestamped `PoseTimeline`, not from
+Minecraft's client partial tick. Server physics poses are published on the
+server tick boundary, while the client alpha describes the client tick; the two
+loops are not phase-locked, so alpha sampling made moving structures jump
+whenever a server tick landed mid-client-tick. The timeline samples
+`now - one smoothed publish interval` and clamps rather than extrapolating.
+Teleports, reindexing and splits reset it. Multiplayer poses go through the same
+timeline: `ClientStructureCache.applyPose` records a timestamp and the renderer
+calls `ClientStructureCache#interpolatedPose(bodyId, frameNanos)`.
 
 ### Transform and precision
 
@@ -305,6 +319,9 @@ frame. A future custom GPU-buffer backend could remove that replay too.
 * `buildMillisLastFrame`, `submitMillisLastFrame`
 
 `statsText()` returns the same as one line for a HUD or command.
+`poseDiagnosticsText()` returns the rate-limited maximum frame-to-frame
+structure pose delta over the last two seconds (see
+`docs/physics-timing.md` for the `/crythst timing` snippet).
 
 Runtime controls:
 
@@ -374,10 +391,12 @@ the per-block renderer.
 * **Special model renderers, block entities, animated model parts outside the
   baked quad set and item/entity features are not reproduced.** The snapshot
   renderer only has baked block quads available.
-* **Snapshots are singleplayer-first.** In multiplayer `ClientPhysicsView` is
-  empty, so neither real renderer has structures to draw. If a snapshot exists
-  but is unavailable for a body (oversized/empty), the bounded coloured-cuboid
-  fallback is used.
+* **Singleplayer and multiplayer use different pose sources.** In singleplayer
+  `ClientPhysicsView` supplies live local `PhysicsStructure` poses; in
+  multiplayer `ClientStructureCache` supplies synced snapshots. Both are now
+  sampled through `PoseTimeline`, with one smoothed publish interval of delay.
+  If a snapshot exists but is unavailable for a body (oversized/empty), the
+  bounded coloured-cuboid fallback is used.
 * **Fallback is intentionally small.** A section that is still building or is
   over the global vertex budget can submit at most
   `MAX_FALLBACK_BLOCKS_PER_FRAME` individual blocks per frame. The fallback uses

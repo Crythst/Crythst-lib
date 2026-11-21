@@ -162,7 +162,7 @@ public final class PhysicsTimingMonitor {
                     + " poseAngle=" + String.format("%.4f", poseDeltaRadians) + "rad"
                     + " stepJitter=" + String.format("%.2f", stepJitter)
                     + " poseJitter=" + String.format("%.5f", poseJitterMetres) + "m"
-                    + " | pose alpha = Minecraft tick partial tick";
+                    + " | render pose = timestamped, one-tick delay";
         }
 
         private static String millis(double seconds) {

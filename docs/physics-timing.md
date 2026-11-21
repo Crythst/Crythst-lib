@@ -45,16 +45,16 @@ step counts eliminate the tick-rate component.
 
 ## Chosen policy
 
-**Tick-locked simulation + one render-pose publish per server tick + Minecraft
-tick partial tick as the render alpha.**
+**Tick-locked simulation + one timestamped render-pose publish per server tick +
+a client-side, one-tick-delayed pose timeline.**
 
 - `FixedStepClock` is fed exactly one server tick of game time per tick:
   `1 / level.getServer().tickRateManager().tickrate()`.
 - At 20 TPS with the default `fixedTimeStep = 1/60`, every tick runs exactly
   three substeps.
 - `syncRenderPose()` runs once per tick, **after** the whole substep batch.
-  The renderer interpolates the previous tick-boundary pose to the current
-  tick-boundary pose using the client partial tick.
+  It records the pose together with `System.nanoTime()` in
+  `PoseTimeline` (`physics/tick`).
 - The physics clock's accumulator (`world.interpolationAlpha()`) is **not** the
   render alpha. It describes the remainder to the next substep, and substeps
   are executed in a burst. Using it while publishing only tick-boundary poses
@@ -62,6 +62,52 @@ tick partial tick as the render alpha.**
 - `/tick` rate changes are respected: the budget is read every tick.
 - When the tick rate manager is frozen (and not manually stepping), physics and
   block logic are skipped, but the current render pose is retained.
+
+## Remaining moving-jitter: server tick vs client partial tick
+
+The first fix made the simulation tick-locked, which removed resting/step-count
+jitter. Moving structures still trembled because the render pose was sampled
+with Minecraft's **client** partial tick while poses are published on the
+**server** tick:
+
+- the integrated server runs its own tick thread; its 20 Hz tick boundaries are
+  not phase-locked to the client's 20 Hz tick boundaries;
+- when a server tick lands in the middle of a client tick, the
+  previous/current pose pair advances while the client alpha keeps rising from
+  its old value. The rendered pose jumps by roughly half a tick of motion, then
+  the alpha restarts. This is a sawtooth in velocity, visible as trembling
+  while the structure or the camera moves;
+- in multiplayer the renderer previously read `ClientStructureSnapshot.pose()`
+  directly, so the same problem was worse: a raw ~20 Hz pose with no
+  interpolation at all.
+
+The fix is to stop using a tick-clock alpha for structures and to sample a
+**timestamped timeline** at frame rate:
+
+- `PoseTimeline` stores the previous and current pose with the monotonic time
+  each was published. Render sampling uses `now - delay`, where `delay` is a
+  smoothed (EMA) estimate of the publish interval, clamped to
+  `[10 ms, 250 ms]`. At 20 TPS this is one tick (50 ms).
+- The sample point is always between the previous and current pose. The
+  timeline never extrapolates: if a publish is late it holds the current pose
+  until the next update arrives.
+- Explicit teleports (`PhysicsStructure#teleport`), direct pose sets, reindexing
+  and structure splits (new body id) reset the timeline. Implicit jumps
+  (`> 16` blocks or `> 120°` in one update, or a stale gap with movement) also
+  snap instead of interpolating.
+- The same sampler is used for local singleplayer poses
+  (`PhysicsStructure#renderStateAt`) and network poses
+  (`ClientStructureCache#interpolatedPose`, fed by `applyPose` timestamps).
+- All renderers that call `PhysicsStructure#renderState(double)` now receive
+  the timestamped frame-time sample. The `alpha` argument is retained for
+  source compatibility but is no longer used for pose selection.
+  `PhysicsStructure#interpolatedPose(double alpha)` remains available as the
+  legacy deterministic tick-alpha sampler.
+
+This preserves exactly one physics step per game tick and adds the same
+one-pose delay vanilla uses for entity interpolation, not a fixed extra tick of
+lag. When the tick rate changes, the EMA converges to the new interval within a
+few ticks.
 
 ## Fixed step choice: 1/60 vs 1/120
 
@@ -102,8 +148,25 @@ Example:
 ```text
 Crythst timing | mode=server-tick tick=1420 wallDt=50.01ms simDt=50.00ms
 steps=3 fixedAlpha=0.000 poseDelta=0.0184m poseAngle=0.0012rad
-stepJitter=0.00 poseJitter=0.00003m | pose alpha = Minecraft tick partial tick
+stepJitter=0.00 poseJitter=0.00003m | render pose = timestamped, one-tick delay
 ```
+
+The server-side command only knows about tick-to-tick pose deltas. To see the
+actual rendered frame deltas, append the batched renderer's rate-limited
+counter. The shared command file is owned elsewhere, so add this snippet there:
+
+```java
+// CrythstCommand#timing, after physics.timingText()
+source.sendSuccess(() -> Component.literal(
+        physics.timingText() + " | "
+                + io.mikaple.crythst.client.render.structure.batch
+                        .BatchedStructureRenderer.poseDiagnosticsText()), false);
+```
+
+`BatchedStructureRenderer.poseDiagnosticsText()` reports the maximum
+frame-to-frame structure pose delta over the last two seconds and the number of
+tracked bodies. It is also logged at `DEBUG` at most once per two seconds when
+the delta exceeds 5 cm/frame.
 
 Fields:
 
@@ -112,9 +175,10 @@ Fields:
 - `simDt`: time actually handed to `FixedStepClock`.
 - `steps`: fixed substeps run this tick.
 - `fixedAlpha`: `FixedStepClock` remainder (not the render alpha).
-- `poseDelta` / `poseAngle`: largest change between the two poses currently in
-  the structure's interpolation buffer (translation in metres, rotation in
-  radians).
+- `poseDelta` / `poseAngle`: largest change between the two server-tick poses
+  in the legacy tick-alpha buffer (translation in metres, rotation in radians).
+  These are simulation-side values; rendered frame deltas come from
+  `BatchedStructureRenderer#poseDiagnosticsText()`.
 - `stepJitter`: mean absolute deviation of step counts over 40 ticks. A stable
   3-step tick reports `0.00`; alternating 2/4 reports `1.00`.
 - `poseJitter`: mean absolute tick-to-tick change of the per-tick pose delta
@@ -123,19 +187,15 @@ Fields:
 
 `/crythst status` and `/crythst align` are unchanged.
 
-## Multiplayer limitation
+## Multiplayer path
 
-The singleplayer render path (`ClientPhysicsView` -> `PhysicsStructure` ->
-`InterpolatedPose`) now uses the stable tick policy above.
+The server still sends pose updates only when the structure moved (1 mm /
+1e-8 quaternion threshold), so a resting structure produces no network traffic.
 
-The synced multiplayer path is different: `BatchedStructureRenderer` reads the
-latest `ClientStructureSnapshot.pose()` directly from `ClientStructureCache`.
-That cache is intentionally passive and currently has no interpolation buffer,
-so remote structures still update at ~20 Hz without smoothing. The server-side
-pose diff already uses a 1 mm / 1e-8 quaternion threshold to avoid sending
-resting-body noise.
-
-Fixing remote interpolation requires a small change in the client network/cache
-layer (store the previous pose and timestamp/sequence in
-`ClientStructureSnapshot`, sample between them in the renderer). That package is
-owned by the multiplayer sync work and was intentionally not modified here.
+`ClientStructureCache.applyPose` now timestamps each received pose into the same
+`PoseTimeline` used by local structures. `BatchedStructureRenderer` samples
+`ClientStructureCache#interpolatedPose(bodyId, frameNanos)` instead of reading
+the raw snapshot pose. A full sync/resync is treated as a snap point, and body
+removal drops the timeline. The result is frame-rate smooth remote structures
+with one smoothed receive interval of delay; network arrival jitter that exceeds
+that window is held (clamped), never extrapolated.

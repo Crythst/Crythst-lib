@@ -59,6 +59,29 @@ class PhysicsStructureTest {
     }
 
     @Test
+    void teleportSnapsTheTimestampedRenderTimeline() {
+        try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
+            final MutableVoxelVolume volume = VoxelVolumes.filled(
+                    new IntBounds3(0, 0, 0, 2, 2, 2), 1000.0, PhysicsMaterial.STONE);
+            final PhysicsStructure structure = new PhysicsStructure(world,
+                    StructureDef.builder(volume)
+                            .pose(Transform3d.of(new Vector3d(0.0, 4.0, 0.0)))
+                            .build());
+
+            structure.syncRenderPose();
+            structure.teleport(Transform3d.of(new Vector3d(40.0, 4.0, 0.0)));
+
+            final Transform3d sampled = structure.renderStateAt(System.nanoTime()).pose();
+            assertEquals(40.0, sampled.position().x, 1.0e-6,
+                    "a teleport must not interpolate from the old pose");
+            assertTrue(structure.renderTimelineSnapCount() >= 1L,
+                    "teleport should be recorded as a timeline snap");
+
+            structure.close();
+        }
+    }
+
+    @Test
     void restingStructureHasNoVisibleTickToTickPoseOscillation() {
         try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
             final MutableVoxelVolume ground = VoxelVolumes.filled(

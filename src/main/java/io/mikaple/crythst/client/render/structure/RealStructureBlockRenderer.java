@@ -172,15 +172,17 @@ public final class RealStructureBlockRenderer {
             return;
         }
 
-        final float alpha = client.getDeltaTracker()
-                .getGameTimeDeltaPartialTick(false);
+        // Sample the timestamped pose timeline at one frame time for every
+        // structure. Server ticks are not phase-locked to the client partial
+        // tick, so the old alpha-based sample could jump mid-frame.
+        final long frameNanos = System.nanoTime();
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
         final List<FallbackBox> fallback = new ArrayList<>();
         final PoseStack pose = new PoseStack();
         int remaining = MAX_BLOCKS_PER_FRAME;
 
         for (PhysicsStructure structure : structures) {
-            final StructureRenderState state = structure.renderState(alpha);
+            final StructureRenderState state = structure.renderStateAt(frameNanos);
             if (!isVisible(camera, state.aabb())) {
                 continue;
             }
