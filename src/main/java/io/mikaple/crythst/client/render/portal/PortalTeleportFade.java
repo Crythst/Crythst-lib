@@ -112,7 +112,7 @@ public final class PortalTeleportFade {
             if (!snapshot.dimension().equals(minecraft.level.dimension())) {
                 continue;
             }
-            if (PortalCrossing.crossesFrontToBack(snapshot.plane(), previous, current)) {
+            if (PortalCrossing.crosses(snapshot.plane(), previous, current)) {
                 return true;
             }
         }

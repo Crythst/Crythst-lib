@@ -57,8 +57,18 @@ public final class PortalRenderer {
      */
     private static final boolean FLIP_V = Boolean.getBoolean("crythst.portal.flipV");
 
+    /**
+     * A/B switch: draw the procedural surface even when a captured destination
+     * texture is available.
+     */
+    private static final boolean FORCE_PROCEDURAL =
+            Boolean.getBoolean("crythst.portal.forceProcedural")
+                    || "false".equalsIgnoreCase(
+                    System.getProperty("crythst.portal.capture", "true"));
+
     private static volatile boolean registered;
     private static volatile boolean viewFailureLogged;
+    private static volatile boolean viewPathLogged;
 
     private PortalRenderer() {
     }
@@ -78,9 +88,22 @@ public final class PortalRenderer {
         LevelRenderEvents.BEFORE_GIZMOS.register(PortalRenderer::render);
         Crythst.LOGGER.info(
                 "Crythst portal renderer registered (destination capture + procedural fallback)");
+        if (FORCE_PROCEDURAL) {
+            Crythst.LOGGER.info(
+                    "Crythst portal debug: procedural surface forced (capture A/B mode)");
+        }
     }
 
     public static void render(LevelRenderContext context) {
+        // The destination capture must contain the world behind the portal,
+        // never another portal surface. Skipping every portal submission here
+        // (texture, procedural and coloured fallback) also guarantees no
+        // recursive texture feedback and removes the old "stars inside the
+        // portal view" artifact. The main pass is unaffected; uncaptured
+        // portals may still draw the procedural surface there.
+        if (PortalCapture.isCapturing()) {
+            return;
+        }
         final Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.level == null) {
             return;
@@ -163,12 +186,18 @@ public final class PortalRenderer {
         // in the dimension currently being rendered. Cross-dimension links
         // (and stale snapshots after a relink) fall back to the procedural
         // surface instead of showing an old, wrong scene.
-        if (!capturing && snapshot.viewableIn(dimension)
+        if (!FORCE_PROCEDURAL && !capturing && snapshot.viewableIn(dimension)
                 && PortalCapture.hasView(snapshot.id())) {
             final Identifier textureId = PortalCapture.textureId(snapshot.id());
             if (textureId != null) {
                 try {
-                    return PortalRenderTypes.view(textureId);
+                    final RenderType viewType = PortalRenderTypes.view(textureId);
+                    if (!viewPathLogged) {
+                        viewPathLogged = true;
+                        Crythst.LOGGER.info(
+                                "Crythst portal render path: offscreen destination texture '{}'", textureId);
+                    }
+                    return viewType;
                 } catch (Throwable error) {
                     if (!viewFailureLogged) {
                         viewFailureLogged = true;

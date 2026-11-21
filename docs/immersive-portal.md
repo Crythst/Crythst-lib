@@ -29,6 +29,7 @@
 | `mixin/client/PortalCaptureMixin.java` | 在主相机提取之前触发传送门捕获 |
 | `mixin/client/PortalCameraAccessor.java` | 临时设置/恢复真实 `Camera` 位姿与视锥 |
 | `mixin/client/PortalGameRendererMixin.java` | 捕获期间把 `mainRenderTarget()` 重定向到传送门离屏目标 |
+| `mixin/client/PortalLevelRendererMixin.java` | 捕获期间保持主 `ViewArea` 中心，避免 section mesh 被重置 |
 | `client/render/portal/PortalViewTexture.java` | 把离屏 `TextureTarget` 包装为 `TextureManager` 纹理 |
 | `client/render/portal/PortalRenderer.java` | `BEFORE_GIZMOS` 中的相机相对四边面渲染 + 回退色块 |
 | `client/render/portal/PortalRenderTypes.java` | 程序化 / 目标视图管线与 RenderType |
@@ -224,9 +225,11 @@ Q * rA = -rB
 exitLocal = (-x, y, -z)
 ```
 
-为什么法线要取反：实体从 `A` 的**正面**进入，应当从 `B` 的**正面**出来并远离
+为什么法线要取反：实体从 `A` 的**正面**进入，应当从 `B` 对应的面出来并远离
 `B` 表面。若使用 `nA -> nB`，玩家会在出口正面继续朝平面里走，立即再次穿越，
-形成循环。`nA -> -nB` 让进入速度 `-nA` 映射为 `+nB`，正确地从出口前面向外离开。
+形成循环。`nA -> -nB` 让进入速度 `-nA` 映射为 `+nB`，正确地从出口外面离开。
+同一个刚体变换同时适用于**双向**穿越：正面→背面从出口正面离开；背面→正面从出口
+背面离开；两者速度都指向远离出口平面的方向，因此视角在穿门瞬间保持连续。
 
 位置与方向变换：
 
@@ -263,8 +266,8 @@ pExit = pB + side * 0.6 * nB      // 物理体
 ```
 
 玩家不使用这个推出偏移：玩家脚点直接取 `T(eye) - (0, eyeHeight, 0)`，相机在穿门瞬间
-正好位于 `T(eye)`，因此视角连续。非玩家实体使用沿出口正面的小偏移（0.05 格），
-物理体仍使用 0.6 格。
+正好位于 `T(eye)`，因此视角连续。非玩家实体使用沿**变换后运动方向**的小偏移（0.05 格，
+正面/背面穿越会自动落在正确的一侧），物理体仍使用 0.6 格。
 
 同时每实体/物理体有 **10 tick 冷却**，并保证同一 tick 最多传送一次，避免
 出口平面立即把对象送回入口。
@@ -277,8 +280,9 @@ pExit = pB + side * 0.6 * nB      // 物理体
 
 1. 按维度遍历传送门，只处理 `linkedPortalId` 有效的门户对。
 2. 对每个实体：
-   - 用**上一 tick 采样点 → 当前采样点**的线段检测**正面 → 背面**穿越
-     （`PortalCrossing`），并要求交点在矩形内；不再使用厚 0.35 的包围盒中心板；
+   - 用**上一 tick 采样点 → 当前采样点**的线段检测**双向**平面穿越
+     （`PortalCrossing.findCrossing`），并要求交点在矩形内；不再使用厚 0.35 的包围盒中心板；
+     穿越时记录一次限流日志（portal、before/after signed distance、inside、结果）；
    - 玩家使用**眼睛位置**，其它 `LivingEntity` 也使用眼睛，非生物实体使用包围盒中心；
      这样玩家可以慢慢走进传送门：在眼睛越过平面之前，身体可以一半在入口一侧；
    - 过滤 removed、死亡、观察者、乘客、`noPhysics`、`Display`、末影龙部件；
@@ -286,7 +290,7 @@ pExit = pB + side * 0.6 * nB      // 物理体
    - 保留 `fallDistance` 与 `onGround`（合理近似）。
 3. 玩家目标点按**眼睛位置**计算：`feet = T(eye) - (0, eyeHeight, 0)`，且**不加额外偏移**，
    这样 vanilla 相机在穿门瞬间正好位于 `T(eye)`，相对门户的视角连续。非玩家实体沿
-   出口正面偏移 0.05 格。
+   变换后运动方向偏移 0.05 格（自动落到出口对应一侧）。
 4. 应用方式：
    - **同维度玩家**：`ServerPlayer.connection.teleport(PositionMoveRotation, Set.of())`，
      位置、变换后的速度与 yaw/pitch 一起发送，避免在门缝处丢失动量；
@@ -299,7 +303,7 @@ pExit = pB + side * 0.6 * nB      // 物理体
 
 ### 客户端过渡
 
-`PortalTeleportFade` 在客户端同样用眼睛的前→后穿越检测触发，只画 **2 tick、最大 alpha 0.18**
+`PortalTeleportFade` 在客户端同样用眼睛的双向平面穿越检测触发，只画 **2 tick、最大 alpha 0.18**
 的轻微暗化，作为穿门瞬间的视觉收尾；它不再用长黑屏掩盖瞬移。位置单 tick 跳跃 > 5 格的
 回退仍覆盖服务端传送/传送命令/重生（多人模式下没有传送门快照时尤其有用）。
 它只影响渲染，不改变输入、相机位置或移动逻辑，也不会触发资源重载。
@@ -378,7 +382,7 @@ PortalRenderer (BEFORE_GIZMOS)
 
 1. `PortalCaptureMixin` 注入 `LevelExtractor.extract` 的 **HEAD**，早于主相机状态重置。
 2. 保存真实 `Camera` 的位姿、`cullFrustum` / `capturedFrustum`，以及主相机的 `visibleSections`
-   / `nearbyVisibleSections` / `ViewArea` 中心。
+   / `nearbyVisibleSections`。
 3. 用 `PortalCameraAccessor` 临时把真实相机放到 `T(eye)`，并把一个显式视锥设为 captured。
    这样嵌套 `LevelExtractor.extract` 会为主相机之外的目标相机重新生成全部渲染状态，同时
    跳过 vanilla 的无界 `addSectionsInFrustum` 路径。
@@ -391,24 +395,52 @@ PortalRenderer (BEFORE_GIZMOS)
 6. 恢复相机、视锥、可见 section 和主相机渲染状态；外层未受影响的 `extract` 继续为主相机
    完成正常提取，不需要再补一次主相机 extraction。
 
+### 空白纹理/卡顿的真正原因（已修复）
+
+之前的捕获会在每次抓取时调用 `ViewArea.repositionCamera(portalCameraSection)`，抓取结束再
+调用一次恢复主相机中心。26.3 的 `RotatingSectionStorage.setSectionNode()` 在中心变化时会
+对涉及的 section 调用 `reset()`，把已编译的 mesh 置为 `UNCOMPILED` 并释放缓冲：
+
+1. section 中心移动到目标相机时，目标端附近的 section 被重置；紧接着
+   `LevelRenderer.prepareChunkRenders` 读不到 `getRenderSectionSlice`，目标纹理只剩清屏色
+   → **空白**。
+2. 每次捕获又移回主中心，主视图的 section 也被反复重置 → 重建/上传抖动和卡顿。
+
+修复：
+
+- 捕获**不再移动共享 `ViewArea`**。`PortalSectionSelection` 直接在现有主相机 section
+  storage 中查询目标相机附近的 section；storage 之外的 section 返回 null 并跳过。
+- 新增 `PortalLevelRendererMixin`：捕获期间取消 `LevelRenderer.repositionCamera` 的
+  `viewArea.repositionCamera`（只通过 `SectionRenderDispatcher.setCameraPosition` 更新
+  半透明排序用相机位置），主 pass 的行为完全不变。
+- 对仍在 `UNCOMPILED` 的目标 section 做有预算的 `compileAsync`（每轮最多 8 个），
+  下一轮正常 upload 后即可绘制；在至少一个 section 编译完成前保持回退，不展示纯清屏纹理。
+- 捕获前后隔离并恢复 projection UBO/type、model-view 栈（identity）、scissor、shader fog
+  和 global settings uniform。此前这些状态属于上一帧尾部或 GUI，可能让目标场景画到屏外
+  或只画到一个很小的 scissor 区域，同样表现为空白。
+- 显式清空离屏 target 的 color+depth 后再渲染；target 自带 depth attachment，viewport 为
+  target 全尺寸。
+
 关键细节：
 
-- 嵌套提取由 `PortalCapture.isCapturing()` 守卫，不会递归触发捕获；目标场景里的嵌套
-  传送门使用程序化表面，不会采样正在写入的纹理。
+- **捕获期间完全不提交传送门表面**：`PortalRenderer.render` 在
+  `PortalCapture.isCapturing()` 时直接返回（纹理、程序化和彩色回退全部跳过）。目标纹理只
+  包含目标端世界，不会把目标传送门自己的程序化星空画进去，也不会采样正在写入的纹理。
+  主 pass 不受影响，未捕获的其它传送门仍可使用程序化表面。
+- 嵌套提取由 `PortalCapture.isCapturing()` 守卫，不会递归触发捕获。
 - 传送门相机会先用 `PortalCameraSanity` 校验位置、四元数、view 旋转和透视投影；
   不合法时直接跳过捕获（限流的 DEBUG 日志）并回退程序化表面。
-- 如果目标端 section 为空、未加载或不在视锥内，本次捕获同样直接跳过并使用程序化表面，
-  避免捕获到“只有天空”的纹理。
-- **不再切换任何帧级渲染模式**，尤其是
+- 如果目标端 section 为空、未加载、没有编译完成的 mesh 或不在视锥内，本次捕获直接跳过并
+  使用上一次纹理/程序化表面，避免展示“只有天空”的纹理。
+- **不切换任何帧级渲染模式**，尤其是
   `shouldUseMultiDrawIndirectForTerrain`。之前的实现为捕获把它置 false 再恢复，导致
   `DynamicGpuData` 每帧销毁并重建 “Chunk Sections Instanced/UBO” 缓冲区，日志刷
   “Resizing Chunk Sections…” 并造成明显卡顿。现在捕获与主 pass 使用同一个模式；
   间接绘制缓冲区每帧写两份，容量最多一次性增长后保持稳定。
 - 地形顶点着色器使用 `Globals.CameraBlockPos/CameraOffset` 重建世界坐标；捕获前用传送门相机
-  位置重写一个私有 `GlobalSettingsUniform`，捕获结束后再用主相机位置恢复，否则目标视图会
-  整体偏移主相机与传送门相机之差。
+  位置重写私有 `GlobalSettingsUniform`，捕获结束后恢复捕获前的 global buffer。
 - 捕获 pass 不渲染天空（`shouldRenderSky=false`），避免共享 `SkyRenderer` 被重新绑定到离屏
-  目标；地形、雾色、实体和方块实体仍完整绘制。
+  目标；地形、雾色、实体、云和方块实体仍完整绘制。
 
 ### 传送门相机
 
@@ -429,8 +461,15 @@ u = ndc.x * 0.5 + 0.5
 v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit 一致
 ```
 
-> 诊断开关：`-Dcrythst.portal.flipV=true` 可翻转 v（仅用于确认后端纹理朝向）；
-> `-Dcrythst.portal.capture=false` 可完全关闭额外的目标场景提取/渲染并回退程序化表面。
+> 诊断开关：
+> - `-Dcrythst.portal.flipV=true` 翻转 v（确认后端纹理朝向）；
+> - `-Dcrythst.portal.capture=false` 完全关闭捕获并回退程序化表面；
+> - `-Dcrythst.portal.forceProcedural=true` 保留捕获但强制使用程序化表面（A/B 对比）；
+> - `-Dcrythst.portal.capture.dump=true` 把第一次成功捕获的离屏纹理写入
+>   `screenshots/`，用于确认目标纹理本身是否有内容；
+> - `-Dcrythst.portal.capture.intervalMs=220` 调整捕获间隔（默认 220 ms）；
+> - `-Dcrythst.portal.capture.scale=0.5` 调整离屏分辨率比例（默认 0.5，另受
+>   1280x720 上限约束）。
 
 ### 表面管线
 
@@ -446,11 +485,14 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 
 ### 递归、性能与回退
 
-- **递归深度 1**：捕获 pass 中 `PortalCapture.isCapturing()` 为 true，嵌套传送门一律使用
-  程序化表面，绝不采样正在写入的纹理，因此没有反馈循环。更深递归需要多张离屏纹理和多趟
-  捕获，留给后续 TODO。
-- 捕获节流：最多每 **100 ms**（10 Hz）捕获一轮；每轮最多 **2 个**最近的可见传送门；
-  距离超过 **160 格**不捕获。未捕获的帧继续使用上一张纹理。
+- **递归深度 1**：捕获 pass 中 `PortalCapture.isCapturing()` 为 true，所有传送门表面都不
+  提交，因此目标纹理是纯世界画面且没有反馈循环。更深递归需要多张离屏纹理和多趟捕获，
+  留给后续 TODO。
+- 捕获节流：默认每 **220 ms**（约 4.5 Hz）捕获一轮；每轮最多 **1 个**最近的可见传送门；
+  离屏分辨率默认 **0.5 倍**（1280x720 上限）；距离超过 **160 格**不捕获。相机位置/朝向
+  几乎未变且纹理未超过 1 秒时直接复用；未捕获的帧继续使用上一张纹理。
+- 每次成功捕获输出一条（最多 1 Hz）`[portal timings]`：portal、分辨率、section 数、
+  extract/render/total 毫秒、scale 和 interval，便于运行时判断预算。
 - 可见性：主相机 `cullFrustum` 对入口平面 AABB 裁剪；跨维度链接不捕获（回退程序化）。
 - 回退：
   - 管线无法构建 → `RenderTypes.debugFilledBox()` 紫色四边形；
@@ -477,14 +519,17 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
   高延迟下仍可能看到一帧左右的修正。黑屏已缩短为 2 tick、alpha 0.18 的轻微过渡。
 - 捕获通过在主相机 extraction 之前嵌套一次 `LevelExtractor.extract` 和
   `LevelRenderer.render` 实现，每轮会额外提取并提交一次完整世界渲染：
-  - 默认 10 Hz、最多 2 个最近传送门、160 格内；
+  - 默认 ~4.5 Hz、最多 1 个最近传送门、160 格内、离屏 0.5 倍分辨率；
   - 会触发一次额外的 `submitFeatures` 和其他模组的 LevelRender 事件监听器，属于 v1 的
     性能/兼容性取舍；
   - 捕获与主 pass 共享 `shouldUseMultiDrawIndirectForTerrain`，indirect 缓冲区每帧写两份；
     容量会在首帧稳定增长一次，之后不再反复 resize；
-  - 已为传送门相机用有界扫描重建 `visibleSections` / `nearbyVisibleSections`；若出口远超
-    主相机视野、未加载或相机矩阵退化，捕获会被跳过并回退程序化表面（避免天空-only 或卡死）；
+  - 已为传送门相机用有界扫描重建 `visibleSections` / `nearbyVisibleSections`；**不再移动共享
+    `ViewArea`**，因此目标端必须位于主相机当前 `ViewArea`/已加载存储内（通常就是渲染距离内）；
+    更远的出口或未加载/未编译区域会回退上一次纹理或程序化表面，而不是重置主视图 section；
   - 目标维度必须有已加载区块；未加载区域显示为雾色。
+- 渲染只使用 RenderPearl/RenderTarget 抽象，不依赖 raw OpenGL 或 stencil；因此没有逐像素洞口
+  模板裁剪，只有四边形几何遮罩。
 - 捕获 pass 使用传送门相机自己的 projection UBO（与主相机投影相同）；主 pass 会在
   `GameRenderer.renderLevel` 中重新绑定投影。视图 bob 只作用于主 pass 的投影矩阵，
   因此开启 bob 时入口表面可能有极轻微错位。
@@ -503,9 +548,11 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
 - 高速投射物只做离散位置检测，没有连续碰撞（CCD）扫掠。
 - 冷却表只存在内存中，不随存档持久化。
 - 传送门没有实体/方块碰撞体，玩家可以自由走进触发板。
-- 只有从**正面**（`+normal`）进入才会传送；从背面穿入不会触发，避免对象从出口背面
-  进入并立刻再次穿越同一扇门。
-- 离屏 `TextureTarget` 使用主目标同分辨率（未降采样）；窗口尺寸变化时重建。
+- 双向穿越都可用：正面→背面从出口正面对应面离开，背面→正面从出口背面对应面离开；
+  两者都沿变换后的运动方向远离出口平面。穿越日志最多 1 秒一条，包含 before/after
+  signed distance、矩形内判断和结果，便于运行时诊断。
+- 离屏 `TextureTarget` 默认半分辨率（可用 `crythst.portal.capture.scale` 调整，并有
+  1280x720 上限）；窗口尺寸变化时重建。
 - `PortalManager.register()` 目前在 `PhysicsTicker.register()` 之前；传送检测使用上一次物理
   step 的已提交位姿。若需要严格在本 tick 物理之后，移动该入口行即可。
 

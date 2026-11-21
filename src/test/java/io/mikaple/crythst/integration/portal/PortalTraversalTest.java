@@ -11,8 +11,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Traversal regression tests: a portal is entered only when the sampled point
- * (the eye for players) crosses from the front side to the back side inside
- * the rectangle, not when the body centre merely enters a thick slab.
+ * (the eye for players) crosses the plane inside the rectangle, in either
+ * direction, not when the body centre merely enters a thick slab or walks along
+ * the plane.
  */
 class PortalTraversalTest {
     private static final double EPS = 1.0e-9;
@@ -53,10 +54,37 @@ class PortalTraversalTest {
     }
 
     @Test
-    void rejectsBackToFrontCrossing() {
+    void detectsBackToFrontCrossingInsideRectangle() {
+        final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(plane(),
+                new Vector3d(0.25, 64.5, -1.0),
+                new Vector3d(0.25, 64.5, 1.0));
+
+        assertNotNull(crossing);
+        assertTrue(crossing.inside());
+        assertFalse(crossing.frontToBack());
+        // The legacy one-way API still reports only front-to-back crossings.
         assertNull(PortalCrossing.frontToBackCrossing(plane(),
                 new Vector3d(0.0, 64.5, -1.0),
                 new Vector3d(0.0, 64.5, 1.0)));
+        assertTrue(PortalCrossing.crosses(plane(),
+                new Vector3d(0.0, 64.5, -1.0),
+                new Vector3d(0.0, 64.5, 1.0)));
+    }
+
+    @Test
+    void doesNotTriggerWalkingAlongOrAroundThePlane() {
+        // Moving parallel to the plane keeps the signed distance unchanged.
+        assertNull(PortalCrossing.findCrossing(plane(),
+                new Vector3d(-0.8, 64.5, 0.5),
+                new Vector3d(0.8, 64.5, 0.5)));
+        assertNull(PortalCrossing.findCrossing(plane(),
+                new Vector3d(-0.8, 64.5, -0.5),
+                new Vector3d(0.8, 64.5, -0.5)));
+
+        // Crossing the infinite plane outside the rectangle does not traverse.
+        assertFalse(PortalCrossing.crosses(plane(),
+                new Vector3d(1.6, 64.5, 0.5),
+                new Vector3d(1.6, 64.5, -0.5)));
     }
 
     @Test
@@ -70,10 +98,16 @@ class PortalTraversalTest {
     }
 
     @Test
-    void doesNotRetriggerWhenRestingExactlyOnThePlane() {
-        assertNull(PortalCrossing.frontToBackCrossing(plane(),
+    void doesNotTriggerWhenBothSamplesAreOnTheSameSide() {
+        assertNull(PortalCrossing.findCrossing(plane(),
+                new Vector3d(0.0, 64.5, 0.5),
+                new Vector3d(0.0, 64.5, 0.4)));
+        assertNull(PortalCrossing.findCrossing(plane(),
+                new Vector3d(0.0, 64.5, -0.5),
+                new Vector3d(0.0, 64.5, -0.4)));
+        assertNull(PortalCrossing.findCrossing(plane(),
                 new Vector3d(0.0, 64.5, 0.0),
-                new Vector3d(0.0, 64.5, -0.5)));
+                new Vector3d(0.0, 64.5, 0.0)));
     }
 
     @Test
@@ -91,11 +125,16 @@ class PortalTraversalTest {
         final Vector3d transformedEye = transform.transformPoint(eye);
         assertEquals(0.0, exit.signedDistance(transformedEye), EPS);
 
-        // Walking front-to-back through the entry exits towards the exit's
-        // front (+normal), not into its back.
-        final Vector3d velocity = new Vector3d(0.0, 0.0, -1.0);
-        final Vector3d transformedVelocity = transform.transformDirection(velocity);
-        assertTrue(transformedVelocity.dot(exit.normal()) > 0.0,
+        // A front-to-back crossing leaves through the exit front (+normal).
+        final Vector3d frontVelocity = new Vector3d(0.0, 0.0, -1.0);
+        assertTrue(transform.transformDirection(frontVelocity).dot(exit.normal()) > 0.0,
                 "front-to-back traversal must leave through the exit front");
+
+        // A back-to-front crossing leaves through the corresponding exit back,
+        // still moving away from the plane (the same rigid transform, so the
+        // view stays continuous across the crossing).
+        final Vector3d backVelocity = new Vector3d(0.0, 0.0, 1.0);
+        assertTrue(transform.transformDirection(backVelocity).dot(exit.normal()) < 0.0,
+                "back-to-front traversal must leave through the exit back");
     }
 }

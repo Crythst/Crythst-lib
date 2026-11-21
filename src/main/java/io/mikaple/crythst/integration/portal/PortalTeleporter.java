@@ -1,5 +1,6 @@
 package io.mikaple.crythst.integration.portal;
 
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.OrientedBox;
@@ -68,6 +69,8 @@ public final class PortalTeleporter {
 
     private static final Map<UUID, Integer> ENTITY_READY = new ConcurrentHashMap<>();
     private static final Map<String, Integer> BODY_READY = new ConcurrentHashMap<>();
+    private static final long CROSSING_LOG_INTERVAL_NANOS = 1_000_000_000L;
+    private static long lastCrossingLogNanos = -CROSSING_LOG_INTERVAL_NANOS;
 
     private PortalTeleporter() {
     }
@@ -107,6 +110,9 @@ public final class PortalTeleporter {
                     continue;
                 }
 
+                // One rigid transform for both directions: the transformed
+                // entry side is the destination side it leaves through, and
+                // the transformed velocity always points away from the plane.
                 final PortalTransform transform =
                         PortalTransform.between(portal.plane(), destination.plane());
 
@@ -119,17 +125,27 @@ public final class PortalTeleporter {
                     // The eye crossing is what the player sees and what makes
                     // the transition feel immersive: the body may already be
                     // half-way through the surface when the camera follows it.
-                    if (!crossedFrontToBack(portal.plane(), entity)) {
+                    final PortalCrossing.Crossing crossing = crossing(portal.plane(), entity);
+                    if (crossing == null) {
                         continue;
                     }
                     final Integer ready = ENTITY_READY.get(entity.getUUID());
-                    if (ready != null && tick < ready) {
+                    if (!crossing.inside()) {
+                        logCrossingAttempt(portal, entity, crossing, "outside rectangle");
                         continue;
                     }
-                    if (teleportEntity(entity, level, destination, destinationLevel, transform)) {
+                    if (ready != null && tick < ready) {
+                        logCrossingAttempt(portal, entity, crossing, "cooldown");
+                        continue;
+                    }
+                    final boolean teleported =
+                            teleportEntity(entity, level, destination, destinationLevel, transform);
+                    if (teleported) {
                         teleportedEntities.add(entity.getUUID());
                         ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
                     }
+                    logCrossingAttempt(portal, entity, crossing,
+                            teleported ? "teleported" : "teleport rejected");
                 }
 
                 // Physics bodies can only stay inside one physics world.
@@ -143,18 +159,33 @@ public final class PortalTeleporter {
     }
 
     /**
-     * True when the entity's traversal point moved from the portal's front
-     * ({@code +normal}) side to its back ({@code -normal}) side during this
-     * tick, through the rectangle.
+     * Segment/plane crossing for this tick, in either direction.
      *
      * <p>Using the previous-tick position ({@code xo/yo/zo}) and the current
      * position also catches fast entity movement without a separate history
      * map. Players use the eye position so the camera, not the body centre,
      * is the thing that enters the plane.</p>
      */
-    private static boolean crossedFrontToBack(PortalPlane plane, Entity entity) {
-        return PortalCrossing.crossesFrontToBack(
+    private static PortalCrossing.Crossing crossing(PortalPlane plane, Entity entity) {
+        return PortalCrossing.findCrossing(
                 plane, previousTraversalPoint(entity), traversalPoint(entity));
+    }
+
+    private static void logCrossingAttempt(Portal portal, Entity entity,
+                                           PortalCrossing.Crossing crossing, String result) {
+        final long now = System.nanoTime();
+        if (now - lastCrossingLogNanos < CROSSING_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastCrossingLogNanos = now;
+        Crythst.LOGGER.info(
+                "Crythst portal crossing: portal='{}' entity={} before={} after={} inside={} "
+                        + "frontToBack={} result={}",
+                portal.name(),
+                entity.getName().getString() + "/" + entity.getUUID(),
+                String.format("%.3f", crossing.before()),
+                String.format("%.3f", crossing.after()),
+                crossing.inside(), crossing.frontToBack(), result);
     }
 
     private static Vector3d traversalPoint(Entity entity) {
@@ -208,9 +239,13 @@ public final class PortalTeleporter {
             // The player's eye is placed exactly at T(eye): at the crossing
             // instant the new camera position equals the transformed view
             // through the portal, so the transition is geometrically
-            // continuous. Other entities get a tiny front-side offset so a
-            // stationary mob cannot sit exactly in the plane.
-            target.add(destination.plane().normal().mul(ENTITY_EXIT_OFFSET));
+            // continuous. Other entities get a tiny bias on the exit side the
+            // transformed motion actually leaves through (front for a
+            // front-to-back crossing, back for a back-to-front crossing).
+            final Vector3d entryLocal = transform.entry().local(
+                    new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
+            target.add(pushDirection(destination.plane(), transformedVelocity, entryLocal)
+                    .mul(ENTITY_EXIT_OFFSET));
         }
 
         final double fallDistance = entity.fallDistance;
