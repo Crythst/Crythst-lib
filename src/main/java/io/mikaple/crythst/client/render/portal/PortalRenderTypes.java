@@ -154,7 +154,9 @@ public final class PortalRenderTypes {
                 .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
                 .withBindGroupLayout(BindGroupLayouts.FOG)
                 .withVertexBinding(0, DefaultVertexFormat.POSITION_TEX_COLOR)
-                .withPrimitiveTopology(PrimitiveTopology.QUADS)
+                // Triangles so near-plane clipping can emit a 3-5 vertex
+                // polygon as a fan without dropping the whole portal.
+                .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
                 .withColorTargetState(ColorTargetState.DEFAULT)
                 .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, true))
                 .withCull(false);

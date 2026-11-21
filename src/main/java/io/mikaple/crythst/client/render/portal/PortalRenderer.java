@@ -44,6 +44,8 @@ public final class PortalRenderer {
     private static final double MAX_RENDER_DISTANCE = 512.0;
     private static final double MAX_RENDER_DISTANCE_SQUARED =
             MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE;
+    /** Homogeneous near-plane epsilon for clipping portal polygons. */
+    private static final float CLIP_EPSILON = 1.0e-4f;
     private static final float FALLBACK_RED = 0.48f;
     private static final float FALLBACK_GREEN = 0.16f;
     private static final float FALLBACK_BLUE = 0.86f;
@@ -121,7 +123,10 @@ public final class PortalRenderer {
         }
 
         final ResourceKey<Level> dimension = minecraft.level.dimension();
-        final Matrix4f viewProjection = new Matrix4f(camera.projectionMatrix)
+        final Matrix4f worldProjection = PortalProjection.worldProjection(
+                camera, levelState.playerRenderState,
+                context.gameRenderer().gameRenderState().optionsRenderState);
+        final Matrix4f viewProjection = new Matrix4f(worldProjection)
                 .mul(camera.viewRotationMatrix);
 
         final Map<RenderType, List<Quad>> groups = new LinkedHashMap<>();
@@ -239,7 +244,7 @@ public final class PortalRenderer {
         final boolean front = dx * normal.x + dy * normal.y + dz * normal.z >= 0.0;
 
         final Vector3d[] corners = plane.corners();
-        final Vertex[] vertices = new Vertex[4];
+        final ClipVertex[] vertices = new ClipVertex[4];
         for (int i = 0; i < 4; i++) {
             final Vector3d corner = corners[i];
             final float x = (float) (corner.x - camera.pos.x);
@@ -250,35 +255,99 @@ public final class PortalRenderer {
             // same NDC -> texture convention used by vanilla screenquad.vsh
             // and target-to-target blits (NDC y = -1 is v = 0).
             final Vector4f clip = viewProjection.transform(new Vector4f(x, y, z, 1.0f));
-            if (clip.w <= 1.0e-4f) {
-                return null;
-            }
-            final float u = clip.x / clip.w * 0.5f + 0.5f;
-            final float ndcV = clip.y / clip.w * 0.5f + 0.5f;
-            final float v = FLIP_V ? 1.0f - ndcV : ndcV;
-            vertices[i] = new Vertex(x, y, z, u, v);
+            final Vertex vertex = clip.w > CLIP_EPSILON
+                    ? vertexFromClip(x, y, z, clip)
+                    : new Vertex(x, y, z, 0.0f, 0.0f);
+            vertices[i] = new ClipVertex(vertex, clip);
         }
 
         // Reverse winding for the back side; per-corner screen UVs stay intact.
-        final Vertex[] ordered = front
+        final ClipVertex[] ordered = front
                 ? vertices
-                : new Vertex[]{vertices[1], vertices[0], vertices[3], vertices[2]};
-        return new Quad(ordered, dx * dx + dy * dy + dz * dz);
+                : new ClipVertex[]{vertices[1], vertices[0], vertices[3], vertices[2]};
+
+        // Clip the quad against the near plane (w > epsilon) instead of
+        // dropping it when a corner gets close/behind the camera. The result
+        // is a 3-5 vertex polygon emitted as a triangle fan.
+        final List<ClipVertex> clipped = clipNearPlane(ordered);
+        if (clipped.size() < 3) {
+            return null;
+        }
+        final Vertex[] clippedVertices = new Vertex[clipped.size()];
+        for (int i = 0; i < clipped.size(); i++) {
+            clippedVertices[i] = clipped.get(i).vertex();
+        }
+        final Vertex[] originalVertices = new Vertex[4];
+        for (int i = 0; i < 4; i++) {
+            originalVertices[i] = ordered[i].vertex();
+        }
+        return new Quad(clippedVertices, originalVertices,
+                dx * dx + dy * dy + dz * dz);
+    }
+
+    private static Vertex vertexFromClip(float x, float y, float z, Vector4f clip) {
+        final float u = clip.x / clip.w * 0.5f + 0.5f;
+        final float ndcV = clip.y / clip.w * 0.5f + 0.5f;
+        final float v = FLIP_V ? 1.0f - ndcV : ndcV;
+        return new Vertex(x, y, z, u, v);
+    }
+
+    private static List<ClipVertex> clipNearPlane(ClipVertex[] vertices) {
+        final List<ClipVertex> output = new ArrayList<>(5);
+        for (int i = 0; i < vertices.length; i++) {
+            final ClipVertex current = vertices[i];
+            final ClipVertex next = vertices[(i + 1) % vertices.length];
+            final boolean currentInside = current.clip().w > CLIP_EPSILON;
+            final boolean nextInside = next.clip().w > CLIP_EPSILON;
+
+            if (currentInside && nextInside) {
+                output.add(next);
+            } else if (currentInside) {
+                output.add(intersectNearPlane(current, next));
+            } else if (nextInside) {
+                output.add(intersectNearPlane(current, next));
+                output.add(next);
+            }
+        }
+        return output;
+    }
+
+    private static ClipVertex intersectNearPlane(ClipVertex from, ClipVertex to) {
+        final float denominator = to.clip().w - from.clip().w;
+        final float t = denominator == 0.0f
+                ? 0.0f : (CLIP_EPSILON - from.clip().w) / denominator;
+        final float x = from.vertex().x() + (to.vertex().x() - from.vertex().x()) * t;
+        final float y = from.vertex().y() + (to.vertex().y() - from.vertex().y()) * t;
+        final float z = from.vertex().z() + (to.vertex().z() - from.vertex().z()) * t;
+        final Vector4f clip = new Vector4f(from.clip()).lerp(to.clip(), t);
+        // Clamp w so a numerical near-zero cannot leak into the UV divide.
+        clip.w = Math.max(clip.w, CLIP_EPSILON);
+        return new ClipVertex(vertexFromClip(x, y, z, clip), clip);
     }
 
     private static void emitShader(List<Quad> quads, PoseStack.Pose pose, VertexConsumer consumer) {
         for (Quad quad : quads) {
-            for (Vertex vertex : quad.vertices()) {
-                consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
-                        .setUv(vertex.u(), vertex.v())
-                        .setColor(1.0f, 1.0f, 1.0f, 1.0f);
+            final Vertex[] vertices = quad.vertices();
+            // Triangle-fan triangulation of the clipped polygon.
+            for (int i = 1; i < vertices.length - 1; i++) {
+                emitShaderVertex(consumer, pose, vertices[0]);
+                emitShaderVertex(consumer, pose, vertices[i]);
+                emitShaderVertex(consumer, pose, vertices[i + 1]);
             }
         }
     }
 
+    private static void emitShaderVertex(VertexConsumer consumer, PoseStack.Pose pose, Vertex vertex) {
+        consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
+                .setUv(vertex.u(), vertex.v())
+                .setColor(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
     private static void emitFallback(List<Quad> quads, PoseStack.Pose pose, VertexConsumer consumer) {
         for (Quad quad : quads) {
-            for (Vertex vertex : quad.vertices()) {
+            // debugFilledBox is a quad topology; keep the unclipped four
+            // corners for the rare shader-unavailable fallback.
+            for (Vertex vertex : quad.originalVertices()) {
                 consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
                         .setColor(FALLBACK_RED, FALLBACK_GREEN, FALLBACK_BLUE, FALLBACK_ALPHA);
             }
@@ -288,6 +357,9 @@ public final class PortalRenderer {
     private record Vertex(float x, float y, float z, float u, float v) {
     }
 
-    private record Quad(Vertex[] vertices, double distanceSquared) {
+    private record ClipVertex(Vertex vertex, Vector4f clip) {
+    }
+
+    private record Quad(Vertex[] vertices, Vertex[] originalVertices, double distanceSquared) {
     }
 }

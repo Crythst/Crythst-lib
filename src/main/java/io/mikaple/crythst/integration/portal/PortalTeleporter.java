@@ -39,23 +39,22 @@ import java.util.concurrent.ConcurrentHashMap;
  *     <li>an entity/body is teleported at most once per tick;</li>
  *     <li>a ten-tick cooldown prevents the destination portal from
  *     re-triggering immediately;</li>
- *     <li>players cross when their <b>eye</b> passes the plane from the front
- *     side to the back side, rather than when their bounding-box centre enters
- *     a thin slab. This lets the player physically walk into the portal: half
- *     the body may still be on the entry side until the camera crosses.
- *     Back-to-front crossings are ignored so the exit always stays on the
- *     destination's front side;</li>
- *     <li>non-player living entities use their eye position, other entities
- *     use their bounding-box centre; their exit point is pushed slightly out
- *     of the destination plane along its front normal;</li>
+ *     <li>entities and players cross when their <b>bounding-box centre</b>
+ *     (feet + half height) passes the plane, in either direction. This matches
+ *     the "roughly half the body has crossed" feel and avoids the eye being
+ *     above a 2-block portal rectangle. Teleport placement still uses the
+ *     transformed eye for players, so the camera stays continuous;</li>
+ *     <li>the same rigid transform serves both directions: a front-to-back
+ *     crossing exits on the destination front, a back-to-front crossing exits
+ *     on the destination back, both moving away from the plane;</li>
+ *     <li>non-player entities receive a tiny exit-side bias along transformed
+ *     motion; physics bodies keep the bounded slab test;</li>
  *     <li>entities may cross dimensions via
  *     {@link Entity#teleport(TeleportTransition)}; physics bodies are skipped
  *     when a link crosses dimensions (their worlds are per-dimension).</li>
  * </ul>
  *
- * <p>Physics bodies still use their oriented bounding-box centre against the
- * bounded trigger slab, because they have no camera/eye to cross with. See
- * {@code docs/immersive-portal.md} for the remaining limitations.</p>
+ * <p>See {@code docs/immersive-portal.md} for the remaining limitations.</p>
  */
 public final class PortalTeleporter {
     /** Half-thickness of the trigger slab used by physics bodies, in blocks. */
@@ -69,7 +68,9 @@ public final class PortalTeleporter {
 
     private static final Map<UUID, Integer> ENTITY_READY = new ConcurrentHashMap<>();
     private static final Map<String, Integer> BODY_READY = new ConcurrentHashMap<>();
+    private static final Map<UUID, Long> PLAYER_ATTEMPT_LOG = new ConcurrentHashMap<>();
     private static final long CROSSING_LOG_INTERVAL_NANOS = 1_000_000_000L;
+    private static final double NEAR_PLAYER_LOG_DISTANCE_SQUARED = 16.0;
     private static long lastCrossingLogNanos = -CROSSING_LOG_INTERVAL_NANOS;
 
     private PortalTeleporter() {
@@ -78,6 +79,7 @@ public final class PortalTeleporter {
     public static void clearCooldowns() {
         ENTITY_READY.clear();
         BODY_READY.clear();
+        PLAYER_ATTEMPT_LOG.clear();
     }
 
     /** Fabric {@code END_SERVER_TICK} callback. */
@@ -122,30 +124,43 @@ public final class PortalTeleporter {
                     if (!isEligible(entity) || teleportedEntities.contains(entity.getUUID())) {
                         continue;
                     }
-                    // The eye crossing is what the player sees and what makes
-                    // the transition feel immersive: the body may already be
-                    // half-way through the surface when the camera follows it.
-                    final PortalCrossing.Crossing crossing = crossing(portal.plane(), entity);
-                    if (crossing == null) {
-                        continue;
-                    }
+                    // The body centre crossing gives the half-in/half-out feel;
+                    // teleport placement still targets the transformed eye.
+                    final Vector3d beforePoint = previousTraversalPoint(entity);
+                    final Vector3d afterPoint = traversalPoint(entity);
+                    final PortalCrossing.Crossing crossing =
+                            PortalCrossing.findCrossing(portal.plane(), beforePoint, afterPoint);
                     final Integer ready = ENTITY_READY.get(entity.getUUID());
-                    if (!crossing.inside()) {
-                        logCrossingAttempt(portal, entity, crossing, "outside rectangle");
-                        continue;
+                    final boolean cooldown = ready != null && tick < ready;
+                    final boolean nearPlayer = entity instanceof ServerPlayer
+                            && portal.plane().distanceSquared(afterPoint)
+                            <= NEAR_PLAYER_LOG_DISTANCE_SQUARED;
+
+                    String result = "no crossing";
+                    boolean teleported = false;
+                    if (crossing != null && !crossing.inside()) {
+                        result = "outside rectangle";
+                    } else if (crossing != null && cooldown) {
+                        result = "cooldown";
+                    } else if (crossing != null) {
+                        teleported = teleportEntity(
+                                entity, level, destination, destinationLevel, transform);
+                        if (teleported) {
+                            teleportedEntities.add(entity.getUUID());
+                            ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
+                            result = "teleported";
+                        } else {
+                            result = "teleport rejected";
+                        }
                     }
-                    if (ready != null && tick < ready) {
-                        logCrossingAttempt(portal, entity, crossing, "cooldown");
-                        continue;
+
+                    if (nearPlayer) {
+                        logNearPlayerAttempt(portal, (ServerPlayer) entity,
+                                crossing, beforePoint, afterPoint,
+                                cooldown, true, result);
+                    } else if (crossing != null) {
+                        logCrossingAttempt(portal, entity, crossing, result);
                     }
-                    final boolean teleported =
-                            teleportEntity(entity, level, destination, destinationLevel, transform);
-                    if (teleported) {
-                        teleportedEntities.add(entity.getUUID());
-                        ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
-                    }
-                    logCrossingAttempt(portal, entity, crossing,
-                            teleported ? "teleported" : "teleport rejected");
                 }
 
                 // Physics bodies can only stay inside one physics world.
@@ -163,14 +178,9 @@ public final class PortalTeleporter {
      *
      * <p>Using the previous-tick position ({@code xo/yo/zo}) and the current
      * position also catches fast entity movement without a separate history
-     * map. Players use the eye position so the camera, not the body centre,
-     * is the thing that enters the plane.</p>
+     * map. The sample is the bounding-box centre for every entity, so a portal
+     * rectangle below the eye still contains the torso.</p>
      */
-    private static PortalCrossing.Crossing crossing(PortalPlane plane, Entity entity) {
-        return PortalCrossing.findCrossing(
-                plane, previousTraversalPoint(entity), traversalPoint(entity));
-    }
-
     private static void logCrossingAttempt(Portal portal, Entity entity,
                                            PortalCrossing.Crossing crossing, String result) {
         final long now = System.nanoTime();
@@ -188,20 +198,47 @@ public final class PortalTeleporter {
                 crossing.inside(), crossing.frontToBack(), result);
     }
 
+    private static void logNearPlayerAttempt(Portal portal, ServerPlayer player,
+                                             PortalCrossing.Crossing crossing,
+                                             Vector3d beforePoint, Vector3d afterPoint,
+                                             boolean cooldown, boolean linkResolved,
+                                             String result) {
+        final long now = System.nanoTime();
+        final Long last = PLAYER_ATTEMPT_LOG.get(player.getUUID());
+        if (last != null && now - last < CROSSING_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        PLAYER_ATTEMPT_LOG.put(player.getUUID(), now);
+
+        final PortalPlane plane = portal.plane();
+        final Vec3 eye = player.getEyePosition();
+        final boolean eyeInside = plane.contains(
+                new Vector3d(eye.x, eye.y, eye.z), PLANE_THICKNESS);
+        final boolean bodyInside = crossing != null
+                ? crossing.inside()
+                : plane.contains(afterPoint, PLANE_THICKNESS);
+
+        Crythst.LOGGER.info(
+                "Crythst portal player attempt: portal='{}' player={} signedBefore={} "
+                        + "signedAfter={} bodyInside={} eyeInside={} cooldown={} "
+                        + "linkResolved={} result={}",
+                portal.name(), player.getName().getString(),
+                String.format("%.3f", plane.signedDistance(beforePoint)),
+                String.format("%.3f", plane.signedDistance(afterPoint)),
+                bodyInside, eyeInside, cooldown, linkResolved, result);
+    }
+
     private static Vector3d traversalPoint(Entity entity) {
-        final Vec3 point = entity instanceof LivingEntity
-                ? entity.getEyePosition()
-                : entity.getBoundingBox().getCenter();
-        return new Vector3d(point.x, point.y, point.z);
+        // Use the body centre (feet + height/2), not the eye. A portal is
+        // created around eye level, so its 2-block rectangle can sit entirely
+        // below the eye while still covering the torso. Testing the centre also
+        // gives the desired "roughly half the body has crossed" trigger.
+        final Vec3 centre = entity.getBoundingBox().getCenter();
+        return new Vector3d(centre.x, centre.y, centre.z);
     }
 
     private static Vector3d previousTraversalPoint(Entity entity) {
-        if (entity instanceof LivingEntity) {
-            // Eye height is effectively constant across one tick; keeping the
-            // current value avoids a second pose lookup and matches the point
-            // that is actually rendered.
-            return new Vector3d(entity.xo, entity.yo + entity.getEyeHeight(), entity.zo);
-        }
+        // Shift the current bbox centre back by this tick's position delta.
         final Vec3 centre = entity.getBoundingBox().getCenter();
         return new Vector3d(
                 centre.x - (entity.getX() - entity.xo),

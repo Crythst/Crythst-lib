@@ -72,6 +72,29 @@ class PortalTraversalTest {
     }
 
     @Test
+    void bodyCentreInsideWhileEyeIsAboveStillTraverses() {
+        // Portal centred at y=64 with height 2 spans y=63..65. A player eye
+        // at y=66 is outside the rectangle, while the body centre at y=64 is
+        // inside. Traversal samples the body centre, so the crossing counts.
+        final PortalPlane lowPortal = new PortalPlane(
+                new Vector3d(0.0, 64.0, 0.0),
+                new Vector3d(0.0, 0.0, 1.0),
+                new Vector3d(1.0, 0.0, 0.0),
+                2.0, 2.0);
+        final Vector3d eye = new Vector3d(0.0, 66.0, 0.0);
+        final Vector3d bodyCentre = new Vector3d(0.0, 64.0, 0.0);
+        assertFalse(lowPortal.contains(eye, 0.35));
+        assertTrue(lowPortal.contains(bodyCentre, 0.35));
+
+        final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(
+                lowPortal,
+                new Vector3d(bodyCentre.x, bodyCentre.y, bodyCentre.z + 1.0),
+                new Vector3d(bodyCentre.x, bodyCentre.y, bodyCentre.z - 1.0));
+        assertNotNull(crossing);
+        assertTrue(crossing.inside());
+    }
+
+    @Test
     void doesNotTriggerWalkingAlongOrAroundThePlane() {
         // Moving parallel to the plane keeps the signed distance unchanged.
         assertNull(PortalCrossing.findCrossing(plane(),

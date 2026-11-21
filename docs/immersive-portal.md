@@ -1,7 +1,7 @@
 # 沉浸式传送门 v1（Immersive Portal, first milestone）
 
 状态：**v1 静态传送门已实现**（模型 / 命令 / 持久化 / 真实目标场景重提取与捕获渲染 /
-按眼睛越面触发的实体与物理体传送 / 2 tick 轻微视觉过渡）。传送门表面会把链接目标端的真实世界
+按身体中心越面触发的实体与物理体传送 / 2 tick 轻微视觉过渡）。传送门表面会把链接目标端的真实世界
 渲染到离屏纹理；递归深度目前为 1 层。多人同步、移动传送门、跨维度物理体、递归 >1 仍属于后续 TODO。
 
 本文对应 `TODO.md` 中“沉浸式传送门”里程碑的第一阶段。设计目标是先把
@@ -282,9 +282,12 @@ pExit = pB + side * 0.6 * nB      // 物理体
 2. 对每个实体：
    - 用**上一 tick 采样点 → 当前采样点**的线段检测**双向**平面穿越
      （`PortalCrossing.findCrossing`），并要求交点在矩形内；不再使用厚 0.35 的包围盒中心板；
-     穿越时记录一次限流日志（portal、before/after signed distance、inside、结果）；
-   - 玩家使用**眼睛位置**，其它 `LivingEntity` 也使用眼睛，非生物实体使用包围盒中心；
-     这样玩家可以慢慢走进传送门：在眼睛越过平面之前，身体可以一半在入口一侧；
+     穿越时记录一次限流日志（portal、before/after signed distance、inside、结果）；玩家在
+     传送门 4 格内时每个玩家最多 1 秒输出一次 attempt 日志，包含 body/eye inside、cooldown
+     和 link resolved；
+   - 所有实体都用**包围盒中心**（脚点 + 身高/2）作为穿越采样点，当前和上一 tick 都是；
+     这样即使传送门 2 格矩形整体低于眼睛（创建时以视线为中心），躯干仍能触发；
+     视觉上也正好是“身体大约一半越过平面”时才传送；
    - 过滤 removed、死亡、观察者、乘客、`noPhysics`、`Display`、末影龙部件；
    - 计算 `vB`、`qB`、目标点、出口推出；
    - 保留 `fallDistance` 与 `onGround`（合理近似）。
@@ -467,9 +470,10 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 > - `-Dcrythst.portal.forceProcedural=true` 保留捕获但强制使用程序化表面（A/B 对比）；
 > - `-Dcrythst.portal.capture.dump=true` 把第一次成功捕获的离屏纹理写入
 >   `screenshots/`，用于确认目标纹理本身是否有内容；
-> - `-Dcrythst.portal.capture.intervalMs=220` 调整捕获间隔（默认 220 ms）；
-> - `-Dcrythst.portal.capture.scale=0.5` 调整离屏分辨率比例（默认 0.5，另受
->   1280x720 上限约束）。
+> - `-Dcrythst.portal.capture.intervalMs=100` 调整基础捕获间隔（默认 100 ms；会根据
+>   实测 extract+render 成本在 100–250 ms 间自适应）；
+> - `-Dcrythst.portal.capture.scale=1.0` 调整离屏分辨率比例（默认 1.0，另受
+>   1280x720 上限约束；0.75 可作为性能折中）。
 
 ### 表面管线
 
@@ -488,9 +492,10 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 - **递归深度 1**：捕获 pass 中 `PortalCapture.isCapturing()` 为 true，所有传送门表面都不
   提交，因此目标纹理是纯世界画面且没有反馈循环。更深递归需要多张离屏纹理和多趟捕获，
   留给后续 TODO。
-- 捕获节流：默认每 **220 ms**（约 4.5 Hz）捕获一轮；每轮最多 **1 个**最近的可见传送门；
-  离屏分辨率默认 **0.5 倍**（1280x720 上限）；距离超过 **160 格**不捕获。相机位置/朝向
-  几乎未变且纹理未超过 1 秒时直接复用；未捕获的帧继续使用上一张纹理。
+- 捕获节流：默认基础间隔 **100 ms**（约 10 Hz），并根据实测成本自适应到最多 250 ms；
+  每轮最多 **1 个**最近的可见传送门；离屏分辨率默认 **1.0 倍**（1280x720 上限）；
+  距离超过 **160 格**不捕获。相机位置/朝向几乎未变且纹理未超过 1 秒时直接复用；
+  未捕获的帧继续使用上一张纹理。
 - 每次成功捕获输出一条（最多 1 Hz）`[portal timings]`：portal、分辨率、section 数、
   extract/render/total 毫秒、scale 和 interval，便于运行时判断预算。
 - 可见性：主相机 `cullFrustum` 对入口平面 AABB 裁剪；跨维度链接不捕获（回退程序化）。
@@ -519,7 +524,7 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
   高延迟下仍可能看到一帧左右的修正。黑屏已缩短为 2 tick、alpha 0.18 的轻微过渡。
 - 捕获通过在主相机 extraction 之前嵌套一次 `LevelExtractor.extract` 和
   `LevelRenderer.render` 实现，每轮会额外提取并提交一次完整世界渲染：
-  - 默认 ~4.5 Hz、最多 1 个最近传送门、160 格内、离屏 0.5 倍分辨率；
+  - 默认 ~10 Hz（自适应成本）、最多 1 个最近传送门、160 格内、离屏 1.0 倍分辨率；
   - 会触发一次额外的 `submitFeatures` 和其他模组的 LevelRender 事件监听器，属于 v1 的
     性能/兼容性取舍；
   - 捕获与主 pass 共享 `shouldUseMultiDrawIndirectForTerrain`，indirect 缓冲区每帧写两份；
@@ -551,8 +556,12 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
 - 双向穿越都可用：正面→背面从出口正面对应面离开，背面→正面从出口背面对应面离开；
   两者都沿变换后的运动方向远离出口平面。穿越日志最多 1 秒一条，包含 before/after
   signed distance、矩形内判断和结果，便于运行时诊断。
-- 离屏 `TextureTarget` 默认半分辨率（可用 `crythst.portal.capture.scale` 调整，并有
+- 离屏 `TextureTarget` 默认全分辨率（可用 `crythst.portal.capture.scale` 调整，并有
   1280x720 上限）；窗口尺寸变化时重建。
+- 传送门四边形在齐次空间对近平面 `w > epsilon` 做多边形裁剪，输出 3–5 个顶点并按
+  三角形扇绘制；相机贴到传送门平面时不会再整块消失。
+- 捕获和四边形 UV 都使用与主 pass 完全相同的投影矩阵（含 view bob、受伤倾斜和
+  portal/nausea 旋转），避免乘上不同投影导致的拉伸。
 - `PortalManager.register()` 目前在 `PhysicsTicker.register()` 之前；传送检测使用上一次物理
   step 的已提交位姿。若需要严格在本 tick 物理之后，移动该入口行即可。
 
@@ -561,7 +570,7 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
 ## 10. 后续 TODO 建议
 
 1. **递归视口**：v1 已有 1 层真实目标场景捕获；下一步是多离屏纹理 + 多趟捕获（深度 2~3）、
-   模板缓冲/逐像素洞口、近裁剪面与相机穿面过渡。
+   模板缓冲/逐像素洞口与相机穿面过渡。
 2. **持久化增强**：v1 已用主世界 `SavedData` 保存 UUID/名称/维度/平面/链接；下一步是存档版本迁移、
    跨维度目标校验与命令级导入/导出。
 3. **网络同步**：链接与平面快照包；客户端只读快照；与结构同步包共用版本/分片策略。

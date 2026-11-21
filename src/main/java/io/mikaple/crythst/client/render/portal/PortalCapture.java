@@ -103,13 +103,16 @@ import java.util.UUID;
  * written.</p>
  */
 public final class PortalCapture {
-    /** Default ~4.5 captures per second (tunable via crythst.portal.capture.intervalMs). */
-    private static final long CAPTURE_INTERVAL_NANOS = readCaptureIntervalNanos();
+    /** Default 10 captures per second (tunable via crythst.portal.capture.intervalMs). */
+    private static final long BASE_CAPTURE_INTERVAL_NANOS = readCaptureIntervalNanos();
+    private static final long MAX_CAPTURE_INTERVAL_NANOS =
+            Math.max(BASE_CAPTURE_INTERVAL_NANOS, 250_000_000L);
+    private static long captureIntervalNanos = BASE_CAPTURE_INTERVAL_NANOS;
     /** One portal per round; each capture is a full extraction + world render. */
     private static final int MAX_PORTALS_PER_CAPTURE = 1;
     /** Budget for scheduling compiles of destination sections not yet meshed. */
     private static final int MAX_PORTAL_SECTION_COMPILES = 8;
-    /** Default half-resolution offscreen texture (tunable via crythst.portal.capture.scale). */
+    /** Default full-resolution offscreen texture, capped below (tunable via crythst.portal.capture.scale). */
     private static final float CAPTURE_SCALE = readCaptureScale();
     private static final int MAX_CAPTURE_WIDTH = 1280;
     private static final int MAX_CAPTURE_HEIGHT = 720;
@@ -259,7 +262,7 @@ public final class PortalCapture {
         }
 
         final long now = System.nanoTime();
-        if (now - lastCaptureNanos < CAPTURE_INTERVAL_NANOS) {
+        if (now - lastCaptureNanos < captureIntervalNanos) {
             return;
         }
 
@@ -418,7 +421,11 @@ public final class PortalCapture {
         orientation.normalize();
         final Matrix4f viewRotation = new Matrix4f().rotation(
                 new Quaternionf(orientation).conjugate());
-        final Matrix4f projection = new Matrix4f(mainCamera.projectionMatrix);
+        // Use the same bobbed/spun projection the main pass will use; the quad
+        // UVs are computed from this exact matrix in PortalRenderer.
+        final Matrix4f projection = PortalProjection.worldProjection(
+                mainCamera, levelState.playerRenderState,
+                Minecraft.getInstance().gameRenderer.gameRenderState().optionsRenderState);
         if (!PortalCameraSanity.isUsable(projection, viewRotation, orientation,
                 position.x, position.y, position.z)) {
             logSkippedInvalidCamera(portal, "degenerate projection or view rotation");
@@ -698,22 +705,40 @@ public final class PortalCapture {
     private static void logTimings(PortalSnapshot portal, int sectionCount, ViewTarget target,
                                    long extractStart, long extractEnd,
                                    long renderStart, long renderEnd) {
+        final double extractMs = (extractEnd - extractStart) / 1.0e6;
+        final double renderMs = (renderEnd - renderStart) / 1.0e6;
+        final double totalMs = extractMs + renderMs;
+        adaptCaptureInterval(totalMs);
+
         final long now = System.nanoTime();
         if (now - lastTimingLogNanos < TIMING_LOG_INTERVAL_NANOS) {
             return;
         }
         lastTimingLogNanos = now;
-        final double extractMs = (extractEnd - extractStart) / 1.0e6;
-        final double renderMs = (renderEnd - renderStart) / 1.0e6;
         Crythst.LOGGER.info(
                 "[portal timings] portal='{}' {}x{} sections={} extract={}ms render={}ms "
                         + "total={}ms scale={} interval={}ms",
                 portal.name(), target.target.width, target.target.height, sectionCount,
                 String.format("%.2f", extractMs),
                 String.format("%.2f", renderMs),
-                String.format("%.2f", extractMs + renderMs),
+                String.format("%.2f", totalMs),
                 String.format("%.2f", CAPTURE_SCALE),
-                CAPTURE_INTERVAL_NANOS / 1_000_000L);
+                captureIntervalNanos / 1_000_000L);
+    }
+
+    /**
+     * Short interval while captures are cheap, backing off toward 250 ms when
+     * a capture is expensive. The per-portal freshness check already skips
+     * captures while the camera is effectively static.
+     */
+    private static void adaptCaptureInterval(double totalMs) {
+        if (totalMs > 12.0) {
+            captureIntervalNanos = Math.min(MAX_CAPTURE_INTERVAL_NANOS,
+                    captureIntervalNanos + 20_000_000L);
+        } else if (totalMs < 6.0) {
+            captureIntervalNanos = Math.max(BASE_CAPTURE_INTERVAL_NANOS,
+                    captureIntervalNanos - 10_000_000L);
+        }
     }
 
     private static void logSkippedCapture(PortalSnapshot portal, String reason) {
@@ -737,7 +762,7 @@ public final class PortalCapture {
 
     private static long readCaptureIntervalNanos() {
         final String raw = System.getProperty("crythst.portal.capture.intervalMs");
-        long millis = 220L;
+        long millis = 100L;
         if (raw != null) {
             try {
                 millis = Long.parseLong(raw.trim());
@@ -751,7 +776,7 @@ public final class PortalCapture {
 
     private static float readCaptureScale() {
         final String raw = System.getProperty("crythst.portal.capture.scale");
-        double scale = 0.5;
+        double scale = 1.0;
         if (raw != null) {
             try {
                 scale = Double.parseDouble(raw.trim());
