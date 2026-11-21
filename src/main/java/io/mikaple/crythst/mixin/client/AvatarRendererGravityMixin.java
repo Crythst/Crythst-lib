@@ -5,7 +5,7 @@ import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.entity.LivingEntityRenderer;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
-import net.minecraft.client.renderer.entity.state.EntityRenderState;
+import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import org.joml.Matrix4f;
@@ -43,7 +43,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(LivingEntityRenderer.class)
 public abstract class AvatarRendererGravityMixin {
     @Inject(method = "setupRotations", at = @At("HEAD"))
-    private void crythst$rotateAvatarToGravity(EntityRenderState state, PoseStack pose,
+    private void crythst$rotateAvatarToGravity(LivingEntityRenderState state, PoseStack pose,
                                                float yaw, float pitch, CallbackInfo ci) {
         if (!(state instanceof AvatarRenderState avatar)) {
             return;
