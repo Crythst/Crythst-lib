@@ -25,12 +25,36 @@ import java.util.List;
 public final class EntityStructureRidingMath {
     /** Default vertical contact tolerance for "feet are on this surface". */
     public static final double DEFAULT_SUPPORT_TOLERANCE = 0.08;
+    /**
+     * Carry displacements below this are numerical noise. Applying them with a
+     * player teleport every tick zeroes velocity and makes a static structure
+     * feel sticky, so they are skipped.
+     */
+    public static final double CARRY_EPSILON = 1.0e-6;
+    /** Yaw changes below this are not worth a teleport packet. */
+    public static final float CARRY_YAW_EPSILON = 1.0e-3f;
     /** Horizontal slack at a box edge, in metres. */
     private static final double EDGE_SLACK = 0.02;
     /** A centre hit is enough; otherwise most of the foot corners must agree. */
     private static final int MIN_CORNER_SAMPLES = 3;
 
     private EntityStructureRidingMath() {
+    }
+
+    /**
+     * Whether a carry target differs from the entity enough to justify moving
+     * it. A static platform therefore produces no teleport at all, while a
+     * real pose delta or yaw change is always applied.
+     */
+    public static boolean needsCarryUpdate(Vector3dc current, Vector3dc target,
+                                           float currentYaw, float targetYaw) {
+        final double dx = target.x() - current.x();
+        final double dy = target.y() - current.y();
+        final double dz = target.z() - current.z();
+        if (dx * dx + dy * dy + dz * dz > CARRY_EPSILON * CARRY_EPSILON) {
+            return true;
+        }
+        return Math.abs(wrapDegrees(targetYaw - currentYaw)) > CARRY_YAW_EPSILON;
     }
 
     /**

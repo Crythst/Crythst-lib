@@ -5,6 +5,8 @@ import io.mikaple.crythst.client.network.ClientStructureSnapshot;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
+import io.mikaple.crythst.integration.minecraft.entity.StructureCollisionDebug;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -72,6 +74,13 @@ public final class ClientPlayerStructureCollision {
     /** Above this per-tick displacement a previous-centre hint is unreliable. */
     private static final double PREVIOUS_HINT_MAX_DISTANCE_SQUARED = 4.0;
 
+    /**
+     * Penetrations at or below this are resting contact. Correcting them every
+     * tick is what makes a player feel glued to a surface; the vanilla-style
+     * gravity re-penetration is handled by the support normal instead.
+     */
+    private static final double CONTACT_SLOP = 2.0e-3;
+
     /** Guards against reusing network geometry after a dimension/session change. */
     private static final Map<Long, CachedGeometry> NETWORK_GEOMETRY = new HashMap<>();
     private static long networkGeometrySyncId = Long.MIN_VALUE;
@@ -117,21 +126,28 @@ public final class ClientPlayerStructureCollision {
         final double margin = Math.clamp(config.entityCollisionMargin, 0.0, 0.5);
         final Aabb entityBox = toCore(vanillaBox);
         final Aabb query = entityBox.expand(margin + BROAD_PHASE_PADDING);
-        final float alpha = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
 
         final List<ClientStructureCollisionResolver.Collider> candidates =
-                collectCandidates(client, query, alpha, margin);
+                collectCandidates(client, query);
         if (candidates.isEmpty()) {
             return;
         }
+
+        final Vec3 velocity = player.getDeltaMovement();
+        final boolean restingOrDescending = player.onGround() || velocity.y <= 0.0;
+        final EntityStructureSolver.Policy policy = EntityStructureSolver.Policy.gameplay(
+                margin,
+                ClientStructureCollisionResolver.DEFAULT_MAX_BOXES,
+                CONTACT_SLOP,
+                restingOrDescending,
+                velocity.y);
 
         final ClientStructureCollisionResolver.Correction correction =
                 ClientStructureCollisionResolver.resolve(
                         entityBox,
                         previousCenter(player, entityBox.center()),
                         candidates,
-                        margin,
-                        ClientStructureCollisionResolver.DEFAULT_MAX_BOXES,
+                        policy,
                         ClientStructureCollisionResolver.DEFAULT_MAX_PASSES,
                         MAX_CORRECTION);
         if (correction == null) {
@@ -150,12 +166,17 @@ public final class ClientPlayerStructureCollision {
     }
 
     private static List<ClientStructureCollisionResolver.Collider> collectCandidates(
-            Minecraft client, Aabb query, float alpha, double margin) {
+            Minecraft client, Aabb query) {
         final List<Candidate> found = new ArrayList<>(4);
         final Set<Long> liveBodyIds = new HashSet<>();
+        final long nowNanos = System.nanoTime();
 
-        // Singleplayer / integrated server: live physics structures with the
-        // interpolated render pose. These win over network data for the same id.
+        // Singleplayer / integrated server: live physics structures. Collision
+        // must use the newest published server pose, not the delayed render
+        // sample: otherwise the client and server resolve against different
+        // surfaces and fight each other on moving structures. Sampling the
+        // timeline one delay ahead returns its current (newest) pose without
+        // touching Bullet from the client thread.
         for (PhysicsStructure structure : ClientPhysicsView.structures()) {
             if (structure.closed()) {
                 continue;
@@ -164,7 +185,8 @@ public final class ClientPlayerStructureCollision {
             if (collider.isEmpty()) {
                 continue;
             }
-            final StructureRenderState state = structure.renderState(alpha);
+            final StructureRenderState state = structure.renderStateAt(
+                    nowNanos + structure.renderTimelineDelayNanos());
             final Aabb bounds = state.aabb();
             liveBodyIds.add(state.bodyId());
             if (!bounds.intersects(query)) {
@@ -237,9 +259,13 @@ public final class ClientPlayerStructureCollision {
     private static void apply(Level level, LocalPlayer player,
                               ClientStructureCollisionResolver.Correction correction) {
         final Vector3d offset = correction.offset();
+        final Vec3 velocityBefore = player.getDeltaMovement();
         final AABB corrected = player.getBoundingBox().move(offset.x, offset.y, offset.z);
         if (hasVanillaCollision(level, player, corrected)) {
             // The structure push would enter terrain; leave it to the server.
+            StructureCollisionDebug.client("-", correction.penetration(),
+                    correction.normal(), offset, velocityBefore, velocityBefore,
+                    false, "would-enter-vanilla-block");
             return;
         }
 
@@ -249,25 +275,38 @@ public final class ClientPlayerStructureCollision {
                 player.getZ() + offset.z
         );
 
-        // Remove only the component pointing into the structure. Vanilla
-        // movement recomputes the rest next tick, so no impulse is invented.
+        // Remove only the component pointing into each contact surface. Vanilla
+        // movement recomputes the rest next tick, so no impulse is invented
+        // and tangential sliding/jumping is preserved. Using every pass normal
+        // (not just the last) keeps a floor+wall contact from accumulating
+        // downward velocity behind a wall pass.
         final Vector3d normal = correction.normal();
         final Vec3 motion = player.getDeltaMovement();
-        final double into = motion.x * normal.x + motion.y * normal.y + motion.z * normal.z;
-        if (into < 0.0) {
-            player.setDeltaMovement(
-                    motion.x - normal.x * into,
-                    motion.y - normal.y * into,
-                    motion.z - normal.z * into
-            );
+        Vec3 velocityAfter = motion;
+        boolean changed = false;
+        for (Vector3d contact : correction.contacts()) {
+            final double into = velocityAfter.x * contact.x
+                    + velocityAfter.y * contact.y + velocityAfter.z * contact.z;
+            if (into < 0.0) {
+                velocityAfter = velocityAfter.add(
+                        -contact.x * into, -contact.y * into, -contact.z * into);
+                changed = true;
+            }
+        }
+        if (changed) {
+            player.setDeltaMovement(velocityAfter);
         }
 
-        if (normal.y > 0.5) {
+        if (correction.support() || normal.y > 0.5) {
             // The structure is not a vanilla block; mirror the server-side
             // ground flag so animation and client-side stepping behave.
             player.setOnGround(true);
             player.resetFallDistance();
         }
+
+        StructureCollisionDebug.client("-", correction.penetration(),
+                normal, offset, velocityBefore, velocityAfter, true,
+                correction.support() ? "support" : "slide");
     }
 
     private static boolean hasVanillaCollision(Level level, LocalPlayer player, AABB box) {

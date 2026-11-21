@@ -68,38 +68,82 @@ Each server tick:
    - Choose the shallowest of the six **face** axes as the minimum translation
      vector (MTV). Cross axes are only used for rejection: de-penetrating along
      a diagonal cross axis is unstable at edges, so it is not used for motion.
-   - Bias ties toward the upward escape. This keeps entities resting on a floor
-     instead of being squeezed sideways by floating-point ties.
+   - Prefer a **world-up support exit** while the entity is resting or
+     descending. If the upward overlap is shallow enough to be a floor or a
+     step (default `0.6` m plus the downward speed), it wins even when a
+     sideways overlap is a few millimetres smaller. This stops a landing on the
+     edge of a platform from being shoved off sideways.
+   - Bias remaining ties toward the upward escape. This keeps entities resting
+     on a floor instead of being squeezed sideways by floating-point ties.
    - Choose the sign of each face axis using the entity AABB centre from the
-     previous tick when available. This sends an entity back toward the side it
-     entered from instead of through a thin wall after it crossed the wall's
-     mid-plane.
+     previous tick **only while the current centre is still inside that box's
+     slab**. Once the centre is clearly outside, the current side is
+     unambiguous and a stale/interpolated hint cannot push the entity back into
+     the surface.
 5. Add the configured `entityCollisionMargin` to the MTV and translate the
    entity. Up to three passes are run per structure so one merged box cannot
    leave the entity inside a neighbouring box.
-6. Remove the velocity component pointing into the structure. This prevents the
-   next tick from re-penetrating and lets horizontal movement slide along a
-   wall.
+6. Remove the velocity component pointing into **every** contact normal (one per
+   pass), not just the last one. All tangential components are left untouched,
+   so walking, sliding along a wall and jumping are preserved even when a floor
+   and a wall are resolved in the same tick.
 
-The solver treats penetrations of `<= 1e-4` m as resting contact. Combined with
-the margin, an entity that is already outside is not moved, and a resting
-entity does not receive a correction every tick unless gravity or movement
-actually re-penetrates the surface.
+Penetrations at or below the contact slop (`2e-3` m for gameplay, `1e-4` m for
+the legacy overloads) are **resting contact** and produce no correction.
+Without this, the margin would generate a small correction on every tick the
+entity merely touches a surface. The slop is applied to the chosen exit, so a
+real landing is still resolved even if another face of the same merged box only
+grazes the surface.
 
 ### Standing on top vs. embedded in a side
 
-The shallowest penetration axis naturally distinguishes the two cases:
+The shallowest penetration axis usually distinguishes the two cases, and the
+support preference covers the ambiguous edge cases:
 
 - Feet slightly below the top of a floor: vertical overlap is small, so the MTV
   points up. Downward velocity is removed, `setOnGround(true)` is set and fall
   distance is reset. This helps mob AI and fall damage even though the
   structure is not a vanilla block.
-- Body overlapping a wall: horizontal overlap is small, so the MTV points out of
-  the wall and the inward velocity component is removed.
+- Landing with most of the body past the edge: the horizontal overlap can be
+  smaller than the vertical one. The support preference still picks up while
+  the vertical overlap is within the step/landing budget, so the player stands
+  on the edge instead of being pushed into the air.
+- Body overlapping a tall wall: the vertical overlap spans the whole body and
+  exceeds the support budget, so the MTV points out of the wall and the inward
+  velocity component is removed while the tangential component is kept.
 
 A tie-break prefers an upward normal when two face axes have effectively equal
-depth. The previous-tick hint only changes the sign, never which axis is
-shallowest.
+depth. The previous-tick hint only changes the sign, and only while the centre
+is inside the box.
+
+### Authority model for players
+
+Sending a `ClientboundPlayerPositionPacket` every contact tick is actively
+harmful: the client applies the packet with `Vec3.ZERO` velocity, so a player
+touching a wall or standing on a floor loses all momentum and feels glued.
+The passes therefore elect a single visible authority:
+
+- **The local client predicts and owns the player position** when the client
+  runs the Crythst prediction layer. The server resolves the same geometry for
+  diagnostics and ground state, but does **not** teleport for corrections below
+  `0.5` m. The client's next movement packet carries the corrected position.
+- **The server teleports** when the client has no prediction channel (a vanilla
+  client) or when the correction is larger than `0.5` m (for example, the
+  client skipped it because the target would enter a vanilla block). Even then
+  the teleport carries the tangential velocity instead of zeroing it.
+- **Singleplayer always counts as prediction-capable**, so both copies never
+  teleport-loop against each other.
+- **The riding/carry pass** only teleports when the structure-local anchor
+  actually moved by more than `1e-6` m or the yaw changed. A static structure
+  therefore produces no carry packet at all, and a moving one keeps the
+  entity's velocity in the packet.
+
+The client uses the **newest published pose** for collision, while rendering
+uses the one-tick-delayed `PoseTimeline` sample. Using the delayed render pose
+for collision made a moving structure push against a surface the server had
+already left, which showed up as alternating corrections. The newest pose is
+obtained without touching Bullet from the client thread by sampling
+`renderStateAt(now + renderTimelineDelayNanos())`.
 
 ### Pose convention and broad phase
 
@@ -124,11 +168,12 @@ COM offset.
 
 ### Players
 
-Server players are server-authoritative only through teleport packets; the
-client predicts vanilla movement. The manager therefore calls
-`ServerPlayer.connection.teleport(...)` after computing the correction and then
-re-applies the adjusted velocity. This keeps the server copy and the client
-copy in the same place. Other entities use `Entity.setPos`.
+Server players are normally server-authoritative only through teleport packets,
+while the client predicts vanilla movement. The collision and riding passes
+follow the authority model above: they prefer the client's prediction and only
+teleport when the client cannot have applied the correction. Other entities
+continue to use `Entity.setPos(...)` and never cause a packet.
+
 
 ## Eligibility and filtering
 
@@ -169,6 +214,36 @@ same data is available programmatically through
 `EntityPhysicsCollisionManager.inspect(level, entity)` and
 `EntityPhysicsCollisionManager.inspectNear(level, centre, radius, max)`.
 
+### Correction trace
+
+`StructureCollisionDebug` keeps the last correction attempt from both the
+client and server paths: penetration, chosen normal, offset, velocity before and
+after, whether it was applied, and why it was skipped or deferred. It also
+counts corrections, deferrals and rapid normal reversals (a flip counter, so
+oscillation is measurable instead of subjective).
+
+Set `-Dcrythst.debug.collision=true` to log the trace at most once per second.
+The latest trace is always available in memory, so an overlay or a debug command
+can show it without changing log settings:
+
+```java
+final StructureCollisionDebug.Sample sample = StructureCollisionDebug.last();
+if (sample != null) {
+    player.displayClientMessage(Component.literal(sample.describe()), true);
+}
+```
+
+Example line:
+
+```text
+CLIENT_PREDICTION applied body=- pen=0.0784 n=(0.000,1.000,0.000)
+off=(0.000,0.098,0.000) v=(0.150,-0.078,0.000)->(0.150,0.000,0.000) (support)
+```
+
+`SERVER_PLAYER_DEFERRED` means the server detected the contact but left the
+visible correction to the client; `SERVER_PLAYER_TELEPORT` means an
+authoritative fallback was sent.
+
 ## Performance
 
 The design bounds every loop:
@@ -207,12 +282,22 @@ Additional properties:
 - **Vanilla collision still runs.** Entities continue to collide with world
   blocks, other entities and pistons. This pass only adds structure collision;
   it does not replace or disable vanilla movement.
-- **Client-side prediction.** Structures are not part of the vanilla chunk
-  collision data. Singleplayer/dedicated clients cannot predict collisions with
-  them, which is why players are corrected via teleport. While a player rests
-  on a structure the server may need to send a correction every tick; the
-  riding layer may also send its own carry teleport. A client-aware prediction
-  layer is out of scope for this task.
+- **Client-side prediction is still an approximation.** Structures are not part
+  of the vanilla chunk collision data, so the client resolves them after vanilla
+  movement. The predictor uses the newest published pose, the same solver and
+  the same margin as the server, but it cannot feed the structures into
+  vanilla's swept movement. Very fast motion can therefore tunnel for one tick
+  before the correction lands. A vanilla client has no predictor at all; the
+  server falls back to teleporting it (with tangential velocity preserved).
+- **Mismatched client config.** A remote client with
+  `entityPhysicsCollisionEnabled=false` will not predict even though the server
+  defers small corrections to it. Keep the feature enabled on both sides when
+  playing multiplayer. Gross penetrations are still teleported by the server.
+- **Carry teleports are still required for moving platforms.** A player riding
+  a moving structure is carried by a teleport because vanilla movement has no
+  platform velocity. The packet now preserves the player's own velocity and is
+  skipped entirely when the anchor did not move, so this is much less sticky,
+  but continuous fast motion still sends one packet per tick.
 - **No structure reaction.** By design, an entity cannot push, rotate or wake a
   structure. Two entities cannot use a structure as a shared movable platform
   with mass transfer.
@@ -249,3 +334,33 @@ covers:
 - local-query rejection of a distant structure,
 - block-scale handling,
 - the box budget.
+
+`EntityStructureSolverContactTest` covers the gameplay policy:
+
+- edge landings resolve up instead of sideways (and the legacy path is asserted
+  to shove sideways, so the regression is explicit),
+- tall walls still resolve horizontally,
+- sub-slop resting contact is ignored,
+- support is only used for grounded/descending callers,
+- fast landings on a corner still resolve up,
+- support wins over a shallower horizontal from another merged box,
+- the previous-centre hint cannot flip the sign once the centre is outside the
+  box, but still prevents tunnelling while it is inside.
+
+`ClientStructureCollisionResolverTest` covers the bounded client correction and
+the `StructureCollisionContactSimulationTest` tick loop covers:
+
+- standing on a floor without horizontal push or height drift,
+- walking while tangential velocity is preserved,
+- walking along a wall with only the into-wall component removed and a stable
+  normal,
+- jumping into a ceiling,
+- landing on a corner,
+- diagonal wall approach,
+- low-speed resting contact,
+- a single grazing contact not starting a shove loop.
+
+`StructureCollisionDebugTest` covers the trace counters and flip detection, and
+`EntityStructureRidingMathTest` covers the no-op carry decision (a static
+structure must not teleport). `EntityStructureSolverPhysicsTest` continues to
+assert that resolving entities never mutates the structure body.

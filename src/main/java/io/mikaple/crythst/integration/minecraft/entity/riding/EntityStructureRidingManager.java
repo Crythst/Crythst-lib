@@ -18,6 +18,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
@@ -683,7 +684,10 @@ public final class EntityStructureRidingManager {
             targetYaw = (float) yaw;
         }
 
-        setPosition(entity, targetPosition, targetYaw);
+        if (EntityStructureRidingMath.needsCarryUpdate(
+                currentPosition, targetPosition, entity.getYRot(), targetYaw)) {
+            setPosition(entity, targetPosition, targetYaw);
+        }
         entity.setOnGround(true);
         entity.resetFallDistance();
         final Vec3 motion = entity.getDeltaMovement();
@@ -716,10 +720,14 @@ public final class EntityStructureRidingManager {
         final float pitch = entity.getXRot();
         if (entity instanceof ServerPlayer player && player.connection != null) {
             // Clients predict vanilla movement; a teleport is the only reliable
-            // way to keep the server and client copies together.
+            // way to keep the server and client copies together. Carry the
+            // entity's current velocity through the packet instead of the
+            // default zero, otherwise every carry tick would stop the player.
+            final Vec3 motion = player.getDeltaMovement();
             player.setYRot(yaw);
             player.setYHeadRot(yaw);
-            player.connection.teleport(position.x, position.y, position.z, yaw, pitch);
+            player.connection.teleport(new PositionMoveRotation(
+                    new Vec3(position.x, position.y, position.z), motion, yaw, pitch), Set.of());
         } else {
             entity.setPos(position.x, position.y, position.z);
             entity.setYRot(yaw);

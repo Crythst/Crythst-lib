@@ -5,15 +5,18 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -22,6 +25,7 @@ import org.joml.Vector3d;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Predicate;
 
 /**
@@ -54,6 +58,17 @@ public final class EntityPhysicsCollisionManager {
     /** Safety valve: never teleport an entity farther than this in one tick. */
     private static final double MAX_TOTAL_OFFSET_SQUARED = 64.0;
     private static final double MAX_MARGIN = 0.5;
+    /** Penetrations at or below this are resting contact, not a collision. */
+    private static final double CONTACT_SLOP = 2.0e-3;
+
+    /**
+     * A player correction below this is owned by the client prediction layer.
+     * The server only teleports when the client cannot have applied it (no
+     * prediction channel, or a gross penetration beyond the client's budget).
+     * Teleporting every contact tick is what used to zero the player's
+     * velocity and make walls feel sticky.
+     */
+    static final double PLAYER_PREDICTION_TELEPORT_THRESHOLD = 0.5;
 
     private static volatile Predicate<Entity> entityFilter = entity -> true;
     private static volatile TickStats lastStats = new TickStats(0, 0, 0, 0, 0L);
@@ -130,9 +145,13 @@ public final class EntityPhysicsCollisionManager {
                 }
                 final Aabb localQuery = EntityStructureSolver.localQueryBox(
                         pose, entityBox.expand(margin), structure.blockScale());
+                final Vec3 motion = entity.getDeltaMovement();
                 final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                         entityBox, previousCenter(entity, center), pose, collider.boxes(),
-                        structure.blockScale(), margin, MAX_BOXES_PER_STRUCTURE);
+                        structure.blockScale(),
+                        EntityStructureSolver.Policy.gameplay(margin, MAX_BOXES_PER_STRUCTURE,
+                                CONTACT_SLOP, entity.onGround() || motion.y <= 0.0,
+                                motion.y));
                 final boolean centerInside = structure.obb().contains(center);
                 structures.add(new StructureDebug(structure.body().id(), pose, bounds,
                         localQuery, hit, centerInside));
@@ -278,20 +297,32 @@ public final class EntityPhysicsCollisionManager {
             candidates.subList(MAX_STRUCTURES_PER_ENTITY, candidates.size()).clear();
         }
 
+        final Vec3 velocity = entity.getDeltaMovement();
+        final boolean restingOrDescending = entity.onGround() || velocity.y <= 0.0;
+        final EntityStructureSolver.Policy policy = EntityStructureSolver.Policy.gameplay(
+                margin, MAX_BOXES_PER_STRUCTURE, CONTACT_SLOP, restingOrDescending, velocity.y);
+
         final Vector3d totalOffset = new Vector3d();
         final Vector3d lastNormal = new Vector3d();
+        final List<Vector3d> contacts = new ArrayList<>(4);
+        double lastPenetration = 0.0;
+        boolean lastSupport = false;
         boolean touched = false;
         for (StructureView structure : candidates) {
             for (int pass = 0; pass < MAX_PASSES_PER_STRUCTURE; pass++) {
                 final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                         entityBox.offset(totalOffset), previousCenter, structure.pose(),
-                        structure.boxes(), structure.blockScale(), margin,
-                        MAX_BOXES_PER_STRUCTURE);
+                        structure.boxes(), structure.blockScale(), policy);
                 if (hit == null) {
                     break;
                 }
                 totalOffset.add(hit.offset());
                 lastNormal.set(hit.normal());
+                lastPenetration = hit.penetration();
+                addContact(contacts, hit.normal());
+                // A landing pass can be followed by a wall pass; keep the
+                // support flag so the caller still marks the contact as ground.
+                lastSupport |= hit.support();
                 touched = true;
                 if (totalOffset.lengthSquared() > MAX_TOTAL_OFFSET_SQUARED) {
                     break;
@@ -305,51 +336,124 @@ public final class EntityPhysicsCollisionManager {
         if (!touched || totalOffset.lengthSquared() < MIN_OFFSET_SQUARED) {
             return false;
         }
-        applyCorrection(entity, totalOffset, lastNormal);
+        applyCorrection(entity, totalOffset, lastNormal, contacts,
+                lastPenetration, lastSupport);
         return true;
     }
 
-    private static void applyCorrection(Entity entity, Vector3d offset, Vector3d normal) {
+    private static void addContact(List<Vector3d> contacts, Vector3d normal) {
+        for (Vector3d existing : contacts) {
+            if (existing.dot(normal) > 0.9999) {
+                return;
+            }
+        }
+        contacts.add(new Vector3d(normal));
+    }
+
+    private static void applyCorrection(Entity entity, Vector3d offset, Vector3d normal,
+                                        List<Vector3d> contacts,
+                                        double penetration, boolean support) {
         final Vec3 position = entity.position();
+        final Vec3 velocityBefore = entity.getDeltaMovement();
         final double x = position.x + offset.x;
         final double y = position.y + offset.y;
         final double z = position.z + offset.z;
-        final Vec3 motion = adjustVelocity(entity.getDeltaMovement(), normal);
 
         if (entity instanceof ServerPlayer player && player.connection != null) {
-            // Clients predict vanilla movement, so the server must explicitly
-            // reposition the player or the local copy immediately re-enters.
-            player.connection.teleport(x, y, z, player.getYRot(), player.getXRot());
+            final boolean predictionOwnsIt = !shouldTeleportPlayer(
+                    hasClientPrediction(player), offset.length());
+            if (predictionOwnsIt) {
+                // The client already corrected its own copy this tick; its
+                // next movement packet carries that position. Teleporting here
+                // would overwrite the prediction and zero the player's
+                // velocity every contact tick (the "glued to the wall" feel).
+                if (support || normal.y > 0.5) {
+                    player.setOnGround(true);
+                    player.resetFallDistance();
+                }
+                StructureCollisionDebug.serverPlayer("-", penetration,
+                        normal, offset, velocityBefore, velocityBefore, false,
+                        "client-prediction");
+                return;
+            }
+            // No prediction channel (vanilla client) or a gross penetration:
+            // the server is authoritative and must reposition the player.
+            // Carry the tangential velocity through the teleport so a single
+            // fallback correction does not stop the player dead.
+            final Vec3 motion = adjustVelocity(velocityBefore, contacts);
+            player.connection.teleport(new PositionMoveRotation(
+                    new Vec3(x, y, z), motion, player.getYRot(), player.getXRot()), Set.of());
             player.setDeltaMovement(motion);
-        } else {
-            entity.setPos(x, y, z);
-            entity.setDeltaMovement(motion);
+            if (support || normal.y > 0.5) {
+                player.setOnGround(true);
+                player.resetFallDistance();
+            }
+            StructureCollisionDebug.serverPlayer("-", penetration,
+                    normal, offset, velocityBefore, motion, true, "teleport");
+            return;
         }
 
-        if (normal.y > 0.5) {
+        final Vec3 motion = adjustVelocity(velocityBefore, contacts);
+        entity.setPos(x, y, z);
+        entity.setDeltaMovement(motion);
+        if (support || normal.y > 0.5) {
             // The structure is not a vanilla block, so help mob AI and fall
             // damage by marking the contact as ground even though vanilla
             // terrain does not know about it.
             entity.setOnGround(true);
             entity.resetFallDistance();
         }
+        StructureCollisionDebug.serverEntity("-", penetration,
+                normal, offset, velocityBefore, motion, true, support ? "support" : "slide");
     }
 
     /**
-     * Removes the velocity component that points into the structure. This
-     * stops the next tick from re-penetrating and lets horizontal movement
-     * slide along a wall.
+     * Whether a player correction must be sent as an authoritative teleport.
+     * With a prediction-capable client, ordinary contact is owned by the
+     * client; only a gross correction is forced. Visible for unit tests.
      */
-    private static Vec3 adjustVelocity(Vec3 motion, Vector3d normal) {
-        final double into = motion.x * normal.x + motion.y * normal.y + motion.z * normal.z;
-        if (into >= 0.0) {
-            return motion;
+    static boolean shouldTeleportPlayer(boolean clientPrediction, double offsetLength) {
+        return !clientPrediction || offsetLength > PLAYER_PREDICTION_TELEPORT_THRESHOLD;
+    }
+
+    /**
+     * Whether this player's client runs the Crythst prediction layer. The
+     * integrated client always does; a remote client advertises the structure
+     * sync channel. Query failures are treated as "no prediction" so the
+     * server stays conservative.
+     */
+    private static boolean hasClientPrediction(ServerPlayer player) {
+        final MinecraftServer server = player.level().getServer();
+        if (server != null && server.isSingleplayer()) {
+            return true;
         }
-        return new Vec3(
-                motion.x - normal.x * into,
-                motion.y - normal.y * into,
-                motion.z - normal.z * into
-        );
+        try {
+            return ServerPlayNetworking.canSend(player, StructureSnapshotPayload.TYPE);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Removes the velocity component that points into each contact surface.
+     * Every pass normal is used, not just the last one, so a floor+wall pair
+     * cannot accumulate downward velocity behind the wall correction. All
+     * tangential components are preserved, which is what lets a player slide
+     * along a wall or jump away from a floor.
+     */
+    private static Vec3 adjustVelocity(Vec3 motion, List<Vector3d> contacts) {
+        Vec3 result = motion;
+        for (Vector3d normal : contacts) {
+            final double into = result.x * normal.x + result.y * normal.y + result.z * normal.z;
+            if (into < 0.0) {
+                result = new Vec3(
+                        result.x - normal.x * into,
+                        result.y - normal.y * into,
+                        result.z - normal.z * into
+                );
+            }
+        }
+        return result;
     }
 
     /**

@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -19,6 +20,26 @@ class EntityStructureRidingMathTest {
 
     private static VoxelBox box(int x, int y, int z, int sx, int sy, int sz) {
         return new VoxelBox(x, y, z, sx, sy, sz, PhysicsMaterial.STONE, 1.0);
+    }
+
+    @Test
+    void staticCarryDoesNotProduceATeleport() {
+        final Vector3d anchor = new Vector3d(3.0, 4.0, 5.0);
+        assertFalse(EntityStructureRidingMath.needsCarryUpdate(
+                anchor, new Vector3d(3.0, 4.0, 5.0), 45.0f, 45.0f),
+                "an unchanged pose must not move or teleport the entity");
+        assertFalse(EntityStructureRidingMath.needsCarryUpdate(
+                anchor, new Vector3d(3.0, 4.0, 5.0 + 1.0e-7), 45.0f, 45.0f),
+                "numerical noise must not teleport the entity");
+    }
+
+    @Test
+    void realCarryAndYawChangeAreApplied() {
+        final Vector3d anchor = new Vector3d(3.0, 4.0, 5.0);
+        assertTrue(EntityStructureRidingMath.needsCarryUpdate(
+                anchor, new Vector3d(3.01, 4.0, 5.0), 0.0f, 0.0f));
+        assertTrue(EntityStructureRidingMath.needsCarryUpdate(
+                anchor, new Vector3d(3.0, 4.0, 5.0), 0.0f, 0.5f));
     }
 
     @Test
