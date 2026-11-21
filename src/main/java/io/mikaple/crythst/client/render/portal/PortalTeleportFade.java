@@ -1,6 +1,7 @@
 package io.mikaple.crythst.client.render.portal;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.integration.portal.PortalCrossing;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
@@ -13,32 +14,31 @@ import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 
 /**
- * Short client-side black fade around a portal traversal.
+ * Very short, subtle client-side transition around a portal traversal.
  *
- * <p>The server teleport is necessarily instantaneous: position, velocity and
- * view rotation are applied in one packet. A short full-screen fade hides the
- * seam without moving the camera or interfering with input/movement.</p>
+ * <p>The portal view is intended to be geometrically continuous: traversal is
+ * triggered when the eye crosses the plane and the player is placed so the new
+ * camera position equals the transformed eye. The black fade is therefore only
+ * a brief visual settle (two ticks, low alpha), never a curtain that hides a
+ * snap. The fallback jump detection still covers command/respawn teleports
+ * where there is no portal crossing at all.</p>
  *
- * <p>Triggers when the local player's bounding-box centre enters a known portal
- * trigger volume, or as a fallback when the client position jumps more than a
- * few blocks in one tick (commands, respawns, cross-dimension). It uses only
- * client events and a HUD fill; no resource reload or network packet is
- * involved.</p>
+ * <p>Uses only client events and a HUD fill; no resource reload or network
+ * packet is involved.</p>
  */
 public final class PortalTeleportFade {
     private static final Identifier ELEMENT_ID =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_teleport_fade");
     /** Total fade duration in client ticks. */
-    private static final int FADE_TICKS = 10;
-    /** Do not retrigger while the player is still standing in the trigger. */
-    private static final int TRIGGER_COOLDOWN_TICKS = 20;
+    private static final int FADE_TICKS = 2;
+    /** Do not retrigger immediately after a traversal. */
+    private static final int TRIGGER_COOLDOWN_TICKS = 10;
     /** Fallback position jump: 5 blocks squared. */
     private static final double JUMP_THRESHOLD_SQUARED = 25.0;
-    private static final float MAX_ALPHA = 0.72f;
+    private static final float MAX_ALPHA = 0.18f;
 
     private static int fadeTicks;
     private static int cooldownTicks;
-    private static boolean wasInsidePortal;
     private static boolean hasLastPosition;
     private static double lastX;
     private static double lastY;
@@ -72,30 +72,25 @@ public final class PortalTeleportFade {
         }
 
         if (!hasLastPosition) {
-            // Do not flash merely because the player joined while standing in
-            // a portal volume.
-            wasInsidePortal = isInsidePortal(player, minecraft);
+            // No previous sample means there is no crossing to detect yet.
             rememberPosition(player);
             return;
         }
         if (player.isSpectator()) {
-            wasInsidePortal = false;
             rememberPosition(player);
             return;
         }
 
-        final boolean inside = isInsidePortal(player, minecraft);
-        if (inside && !wasInsidePortal && cooldownTicks == 0 && !player.isPassenger()) {
-            trigger();
-        }
-        wasInsidePortal = inside;
-
         if (!player.isPassenger() && cooldownTicks == 0) {
-            final double dx = player.getX() - lastX;
-            final double dy = player.getY() - lastY;
-            final double dz = player.getZ() - lastZ;
-            if (dx * dx + dy * dy + dz * dz > JUMP_THRESHOLD_SQUARED) {
+            if (crossedPortalPlane(player, minecraft)) {
                 trigger();
+            } else {
+                final double dx = player.getX() - lastX;
+                final double dy = player.getY() - lastY;
+                final double dz = player.getZ() - lastZ;
+                if (dx * dx + dy * dy + dz * dz > JUMP_THRESHOLD_SQUARED) {
+                    trigger();
+                }
             }
         }
         rememberPosition(player);
@@ -108,14 +103,16 @@ public final class PortalTeleportFade {
         hasLastPosition = true;
     }
 
-    private static boolean isInsidePortal(LocalPlayer player, Minecraft minecraft) {
-        final Vec3 centre = player.getBoundingBox().getCenter();
-        final Vector3d point = new Vector3d(centre.x, centre.y, centre.z);
+    private static boolean crossedPortalPlane(LocalPlayer player, Minecraft minecraft) {
+        final Vec3 eye = player.getEyePosition();
+        final Vector3d current = new Vector3d(eye.x, eye.y, eye.z);
+        final Vector3d previous = new Vector3d(
+                player.xo, player.yo + player.getEyeHeight(), player.zo);
         for (PortalSnapshot snapshot : PortalClientCache.get()) {
             if (!snapshot.dimension().equals(minecraft.level.dimension())) {
                 continue;
             }
-            if (snapshot.plane().contains(point, 0.35)) {
+            if (PortalCrossing.crossesFrontToBack(snapshot.plane(), previous, current)) {
                 return true;
             }
         }
@@ -144,7 +141,6 @@ public final class PortalTeleportFade {
     private static void reset() {
         fadeTicks = 0;
         cooldownTicks = 0;
-        wasInsidePortal = false;
         hasLastPosition = false;
     }
 }

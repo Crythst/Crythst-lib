@@ -13,6 +13,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
@@ -35,25 +36,33 @@ import java.util.concurrent.ConcurrentHashMap;
  * and is deliberately conservative:</p>
  * <ul>
  *     <li>an entity/body is teleported at most once per tick;</li>
- *     <li>a ten-tick cooldown prevents an exit slab from re-triggering the
- *     destination portal immediately;</li>
- *     <li>the exit point is pushed out of the destination plane along the
- *     transformed direction of travel;</li>
+ *     <li>a ten-tick cooldown prevents the destination portal from
+ *     re-triggering immediately;</li>
+ *     <li>players cross when their <b>eye</b> passes the plane from the front
+ *     side to the back side, rather than when their bounding-box centre enters
+ *     a thin slab. This lets the player physically walk into the portal: half
+ *     the body may still be on the entry side until the camera crosses.
+ *     Back-to-front crossings are ignored so the exit always stays on the
+ *     destination's front side;</li>
+ *     <li>non-player living entities use their eye position, other entities
+ *     use their bounding-box centre; their exit point is pushed slightly out
+ *     of the destination plane along its front normal;</li>
  *     <li>entities may cross dimensions via
  *     {@link Entity#teleport(TeleportTransition)}; physics bodies are skipped
  *     when a link crosses dimensions (their worlds are per-dimension).</li>
  * </ul>
  *
- * <p>Only the centre of an entity's bounding box / a body's oriented bounding
- * box is tested against the trigger volume. Large structures therefore enter
- * the portal when their centre crosses it. See
+ * <p>Physics bodies still use their oriented bounding-box centre against the
+ * bounded trigger slab, because they have no camera/eye to cross with. See
  * {@code docs/immersive-portal.md} for the remaining limitations.</p>
  */
 public final class PortalTeleporter {
-    /** Half-thickness of the trigger slab, in blocks. */
+    /** Half-thickness of the trigger slab used by physics bodies, in blocks. */
     public static final double PLANE_THICKNESS = 0.35;
-    /** Distance the exit point is pushed out of the destination plane. */
+    /** Distance a physics body is pushed out of the destination plane. */
     public static final double EXIT_OFFSET = 0.6;
+    /** Small front-side bias for non-player entities. */
+    public static final double ENTITY_EXIT_OFFSET = 0.05;
     /** Ticks before the same entity/body may traverse again. */
     public static final int COOLDOWN_TICKS = 10;
 
@@ -104,23 +113,22 @@ public final class PortalTeleporter {
                 // Entities first: they are cheap and keep the player experience
                 // consistent even when the physics backend is unavailable.
                 for (Entity entity : level.getAllEntities()) {
-                    if (!isEligible(entity) || !teleportedEntities.add(entity.getUUID())) {
+                    if (!isEligible(entity) || teleportedEntities.contains(entity.getUUID())) {
                         continue;
                     }
-                    if (!portal.plane().contains(toVector(entity.getBoundingBox().getCenter()),
-                            PLANE_THICKNESS)) {
-                        teleportedEntities.remove(entity.getUUID());
+                    // The eye crossing is what the player sees and what makes
+                    // the transition feel immersive: the body may already be
+                    // half-way through the surface when the camera follows it.
+                    if (!crossedFrontToBack(portal.plane(), entity)) {
                         continue;
                     }
                     final Integer ready = ENTITY_READY.get(entity.getUUID());
                     if (ready != null && tick < ready) {
-                        teleportedEntities.remove(entity.getUUID());
                         continue;
                     }
                     if (teleportEntity(entity, level, destination, destinationLevel, transform)) {
+                        teleportedEntities.add(entity.getUUID());
                         ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
-                    } else {
-                        teleportedEntities.remove(entity.getUUID());
                     }
                 }
 
@@ -132,6 +140,42 @@ public final class PortalTeleporter {
                         teleportedBodies);
             }
         }
+    }
+
+    /**
+     * True when the entity's traversal point moved from the portal's front
+     * ({@code +normal}) side to its back ({@code -normal}) side during this
+     * tick, through the rectangle.
+     *
+     * <p>Using the previous-tick position ({@code xo/yo/zo}) and the current
+     * position also catches fast entity movement without a separate history
+     * map. Players use the eye position so the camera, not the body centre,
+     * is the thing that enters the plane.</p>
+     */
+    private static boolean crossedFrontToBack(PortalPlane plane, Entity entity) {
+        return PortalCrossing.crossesFrontToBack(
+                plane, previousTraversalPoint(entity), traversalPoint(entity));
+    }
+
+    private static Vector3d traversalPoint(Entity entity) {
+        final Vec3 point = entity instanceof LivingEntity
+                ? entity.getEyePosition()
+                : entity.getBoundingBox().getCenter();
+        return new Vector3d(point.x, point.y, point.z);
+    }
+
+    private static Vector3d previousTraversalPoint(Entity entity) {
+        if (entity instanceof LivingEntity) {
+            // Eye height is effectively constant across one tick; keeping the
+            // current value avoids a second pose lookup and matches the point
+            // that is actually rendered.
+            return new Vector3d(entity.xo, entity.yo + entity.getEyeHeight(), entity.zo);
+        }
+        final Vec3 centre = entity.getBoundingBox().getCenter();
+        return new Vector3d(
+                centre.x - (entity.getX() - entity.xo),
+                centre.y - (entity.getY() - entity.yo),
+                centre.z - (entity.getZ() - entity.zo));
     }
 
     private static boolean isEligible(Entity entity) {
@@ -156,13 +200,18 @@ public final class PortalTeleporter {
         final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
                 PortalTransform.viewDirection(entity.getYRot(), entity.getXRot())));
 
-        final Vector3d entityCentre = toVector(entity.getBoundingBox().getCenter());
         final Vector3d base = entity instanceof ServerPlayer player
                 ? transformedPlayerFeet(player, transform)
                 : transform.transformPoint(new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
         final Vector3d target = new Vector3d(base);
-        target.add(pushDirection(destination.plane(), transformedVelocity,
-                transform.entry().local(entityCentre)).mul(EXIT_OFFSET));
+        if (!(entity instanceof ServerPlayer)) {
+            // The player's eye is placed exactly at T(eye): at the crossing
+            // instant the new camera position equals the transformed view
+            // through the portal, so the transition is geometrically
+            // continuous. Other entities get a tiny front-side offset so a
+            // stationary mob cannot sit exactly in the plane.
+            target.add(destination.plane().normal().mul(ENTITY_EXIT_OFFSET));
+        }
 
         final double fallDistance = entity.fallDistance;
         final boolean onGround = entity.onGround();
@@ -313,7 +362,4 @@ public final class PortalTeleporter {
         return normal.mul(side);
     }
 
-    private static Vector3d toVector(Vec3 value) {
-        return new Vector3d(value.x, value.y, value.z);
-    }
 }

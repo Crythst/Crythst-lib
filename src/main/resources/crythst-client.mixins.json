@@ -4,7 +4,12 @@
   "package": "io.mikaple.crythst.mixin.client",
   "compatibilityLevel": "JAVA_25",
   "client": [
-    "CameraGravityMixin"
+    "CameraGravityMixin",
+    "PortalCameraAccessor",
+    "PortalCaptureMixin",
+    "PortalGameRendererMixin",
+    "PortalLevelExtractorAccessor",
+    "StructureHitResultMixin"
   ],
   "injectors": {
     "defaultRequire": 1

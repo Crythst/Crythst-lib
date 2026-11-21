@@ -120,7 +120,7 @@ public final class PortalRenderer {
                 continue;
             }
 
-            final RenderType type = chooseType(snapshot, capturing);
+            final RenderType type = chooseType(snapshot, capturing, dimension);
             if (type == null) {
                 coloredQuads.add(quad);
             } else {
@@ -157,8 +157,14 @@ public final class PortalRenderer {
      * Picks the captured-view render type when a texture is ready, otherwise
      * the procedural surface.
      */
-    private static RenderType chooseType(PortalSnapshot snapshot, boolean capturing) {
-        if (!capturing && PortalCapture.hasView(snapshot.id())) {
+    private static RenderType chooseType(PortalSnapshot snapshot, boolean capturing,
+                                          ResourceKey<Level> dimension) {
+        // A captured view is only valid while the link still targets a plane
+        // in the dimension currently being rendered. Cross-dimension links
+        // (and stale snapshots after a relink) fall back to the procedural
+        // surface instead of showing an old, wrong scene.
+        if (!capturing && snapshot.viewableIn(dimension)
+                && PortalCapture.hasView(snapshot.id())) {
             final Identifier textureId = PortalCapture.textureId(snapshot.id());
             if (textureId != null) {
                 try {

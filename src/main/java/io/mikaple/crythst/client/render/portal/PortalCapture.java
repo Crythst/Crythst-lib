@@ -1,5 +1,6 @@
 package io.mikaple.crythst.client.render.portal;
 
+import com.mojang.blaze3d.ProjectionType;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.pipeline.TextureTarget;
 import com.mojang.blaze3d.resource.CrossFrameResourcePool;
@@ -10,14 +11,18 @@ import com.mojang.renderpearl.api.textures.FilterMode;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import io.mikaple.crythst.integration.portal.PortalTransform;
+import io.mikaple.crythst.mixin.client.PortalCameraAccessor;
+import io.mikaple.crythst.mixin.client.PortalLevelExtractorAccessor;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionContext;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionEvents;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.ProjectionMatrixBuffer;
 import net.minecraft.client.renderer.ViewArea;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.fog.FogData;
@@ -53,37 +58,42 @@ import java.util.UUID;
  *
  * <h2>When and how</h2>
  *
- * <p>{@link LevelExtractionEvents#END_EXTRACTION} runs on the render thread
- * after the current frame's render state (including the interpolated camera)
- * has been extracted and before {@code LevelRenderer.render} begins. At that
- * point no framegraph pass is active, so calling
- * {@link net.minecraft.client.renderer.LevelRenderer#render} a second time with
- * a transformed {@link CameraRenderState} is safe.</p>
+ * <p>26.3 renders from an extracted {@link LevelRenderState}. Calling
+ * {@code LevelRenderer.render} a second time with a different
+ * {@link CameraRenderState} is not enough: terrain visibility, entities,
+ * block entities, sky and particles were all extracted for the main camera.
+ * This class therefore runs at the <b>head</b> of
+ * {@code LevelExtractor.extract}, before the main camera's extraction:</p>
  *
  * <ol>
- *     <li>Build a portal camera from the main camera and the link transform
- *     (position and orientation are transformed by the portal rotation).</li>
- *     <li>Temporarily replace {@link LevelRenderState#cameraRenderState}, call
- *     {@code LevelRenderer.render} with the same projection, then restore the
- *     main camera state.</li>
- *     <li>Copy the main render target's colour texture into a per-portal
- *     offscreen target (the main target is cleared by the normal pass right
- *     after this event, so the temporary contents are harmless).</li>
- *     <li>The portal quad in the main pass samples that texture using the
- *     portal's screen-space UVs. Because the destination camera is exactly the
- *     main camera transformed through the portal, the screen-space projection
- *     lines up pixel-for-pixel.</li>
+ *     <li>Save the real {@link Camera}'s pose/frustums and the main camera
+ *     render state.</li>
+ *     <li>Point the real camera at the destination via the link transform and
+ *     run a nested {@code LevelExtractor.extract}. The recursion guard makes
+ *     that nested extraction skip capture and rebuild every render-state list
+ *     for the portal camera.</li>
+ *     <li>Rebuild {@code visibleSections} for the portal camera with the
+ *     bounded {@link PortalSectionSelection} scan. The nested extraction skips
+ *     vanilla's unbounded {@code addSectionsInFrustum} path because the portal
+ *     camera has an explicitly captured frustum.</li>
+ *     <li>Render directly into the portal's offscreen target by temporarily
+ *     overriding {@code GameRenderer.mainRenderTarget()} (see
+ *     {@link io.mikaple.crythst.mixin.client.PortalGameRendererMixin}).</li>
+ *     <li>Restore the camera, frustums, visible sections and main render state.
+ *     The outer {@code extract} call then performs the normal main-camera
+ *     extraction, so no second main extraction is needed.</li>
  * </ol>
  *
- * <p>Recursion depth is 1 in this milestone. During the capture pass nested
- * portals are drawn with the procedural shader (the {@link #capturing} flag),
- * never with the texture currently being written, so there is no feedback
- * loop. Portal-to-portal recursion beyond one level is a later TODO item.</p>
+ * <p>No frame-global render mode is toggled. In particular
+ * {@code shouldUseMultiDrawIndirectForTerrain} is left exactly as the
+ * extractor sets it; flipping it used to destroy/recreate the chunk-section
+ * UBO storage on every capture, flooding the log with "Resizing Chunk
+ * Sections..." messages and stuttering the frame. Both passes now use
+ * whatever mode the extractor selected.</p>
  *
- * <p>Capture is throttled to {@link #CAPTURE_INTERVAL_NANOS} and limited to
- * {@link #MAX_PORTALS_PER_CAPTURE} nearest visible portals per round. If the
- * destination is cross-dimensional, invisible, or the capture fails, the
- * renderer falls back to the procedural surface.</p>
+ * <p>Recursion depth is 1. {@link #capturing} makes nested portal surfaces use
+ * the procedural shader, so a portal never samples the texture currently being
+ * written.</p>
  */
 public final class PortalCapture {
     /** 10 captures per second; the portal view intentionally updates slower than the display. */
@@ -105,6 +115,9 @@ public final class PortalCapture {
     private static CrossFrameResourcePool resourcePool;
     private static FogRenderer fogRenderer;
     private static GlobalSettingsUniform portalGlobalSettings;
+    private static ProjectionMatrixBuffer portalProjectionBuffer;
+    /** Non-null only while {@code LevelRenderer.render} is drawing a capture pass. */
+    private static volatile RenderTarget renderTargetOverride;
     private static long lastCaptureNanos;
     private static boolean capturing;
     private static boolean registered;
@@ -122,7 +135,8 @@ public final class PortalCapture {
             return;
         }
         registered = true;
-        LevelExtractionEvents.END_EXTRACTION.register(PortalCapture::onEndExtraction);
+        // Capture itself is injected at the head of LevelExtractor.extract by
+        // PortalCaptureMixin; this lifecycle hook only frees GPU resources.
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> close());
     }
 
@@ -142,36 +156,70 @@ public final class PortalCapture {
         return target == null ? null : target.textureId;
     }
 
-    private static void onEndExtraction(LevelExtractionContext context) {
+    /**
+     * Target that {@code LevelRenderer.render} should use for the duration of
+     * the current capture. Read by {@code PortalGameRendererMixin}.
+     */
+    public static RenderTarget renderTargetOverride() {
+        return renderTargetOverride;
+    }
+
+    /**
+     * Entry point called from {@code PortalCaptureMixin} at the head of
+     * {@code LevelExtractor.extract}. Runs before the main camera's state is
+     * reset, and the outer extraction fills the main state immediately after
+     * this method returns.
+     */
+    public static void onExtractStart(Camera camera, DeltaTracker deltaTracker, float partialTick) {
+        if (capturing) {
+            return;
+        }
+        if (!ENABLED) {
+            READY.clear();
+            return;
+        }
         try {
-            captureDestinationViews(context);
+            captureDestinationViews(camera, deltaTracker, partialTick);
         } catch (Throwable error) {
-            if (!failureLogged) {
-                failureLogged = true;
-                Crythst.LOGGER.warn("Crythst portal capture aborted; "
-                        + "falling back to procedural surfaces", error);
-            }
+            logFailure("Crythst portal capture aborted; falling back to procedural surfaces", error);
+            READY.clear();
         }
     }
 
-    private static void captureDestinationViews(LevelExtractionContext context) {
-        if (capturing || !ENABLED) {
-            if (!ENABLED) {
-                READY.clear();
-            }
-            return;
-        }
+    private static void captureDestinationViews(Camera camera, DeltaTracker deltaTracker,
+                                                float partialTick) {
         final Minecraft minecraft = Minecraft.getInstance();
         final ClientLevel level = minecraft.level;
-        if (level == null) {
+        final GameRenderer gameRenderer = minecraft.gameRenderer;
+        final LevelRenderer renderer = minecraft.levelRenderer;
+        final LevelRenderState levelState = gameRenderer.gameRenderState().levelRenderState;
+
+        if (level == null || camera == null) {
             READY.clear();
             pruneTargets(Set.of());
             return;
         }
+        // Capture only for the normal gameplay extraction. Secondary cameras
+        // (panorama, screenshot tooling, other mods' passes) must not pay for
+        // a portal render or disturb the main camera state.
+        if (camera != gameRenderer.mainCamera()) {
+            return;
+        }
 
-        final LevelRenderState levelState = context.levelState();
-        final CameraRenderState mainCamera = levelState == null ? null : levelState.cameraRenderState;
+        final CameraRenderState mainCamera = levelState.cameraRenderState;
         if (mainCamera == null || mainCamera.pos == null) {
+            return;
+        }
+
+        // These resets are global and one-shot. A nested extraction would
+        // consume them before the main camera's extraction, so skip capture for
+        // this single frame and let the normal path perform them.
+        final PortalLevelExtractorAccessor extractor =
+                (PortalLevelExtractorAccessor) minecraft.levelExtractor;
+        if (extractor.crythst$shouldResetLevelRenderData()
+                || extractor.crythst$shouldInvalidateCompiledGeometry()
+                || extractor.crythst$shouldResetSkyRenderer()
+                || extractor.crythst$shouldResetChunkLayerSampler()) {
             return;
         }
 
@@ -191,7 +239,6 @@ public final class PortalCapture {
         if (now - lastCaptureNanos < CAPTURE_INTERVAL_NANOS) {
             return;
         }
-        lastCaptureNanos = now;
 
         final List<PortalSnapshot> candidates = new ArrayList<>();
         for (PortalSnapshot portal : allPortals) {
@@ -207,149 +254,93 @@ public final class PortalCapture {
             candidates.add(portal);
         }
         if (candidates.isEmpty()) {
-            READY.clear();
+            // Keep the previous textures: the portal quad is frustum-culled
+            // independently, and dropping the view here would cause a
+            // one-frame procedural flash whenever the player looks away.
             return;
         }
         final Vector3d cameraPosition = new Vector3d(
                 mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z);
         candidates.sort(Comparator.comparingDouble(portal -> portal.plane().distanceSquared(cameraPosition)));
 
-        final RenderTarget mainTarget = context.gameRenderer().mainRenderTarget();
+        final RenderTarget mainTarget = gameRenderer.mainRenderTarget();
         if (mainTarget == null || mainTarget.getColorTexture() == null
+                || mainTarget.getDepthTexture() == null
                 || mainTarget.width <= 0 || mainTarget.height <= 0) {
             return;
         }
 
         ensureResources();
-        if (resourcePool == null || fogRenderer == null || portalGlobalSettings == null) {
+        if (resourcePool == null || fogRenderer == null || portalGlobalSettings == null
+                || portalProjectionBuffer == null) {
             return;
         }
+
+        lastCaptureNanos = now;
 
         final FogData fogData = copyFog(mainCamera.fogData);
         fogRenderer.updateBuffer(fogData);
         final GpuBufferSlice fogSlice = fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
         final Vector4f fogColor = new Vector4f(fogData.color);
 
-        // LevelRenderer.submitFeatures consumes these render-state lists so the
-        // main pass does not draw them twice. Capture them and put them back
-        // before the normal frame continues.
-        final List<net.minecraft.client.renderer.entity.state.EntityRenderState> savedEntities =
-                List.copyOf(levelState.entityRenderStates);
-        final List<net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState> savedBlockEntities =
-                List.copyOf(levelState.blockEntityRenderStates);
-        final List<net.minecraft.client.renderer.state.level.BlockBreakingRenderState> savedBreaking =
-                List.copyOf(levelState.blockBreakingRenderStates);
-        final boolean savedMultiDraw = levelState.shouldUseMultiDrawIndirectForTerrain;
-        levelState.shouldUseMultiDrawIndirectForTerrain = false;
-        final Runnable savedCompiledSectionCallback = levelState.playerCompiledSectionCallback;
-        levelState.playerCompiledSectionCallback = null;
+        final LevelRenderer levelRenderer = renderer;
+        final ViewArea viewArea = levelRenderer.viewArea();
+        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> savedVisibleSections =
+                List.copyOf(levelRenderer.visibleSections());
+        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> savedNearbySections =
+                List.copyOf(levelRenderer.nearbyVisibleSections());
+        final SectionPos savedViewAreaCenter = viewArea == null ? null : viewArea.getCameraSectionPos();
 
-        final LevelRenderer renderer = context.levelRenderer();
-        final var savedVisibleSections = List.copyOf(renderer.visibleSections());
-        final var savedNearbySections = List.copyOf(renderer.nearbyVisibleSections());
-        // The normal main pass will reposition the ViewArea to the current main
-        // camera, but restore the centre that existed before capture first so
-        // this hook leaves the renderer in the state extraction produced.
-        final SectionPos savedViewAreaCenter = renderer.viewArea() == null
-                ? null : renderer.viewArea().getCameraSectionPos();
+        final Vec3 savedCameraPos = camera.position();
+        final float savedYaw = camera.yRot();
+        final float savedPitch = camera.xRot();
+        final Frustum savedCullFrustum = camera.getCullFrustum();
+        final Frustum savedCapturedFrustum = camera.getCapturedFrustum();
 
         capturing = true;
-        final Set<UUID> captured = new HashSet<>();
         try {
             int count = 0;
             for (PortalSnapshot portal : candidates) {
                 if (count >= MAX_PORTALS_PER_CAPTURE) {
                     break;
                 }
-                final PortalTransform transform = PortalTransform.between(
-                        portal.plane(), portal.destinationPlane());
-                final CameraRenderState portalCamera = createPortalCamera(portal, mainCamera, transform);
-                if (portalCamera == null) {
-                    continue;
-                }
-
-                final ViewTarget target = ensureTarget(portal, mainTarget);
-                if (target == null) {
-                    continue;
-                }
-
-                // Each capture consumes the lists; restore them so the next
-                // capture and the main pass still have the entities.
-                restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
-                updateGlobalSettings(context, portalCamera.pos);
-
-                final CameraRenderState previous = levelState.cameraRenderState;
                 boolean rendered = false;
                 try {
-                    levelState.cameraRenderState = portalCamera;
-                    final int sectionCount = rebuildVisibleSections(level, renderer, portalCamera);
-                    if (sectionCount <= 0 || renderer.visibleSections().isEmpty()) {
-                        // The destination neighbourhood is outside the loaded
-                        // chunks or has no sections in view. Skipping is better
-                        // than capturing a sky-only image.
-                        continue;
-                    }
-                    renderer.render(resourcePool, false, portalCamera,
-                            fogSlice, fogColor, false, false);
-                    rendered = true;
+                    rendered = captureOne(portal, camera, deltaTracker, partialTick,
+                            mainCamera, levelState, levelRenderer, mainTarget,
+                            fogSlice, fogColor, level);
                 } catch (Throwable error) {
-                    if (!failureLogged) {
-                        failureLogged = true;
-                        Crythst.LOGGER.warn("Crythst portal destination capture failed; "
-                                + "falling back to the procedural surface", error);
-                    }
+                    logFailure("Crythst portal destination capture failed; "
+                            + "keeping the previous view (or procedural surface)", error);
                 } finally {
-                    levelState.cameraRenderState = previous;
+                    // Always leave the camera and render state exactly as the
+                    // outer main extraction expects them.
+                    levelState.cameraRenderState = mainCamera;
+                    restoreCamera(camera, savedCameraPos, savedYaw, savedPitch,
+                            savedCullFrustum, savedCapturedFrustum);
+                    restoreVisibleSections(levelRenderer, savedVisibleSections,
+                            savedNearbySections, savedViewAreaCenter);
                 }
-
                 if (rendered) {
-                    target.target.copyColorFrom(mainTarget);
-                    captured.add(portal.id());
-                    if (!firstCaptureLogged) {
-                        firstCaptureLogged = true;
-                        Crythst.LOGGER.info(
-                                "Crythst captured destination view for portal '{}' ({}x{})",
-                                portal.name(), mainTarget.width, mainTarget.height);
-                    }
+                    count++;
                 }
-                count++;
             }
         } finally {
-            // Clear the recursion guard first so a restore failure cannot
-            // disable capture for every later frame.
             capturing = false;
+            renderTargetOverride = null;
+            levelState.cameraRenderState = mainCamera;
+            restoreCamera(camera, savedCameraPos, savedYaw, savedPitch,
+                    savedCullFrustum, savedCapturedFrustum);
+            restoreVisibleSections(levelRenderer, savedVisibleSections,
+                    savedNearbySections, savedViewAreaCenter);
             try {
-                restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
-                levelState.shouldUseMultiDrawIndirectForTerrain = savedMultiDraw;
-                levelState.playerCompiledSectionCallback = savedCompiledSectionCallback;
-                // Restore the global camera UBO for the normal main pass. The
-                // next GameRenderer frame will overwrite it again; doing it
-                // here keeps the same frame consistent too.
-                if (portalGlobalSettings != null) {
-                    updateGlobalSettings(context, mainCamera.pos);
-                }
-                // The normal main pass reuses LevelRenderer.visibleSections,
-                // which was populated for the main camera during extraction.
-                // Restore the exact lists saved before the portal captures.
-                renderer.clearVisibleSections();
-                renderer.visibleSections().addAll(savedVisibleSections);
-                renderer.nearbyVisibleSections().addAll(savedNearbySections);
-                // Capture moved the rotating section storage to each portal
-                // camera. Put the main camera's centre back so the next main
-                // pass does not have to do an extra relocate/invalidate cycle.
-                if (renderer.viewArea() != null && savedViewAreaCenter != null
-                        && savedViewAreaCenter.x() != Integer.MIN_VALUE) {
-                    renderer.viewArea().repositionCamera(savedViewAreaCenter);
-                }
+                // The main frame updates this again in GameRenderer.render,
+                // but keep the rest of this frame consistent if anything reads
+                // it before then.
+                updateGlobalSettings(gameRenderer, levelState, mainCamera.pos);
             } catch (Throwable error) {
-                if (!failureLogged) {
-                    failureLogged = true;
-                    Crythst.LOGGER.warn("Crythst portal capture cleanup failed; "
-                            + "the main render state may be incomplete this frame", error);
-                }
+                logFailure("Crythst portal global-settings restore failed", error);
             }
-            READY.clear();
-            READY.addAll(captured);
             if (fogRenderer != null) {
                 fogRenderer.endFrame();
             }
@@ -359,27 +350,156 @@ public final class PortalCapture {
         }
     }
 
-    private static void restoreRenderStateLists(
-            LevelRenderState levelState,
-            List<net.minecraft.client.renderer.entity.state.EntityRenderState> entities,
-            List<net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState> blockEntities,
-            List<net.minecraft.client.renderer.state.level.BlockBreakingRenderState> breaking) {
-        levelState.entityRenderStates.clear();
-        levelState.entityRenderStates.addAll(entities);
-        levelState.blockEntityRenderStates.clear();
-        levelState.blockEntityRenderStates.addAll(blockEntities);
-        levelState.blockBreakingRenderStates.clear();
-        levelState.blockBreakingRenderStates.addAll(breaking);
+    /**
+     * Captures one portal. The caller restores the camera/render state in a
+     * {@code finally} block even when this returns {@code false} or throws.
+     */
+    private static boolean captureOne(PortalSnapshot portal, Camera camera,
+                                      DeltaTracker deltaTracker, float partialTick,
+                                      CameraRenderState mainCamera,
+                                      LevelRenderState levelState,
+                                      LevelRenderer levelRenderer,
+                                      RenderTarget mainTarget,
+                                      GpuBufferSlice fogSlice,
+                                      Vector4f fogColor,
+                                      ClientLevel level) {
+        final PortalTransform transform = PortalTransform.between(
+                portal.plane(), portal.destinationPlane());
+        final Vector3d position = transform.transformPoint(
+                new Vector3d(mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z));
+        if (!PortalCameraSanity.isFinitePosition(position.x, position.y, position.z)) {
+            logSkippedInvalidCamera(portal, "non-finite camera position");
+            return false;
+        }
+
+        final Quaternionf orientation = new Quaternionf(
+                mainCamera.orientation == null ? new Quaternionf() : mainCamera.orientation)
+                .premul(new Quaternionf(transform.rotation()));
+        if (!PortalCameraSanity.isSaneOrientation(orientation)) {
+            logSkippedInvalidCamera(portal, "non-finite orientation");
+            return false;
+        }
+        orientation.normalize();
+        final Matrix4f viewRotation = new Matrix4f().rotation(
+                new Quaternionf(orientation).conjugate());
+        final Matrix4f projection = new Matrix4f(mainCamera.projectionMatrix);
+        if (!PortalCameraSanity.isUsable(projection, viewRotation, orientation,
+                position.x, position.y, position.z)) {
+            logSkippedInvalidCamera(portal, "degenerate projection or view rotation");
+            return false;
+        }
+
+        final Vec3 portalPos = new Vec3(position.x, position.y, position.z);
+        final Vector3f forward = orientation.transform(new Vector3f(0.0f, 0.0f, -1.0f));
+        final float[] yawPitch = PortalTransform.yawPitch(
+                new Vector3d(forward.x, forward.y, forward.z));
+
+        final ViewTarget target = ensureTarget(portal, mainTarget);
+        if (target == null) {
+            return false;
+        }
+
+        // Point the real camera at the destination for the nested extraction.
+        // The exact orientation (which may contain roll from a tilted portal)
+        // is written into the render state below; Camera only stores yaw/pitch.
+        final PortalCameraAccessor access = (PortalCameraAccessor) camera;
+        access.crythst$setPosition(portalPos);
+        access.crythst$setRotation(yawPitch[0], yawPitch[1]);
+
+        final Frustum frustum = new Frustum(viewRotation, projection);
+        frustum.prepare(position.x, position.y, position.z);
+        // Marking the frustum as captured makes SectionOcclusionGraph.update
+        // skip its own frustum-offset path during the nested extraction. We
+        // still populate visibleSections ourselves with a bounded scan.
+        access.crythst$setCullFrustum(frustum);
+        access.crythst$setCapturedFrustum(frustum);
+
+        final CameraRenderState portalCamera = new CameraRenderState();
+        camera.extractRenderState(portalCamera, deltaTracker);
+        portalCamera.pos = portalPos;
+        portalCamera.blockPos = BlockPos.containing(portalPos);
+        portalCamera.initialized = true;
+        portalCamera.orientation = orientation;
+        portalCamera.viewRotationMatrix = viewRotation;
+        portalCamera.cullFrustum = frustum;
+        portalCamera.projectionMatrix = projection;
+        portalCamera.xRot = yawPitch[1];
+        portalCamera.yRot = yawPitch[0];
+        portalCamera.fogType = mainCamera.fogType;
+        portalCamera.fogData = copyFog(mainCamera.fogData);
+
+        levelState.cameraRenderState = portalCamera;
+        final int sectionCount = rebuildVisibleSections(level, levelRenderer, portalCamera);
+        if (sectionCount <= 0 || levelRenderer.visibleSections().isEmpty()) {
+            // The destination neighbourhood is not loaded or has no sections
+            // in view. Keep any previously captured texture instead of
+            // flashing the procedural surface; a never-captured portal simply
+            // has no entry in READY.
+            return false;
+        }
+
+        // Re-extract terrain visibility, entities, block entities, sky,
+        // weather and particles for the portal camera. The recursion guard
+        // (capturing == true) prevents this from starting another capture.
+        Minecraft.getInstance().levelExtractor.extract(deltaTracker, camera, partialTick);
+
+        updateGlobalSettings(Minecraft.getInstance().gameRenderer, levelState, portalPos);
+
+        // Use the same projection the portal quad's UVs are computed with.
+        // GameRenderer.renderLevel replaces this buffer before the main pass,
+        // so no restore is required.
+        RenderSystem.setProjectionMatrix(
+                portalProjectionBuffer.getBuffer(projection), ProjectionType.PERSPECTIVE);
+
+        renderTargetOverride = target.target;
+        try {
+            // Sky is left off so the capture does not recreate/rebind the
+            // shared SkyRenderer against the offscreen target (SkyRenderer
+            // caches the target it was constructed with). Terrain, fog,
+            // entities, clouds and block entities still fill the view.
+            levelRenderer.render(resourcePool, false, portalCamera,
+                    fogSlice, fogColor, false, false);
+        } finally {
+            renderTargetOverride = null;
+        }
+
+        READY.add(portal.id());
+        if (!firstCaptureLogged) {
+            firstCaptureLogged = true;
+            Crythst.LOGGER.info(
+                    "Crythst captured destination view for portal '{}' ({}x{}, {} sections)",
+                    portal.name(), target.target.width, target.target.height, sectionCount);
+        }
+        return true;
+    }
+
+    private static void restoreCamera(Camera camera, Vec3 position, float yaw, float pitch,
+                                      Frustum cullFrustum, Frustum capturedFrustum) {
+        if (camera == null) {
+            return;
+        }
+        final PortalCameraAccessor access = (PortalCameraAccessor) camera;
+        access.crythst$setPosition(position);
+        access.crythst$setRotation(yaw, pitch);
+        access.crythst$setCullFrustum(cullFrustum);
+        access.crythst$setCapturedFrustum(capturedFrustum);
+    }
+
+    private static void restoreVisibleSections(LevelRenderer renderer,
+                                               List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> visible,
+                                               List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection> nearby,
+                                               SectionPos center) {
+        renderer.clearVisibleSections();
+        renderer.visibleSections().addAll(visible);
+        renderer.nearbyVisibleSections().addAll(nearby);
+        final ViewArea viewArea = renderer.viewArea();
+        if (viewArea != null && center != null && center.x() != Integer.MIN_VALUE) {
+            viewArea.repositionCamera(center);
+        }
     }
 
     /**
      * Rebuilds {@code LevelRenderer.visibleSections} for a portal camera.
-     *
-     * <p>{@code LevelExtractor} populates this list for the <em>main</em>
-     * camera during extraction. A second {@code LevelRenderer.render} call
-     * does not re-extract it, so without this the portal camera would reuse
-     * the main camera's visible-section set and could show only sky when the
-     * destination is outside the player's current view.</p>
      *
      * <p>This intentionally does <em>not</em> call
      * {@code SectionOcclusionGraph.addSectionsInFrustum}: that method's
@@ -401,8 +521,8 @@ public final class PortalCapture {
             return 0;
         }
         // Position the rotating section storage before querying it, so the
-        // section objects match the portal camera's neighbourhood. The centre
-        // is restored in captureDestinationViews' finally block.
+        // section objects match the portal camera's neighbourhood. The main
+        // centre is restored by the caller.
         final SectionPos center = SectionPos.of(camera.blockPos);
         viewArea.repositionCamera(center);
         return PortalSectionSelection.collect(level, viewArea, camera.cullFrustum, center,
@@ -425,82 +545,6 @@ public final class PortalCapture {
     }
 
     /**
-     * Builds the camera that looks through the portal. The main camera is
-     * transformed by the same rigid link transform used for entities, so the
-     * destination view is exactly what the player would see from the exit.
-     *
-     * <p>Returns {@code null} when the transformed state is degenerate. The
-     * caller must then fall back to the procedural portal surface instead of
-     * entering vanilla culling/rendering.</p>
-     */
-    private static CameraRenderState createPortalCamera(PortalSnapshot portal, CameraRenderState main,
-                                                        PortalTransform transform) {
-        if (main == null || main.pos == null || main.projectionMatrix == null
-                || transform == null || transform.rotation() == null) {
-            logSkippedInvalidCamera(portal, "missing camera matrix");
-            return null;
-        }
-        final Vector3d position = transform.transformPoint(
-                new Vector3d(main.pos.x, main.pos.y, main.pos.z));
-        if (!PortalCameraSanity.isFinitePosition(position.x, position.y, position.z)) {
-            logSkippedInvalidCamera(portal, "non-finite camera position");
-            return null;
-        }
-
-        final CameraRenderState camera = new CameraRenderState();
-        camera.pos = new Vec3(position.x, position.y, position.z);
-        camera.blockPos = BlockPos.containing(camera.pos);
-        camera.initialized = true;
-        camera.isPanoramicMode = false;
-        // We select visible sections ourselves (PortalSectionSelection). Marking
-        // the frustum as captured makes SectionOcclusionGraph.update skip its
-        // own frustum-offset path during the capture render, so no unbounded
-        // vanilla loop can run for portal camera state.
-        camera.isFrustumCaptured = true;
-        camera.isFirstPerson = false;
-        camera.smartCull = main.smartCull;
-        camera.cameraEntityPartialTicks = main.cameraEntityPartialTicks;
-        camera.fogType = main.fogType;
-        camera.fogData = copyFog(main.fogData);
-        camera.hudFov = main.hudFov;
-        camera.depthFar = main.depthFar;
-        camera.projectionMatrix = new Matrix4f(main.projectionMatrix);
-        camera.entityRenderState = main.entityRenderState;
-
-        final Quaternionf rotation = new Quaternionf(transform.rotation());
-        final Quaternionf baseOrientation = main.orientation == null
-                ? new Quaternionf()
-                : new Quaternionf(main.orientation);
-        final Quaternionf orientation = baseOrientation.premul(rotation);
-        if (!PortalCameraSanity.isSaneOrientation(orientation)) {
-            logSkippedInvalidCamera(portal, "non-finite orientation");
-            return null;
-        }
-        // Normalize so viewRotationMatrix is a pure rotation (determinant ~ 1)
-        // even if an upstream quaternion drifted slightly.
-        orientation.normalize();
-        camera.orientation = orientation;
-        camera.viewRotationMatrix = new Matrix4f().rotation(new Quaternionf(orientation).conjugate());
-
-        if (!PortalCameraSanity.isUsable(camera.projectionMatrix, camera.viewRotationMatrix,
-                camera.orientation, camera.pos.x, camera.pos.y, camera.pos.z)) {
-            logSkippedInvalidCamera(portal, "degenerate projection or view rotation");
-            return null;
-        }
-
-        final Vector3f forward = orientation.transform(new Vector3f(0.0f, 0.0f, -1.0f));
-        final float[] yawPitch = PortalTransform.yawPitch(
-                new Vector3d(forward.x, forward.y, forward.z));
-        camera.yRot = yawPitch[0];
-        camera.xRot = yawPitch[1];
-
-        final Frustum frustum = new Frustum(camera.viewRotationMatrix, camera.projectionMatrix);
-        frustum.prepare(camera.pos.x, camera.pos.y, camera.pos.z);
-        camera.cullFrustum = frustum;
-        return camera;
-    }
-
-    /**
      * Debug-only, rate-limited so a permanently broken link cannot flood the
      * log every capture tick.
      */
@@ -514,6 +558,14 @@ public final class PortalCapture {
                 portal == null ? "<unknown>" : portal.name(), reason);
     }
 
+    private static void logFailure(String message, Throwable error) {
+        if (failureLogged) {
+            return;
+        }
+        failureLogged = true;
+        Crythst.LOGGER.warn(message, error);
+    }
+
     private static void ensureResources() {
         if (resourcePool == null) {
             resourcePool = new CrossFrameResourcePool(3);
@@ -524,6 +576,9 @@ public final class PortalCapture {
         if (portalGlobalSettings == null) {
             portalGlobalSettings = new GlobalSettingsUniform();
         }
+        if (portalProjectionBuffer == null) {
+            portalProjectionBuffer = new ProjectionMatrixBuffer("crythst portal");
+        }
     }
 
     /**
@@ -532,11 +587,11 @@ public final class PortalCapture {
      * {@code Position + (ChunkPosition - CameraBlockPos) + CameraOffset}, so
      * the uniform must describe the portal camera rather than the main camera.
      */
-    private static void updateGlobalSettings(LevelExtractionContext context, Vec3 cameraPos) {
-        final GameRenderState game = context.gameRenderer().gameRenderState();
+    private static void updateGlobalSettings(GameRenderer gameRenderer,
+                                             LevelRenderState levelState, Vec3 cameraPos) {
+        final GameRenderState game = gameRenderer.gameRenderState();
         final OptionsRenderState options = game.optionsRenderState;
         final WindowRenderState window = game.windowRenderState;
-        final LevelRenderState levelState = context.levelState();
         portalGlobalSettings.update(
                 window.width,
                 window.height,
@@ -566,6 +621,9 @@ public final class PortalCapture {
         if (existing.target.width != mainTarget.width
                 || existing.target.height != mainTarget.height) {
             final TextureTarget target = createTarget(portal, mainTarget);
+            // The old image belongs to the old size; fall back until the next
+            // successful capture has filled the new target.
+            READY.remove(portal.id());
             existing.target.destroyBuffers();
             existing.target = target;
             existing.texture.setTarget(target,
@@ -576,12 +634,14 @@ public final class PortalCapture {
 
     private static TextureTarget createTarget(PortalSnapshot portal, RenderTarget mainTarget) {
         final GpuFormat colorFormat = mainTarget.getColorTexture().getFormat();
-        // Only the colour attachment is sampled; the destination view has
-        // already been depth-composited in the main target before the copy.
+        final GpuFormat depthFormat = mainTarget.getDepthTexture() == null
+                ? GpuFormat.D32_FLOAT : mainTarget.getDepthTexture().getFormat();
+        // The capture renders straight into this target, so it needs its own
+        // depth attachment just like the main target.
         return new TextureTarget(
                 "crythst_portal_view_" + portal.id(),
                 mainTarget.width, mainTarget.height,
-                colorFormat, null);
+                colorFormat, depthFormat);
     }
 
     private static FogData copyFog(FogData source) {
@@ -623,6 +683,7 @@ public final class PortalCapture {
 
     private static void close() {
         capturing = false;
+        renderTargetOverride = null;
         for (ViewTarget target : TARGETS.values()) {
             target.close();
         }
@@ -635,6 +696,10 @@ public final class PortalCapture {
         if (portalGlobalSettings != null) {
             portalGlobalSettings.close();
             portalGlobalSettings = null;
+        }
+        if (portalProjectionBuffer != null) {
+            portalProjectionBuffer.close();
+            portalProjectionBuffer = null;
         }
         if (resourcePool != null) {
             resourcePool.clear();

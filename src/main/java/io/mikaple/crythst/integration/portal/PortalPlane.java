@@ -179,9 +179,10 @@ public final class PortalPlane {
 
     /**
      * Conservative test of an oriented box against the portal trigger volume.
-     * Useful for broad-phase checks and debug tooling; the v1 teleporter uses
-     * the stricter centre test in {@link #contains} so a large structure only
-     * traverses when its centre crosses the plane.
+     * Useful for broad-phase checks and debug tooling. Physics bodies still use
+     * the stricter centre test in {@link #contains}; entities and players use
+     * {@link PortalCrossing}'s sampled front-to-back eye/centre crossing
+     * instead of this slab.
      */
     public boolean intersects(OrientedBox box, double thickness) {
         final Vector3d rel = new Vector3d(box.center()).sub(origin);
