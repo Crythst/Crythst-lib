@@ -1,5 +1,6 @@
 package io.mikaple.crythst.integration.minecraft.interaction.client;
 
+import io.mikaple.crythst.client.render.structure.breakoverlay.StructureBreakOverlay;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureAction;
@@ -30,7 +31,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>Left clicks are intercepted by {@link ClientPreAttackCallback}. Right
  * clicks are intercepted by {@code StructurePlacementMixin} at the head of
  * {@code MultiPlayerGameMode.useItemOn}, before 26.3's client prediction can
- * run {@code BlockItem.place}; see {@link #requestStructurePlacement}. A real
+ * run {@code BlockItem.place}; see {@link #requestStructureUse}. A real
  * block target is left to vanilla and the server-side
  * {@code UseBlockCallback}.</p>
  *
@@ -39,12 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * correctly.</p>
  */
 public final class ClientStructureInteraction {
-    /** Repeat interval for hold-to-mine; one voxel per interval. */
-    private static final int MINE_REPEAT_TICKS = 5;
-
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
-
-    private static int lastMineTick = Integer.MIN_VALUE / 2;
 
     private ClientStructureInteraction() {
     }
@@ -57,6 +53,8 @@ public final class ClientStructureInteraction {
             return;
         }
         ClientPreAttackCallback.EVENT.register(ClientStructureInteraction::onPreAttack);
+        StructureMiningController.register();
+        StructureBreakOverlay.register();
         // Register the vanilla-outline override here because the client
         // entrypoint already calls this method. It must run after vanilla has
         // extracted its own block outline.
@@ -67,10 +65,10 @@ public final class ClientStructureInteraction {
         if (player == null
                 || !CrythstFabric.config().structureBlockInteractionEnabled
                 || player.isSpectator()) {
+            StructureMiningController.reset();
             return false;
         }
         final double reach = player.blockInteractionRange();
-        final Vec3 eye = player.getEyePosition();
         // This is exactly the hit Minecraft shows and uses for interactions.
         // ClientLevel.clip returns it, so a real block or entity that is closer
         // has already replaced it and the crosshair target is never a second,
@@ -89,29 +87,42 @@ public final class ClientStructureInteraction {
             }
         }
 
-        if (structureHit == null && waterHit == null) {
+        final StructureMiningController.AttackRoute route =
+                StructureMiningController.route(structureHit != null, waterHit != null);
+        if (route == StructureMiningController.AttackRoute.PASS) {
+            StructureMiningController.reset();
             return false;
         }
         if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
             // If the channel is unavailable, leave vanilla behaviour alone.
+            StructureMiningController.reset();
             return false;
         }
-        // Fabric reads KeyMapping.clickCount before vanilla consumes it, so a
-        // fresh press has clickCount >= 1 and a held key has 0. The initial
-        // click must use != 0; while held, a slow repeat keeps hold-to-mine
-        // working without spending == 0 as the click signal.
-        if (structureHit != null) {
-            final boolean initialClick = clickCount != 0;
-            final boolean repeat = player.tickCount - lastMineTick >= MINE_REPEAT_TICKS;
-            if (initialClick || repeat) {
-                send(player, StructureAction.MINE);
-                lastMineTick = player.tickCount;
+
+        if (route == StructureMiningController.AttackRoute.MINE) {
+            // The controller owns survival progress and creative instant
+            // breaking. It sends MINE only on a completed target, so holding
+            // the key no longer emits a packet every five ticks.
+            final StructureMiningController.Update update =
+                    StructureMiningController.tick(client, player, structureHit, clickCount);
+            switch (update) {
+                case BREAK -> send(player, StructureAction.MINE);
+                case STARTED -> player.swing(InteractionHand.MAIN_HAND,
+                        SwingAnimation.DEFAULT, true);
+                case NONE, PROGRESSING -> {
+                    // Progress is rendered by StructureBreakOverlay.
+                }
             }
-        } else if (clickCount != 0) {
+            // Suppress vanilla block breaking while the crosshair is on a
+            // structure, otherwise the real block behind it would be mined.
+            return true;
+        }
+
+        // Shovel + water is still a one-shot action, not a held break.
+        StructureMiningController.reset();
+        if (clickCount != 0) {
             send(player, StructureAction.SHOVEL_WATER);
         }
-        // Suppress vanilla block breaking while the crosshair is on a
-        // structure, otherwise the real block behind it would be mined.
         return true;
     }
 
@@ -133,19 +144,21 @@ public final class ClientStructureInteraction {
      *
      * <p>Block items, spawn eggs, item frames and items with a registered
      * {@link io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler}
-     * are consumed. The server re-raycasts and recomputes the surface point;
-     * no client position is sent. Unsupported items keep vanilla behaviour.</p>
+     * are consumed as {@link StructureAction#PLACE}. Everything else - an empty
+     * hand, tools, buckets, food and other items - is routed to
+     * {@link StructureAction#USE}, which runs vanilla block interaction on the
+     * server. In both cases the server re-raycasts; no client position is
+     * sent.</p>
      *
-     * @return whether the click was consumed as a structure placement
+     * @return whether the click was consumed as a structure action
      */
-    public static boolean requestStructurePlacement(LocalPlayer player, InteractionHand hand,
-                                                    BlockHitResult hitResult) {
+    public static boolean requestStructureUse(LocalPlayer player, InteractionHand hand,
+                                              BlockHitResult hitResult) {
         if (hand != InteractionHand.MAIN_HAND
                 || player == null
                 || !(hitResult instanceof StructureBlockHitResult)
                 || player.isSpectator()
                 || !CrythstFabric.config().structureBlockInteractionEnabled
-                || !StructureItemUse.shouldHandleStructureUse(player.getMainHandItem())
                 || !player.level().getWorldBorder().isWithinBounds(hitResult.getBlockPos())
                 || !ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
             return false;
@@ -153,7 +166,8 @@ public final class ClientStructureInteraction {
         // Do not send ServerboundUseItemOnPacket. Only the authoritative
         // structure action is sent; the server re-raycasts from the player's
         // look vector and never runs BlockItem.place for this click.
-        return send(player, StructureAction.PLACE);
+        StructureMiningController.reset();
+        return send(player, StructureItemUse.actionForUse(player.getMainHandItem()));
     }
 
     /**
@@ -182,6 +196,7 @@ public final class ClientStructureInteraction {
                 ? StructureAction.PICK_WITH_DATA
                 : StructureAction.PICK;
         // Pick-block does not swing the arm.
+        StructureMiningController.reset();
         return send(player, action, false);
     }
 

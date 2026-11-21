@@ -1,5 +1,6 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
+import io.mikaple.crythst.math.Transform3d;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -24,6 +25,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.storage.LevelData;
 import net.minecraft.world.phys.BlockHitResult;
+import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -32,6 +34,8 @@ import java.util.Collection;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
  * Exercises the real vanilla {@code getStateForPlacement} hooks with the
@@ -94,6 +98,113 @@ class StructurePlacementVanillaRulesTest {
         assertEquals(Direction.Axis.Y, logAxis(Direction.DOWN));
         assertEquals(Direction.Axis.Z, logAxis(Direction.NORTH));
         assertEquals(Direction.Axis.Z, logAxis(Direction.SOUTH));
+    }
+
+    @Test
+    void rotatedAndScaledStructureStairsUseLocalFacing() {
+        final Transform3d pose = new Transform3d(new Vector3d(10.0, 20.0, 30.0),
+                new Quaterniond().rotateY(Math.toRadians(90.0)));
+        final double scale = 2.0;
+        final Vector3d localClick = new Vector3d(1.5, 2.0, 1.5);
+        final Vector3d worldClick = pose.transformPoint(new Vector3d(localClick).mul(scale));
+        final Vector3d roundTrip = StructurePlacementMath.localPoint(pose, worldClick, scale);
+
+        assertEquals(localClick.x, roundTrip.x, 1.0e-9);
+        assertEquals(localClick.y, roundTrip.y, 1.0e-9);
+        assertEquals(localClick.z, roundTrip.z, 1.0e-9);
+
+        // The player looks east in the structure frame. With a 90-degree
+        // structure yaw that is a different world direction, so a world-frame
+        // context would select NORTH rather than EAST.
+        final StructurePlacementContext context = localContext(
+                StructurePlacementMath.localBlockHit(roundTrip, Direction.UP, 1, 1, 1),
+                new BlockPos(1, 2, 1), Direction.UP, new Vector3d(1.0, 0.0, 0.0));
+        final BlockState state = Blocks.OAK_STAIRS.getStateForPlacement(context);
+
+        assertNotNull(state);
+        assertEquals(Direction.EAST, state.getValue(StairBlock.FACING));
+        assertEquals(Half.BOTTOM, state.getValue(StairBlock.HALF));
+    }
+
+    @Test
+    void logsUseEveryLocalFaceAxis() {
+        for (Direction face : Direction.values()) {
+            final BlockPos clicked = new BlockPos(2, 2, 2);
+            final BlockPos target = clicked.relative(face);
+            final Vector3d point = new Vector3d(
+                    2.5 + face.getStepX() * 0.5,
+                    2.5 + face.getStepY() * 0.5,
+                    2.5 + face.getStepZ() * 0.5);
+            final StructurePlacementContext context = localContext(
+                    StructurePlacementMath.localBlockHit(point, face, 2, 2, 2),
+                    target, face, new Vector3d(0.0, 0.0, 1.0));
+            final BlockState state = Blocks.OAK_LOG.getStateForPlacement(context);
+
+            assertNotNull(state);
+            assertEquals(face.getAxis(), state.getValue(RotatedPillarBlock.AXIS),
+                    "local face " + face);
+        }
+    }
+
+    @Test
+    void slabHalfUsesLocalClickFractionWithScale() {
+        final Transform3d pose = new Transform3d(new Vector3d(-4.0, 7.0, 3.0),
+                new Quaterniond().rotateY(Math.toRadians(-35.0)));
+        final double scale = 3.0;
+
+        final BlockState top = slabAt(pose, scale, 0.75);
+        assertEquals(SlabType.TOP, top.getValue(SlabBlock.TYPE));
+
+        final BlockState bottom = slabAt(pose, scale, 0.25);
+        assertEquals(SlabType.BOTTOM, bottom.getValue(SlabBlock.TYPE));
+    }
+
+    private static BlockState slabAt(Transform3d pose, double scale, double localY) {
+        final Vector3d localClick = new Vector3d(1.0, localY, 0.5);
+        final Vector3d worldClick = pose.transformPoint(new Vector3d(localClick).mul(scale));
+        final Vector3d roundTrip = StructurePlacementMath.localPoint(pose, worldClick, scale);
+        final StructurePlacementContext context = localContext(
+                StructurePlacementMath.localBlockHit(roundTrip, Direction.EAST, 0, 0, 0),
+                new BlockPos(1, 0, 0), Direction.EAST, new Vector3d(0.0, 0.0, 1.0));
+        return Blocks.OAK_SLAB.getStateForPlacement(context);
+    }
+
+    @Test
+    void gravityRotatedLookUsesLocalYawPitchNotWorldYaw() {
+        final Transform3d pose = new Transform3d(new Vector3d(),
+                new Quaterniond().rotateY(Math.toRadians(90.0)));
+        final Vector3d localLook = new Vector3d(0.0, -0.6, -0.8);
+        final Vector3d worldLook = pose.transformDirection(localLook);
+        final Vector3d roundTrip = StructurePlacementMath.localLook(pose, worldLook);
+
+        assertEquals(localLook.x, roundTrip.x, 1.0e-9);
+        assertEquals(localLook.y, roundTrip.y, 1.0e-9);
+        assertEquals(localLook.z, roundTrip.z, 1.0e-9);
+        assertNotEquals(StructurePlacementMath.lookYaw(worldLook),
+                StructurePlacementMath.lookYaw(roundTrip));
+
+        final StructurePlacementContext context = localContext(
+                StructurePlacementMath.localBlockHit(
+                        new Vector3d(1.5, 1.5, 1.5), Direction.UP, 1, 1, 1),
+                new BlockPos(1, 2, 1), Direction.UP, roundTrip);
+
+        // Local north (z = -1) is yaw 180, while the same world look is west
+        // (yaw 90). getRotation and getHorizontalDirection must follow local.
+        assertEquals(180.0f, Math.abs(context.getRotation()), 1.0e-4);
+        assertEquals(Direction.NORTH, context.getHorizontalDirection());
+        assertEquals(Direction.DOWN, context.getNearestLookingVerticalDirection());
+        // Vanilla moves the clicked face's opposite to the front for a
+        // non-replacing placement, so DOWN (the opposite of the UP face) is
+        // the first candidate even though local look is mostly north.
+        assertEquals(Direction.DOWN, context.getNearestLookingDirection());
+    }
+
+    private static StructurePlacementContext localContext(BlockHitResult localHit,
+                                                          BlockPos target,
+                                                          Direction localFace,
+                                                          Vector3d localLook) {
+        return new StructurePlacementContext(newFakeLevel(), null, ItemStack.EMPTY,
+                localHit, target, localFace, localLook);
     }
 
     private static Direction.Axis logAxis(Direction face) {

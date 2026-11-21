@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.BlockPhysicsMapper;
+import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
@@ -29,6 +30,10 @@ import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.MenuProvider;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.decoration.HangingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
@@ -36,12 +41,14 @@ import net.minecraft.world.item.component.BlockItemStateProperties;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.storage.TagValueOutput;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -50,6 +57,7 @@ import net.minecraft.tags.ItemTags;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -92,6 +100,15 @@ public final class StructureInteraction {
      * that quickly. Keyed weakly because ServerPlayer instances are long-lived.
      */
     private static final Map<ServerPlayer, Long> LAST_PLACEMENT_TICK = new WeakHashMap<>();
+    /**
+     * At most one authoritative structure break per server tick. This is a
+     * sanity limit for the client-driven {@code MINE} payload: the client may
+     * compute survival progress locally, but the server never trusts a burst of
+     * break packets for arbitrary voxels. A successful break removes the voxel,
+     * so the next legitimate break for the same target must wait for a new
+     * authoritative raycast anyway.
+     */
+    private static final Map<ServerPlayer, Long> LAST_MINE_TICK = new WeakHashMap<>();
 
     /**
      * Minimal edit surface shared by {@link MutableVoxelVolume} and restored
@@ -259,6 +276,32 @@ public final class StructureInteraction {
     }
 
     /**
+     * Server-side rate guard for the client {@code MINE} payload.
+     *
+     * <p>Progress is intentionally not trusted across the wire. A client sends
+     * {@code MINE} only when its local progress reaches {@code 1.0}, but the
+     * server still checks reach, occlusion and occupancy through
+     * {@link #breakBlock}. This guard only collapses duplicate packets that
+     * arrive in the same server tick, which cannot represent two legitimate
+     * breaks of different voxels because a single structure raycast has one
+     * target.</p>
+     *
+     * @return {@code false} when this player already mined during this tick
+     */
+    public static boolean beginMine(ServerPlayer player) {
+        if (player == null) {
+            return false;
+        }
+        final long now = player.level().getGameTime();
+        final Long previous = LAST_MINE_TICK.get(player);
+        if (previous != null && previous == now) {
+            return false;
+        }
+        LAST_MINE_TICK.put(player, now);
+        return true;
+    }
+
+    /**
      * Removes one solid voxel from a mutable structure volume, rebuilds the
      * collider, refreshes the auxiliary block-ticking level and applies a
      * reaction impulse opposite to the player's look direction.
@@ -349,18 +392,22 @@ public final class StructureInteraction {
     /**
      * Resolves the block state a held block item would place for this hit.
      *
-     * <p>The client never supplies a state. The server rebuilds a vanilla
-     * {@link BlockPlaceContext} from the player's current look direction, the
-     * clicked structure face and the stack, then asks
-     * {@link Block#getStateForPlacement(BlockPlaceContext)}. This is the same
-     * hook {@code BlockItem.getPlacementState} delegates to, so stairs, slabs,
-     * trapdoors, fences, logs and pillars honour player yaw/pitch, the clicked
-     * face and the placement rules. {@code BlockItem.getPlacementState} is
-     * protected; calling the public block hook avoids an accessor while keeping
-     * the exact state semantics. We intentionally skip
-     * {@code BlockItem.canPlace}: structure voxels are not part of the real
-     * {@code Level}, so vanilla's support/unobstructed checks would reject
-     * otherwise valid placements.</p>
+     * <p>The client never supplies a state. The server rebuilds a
+     * {@link StructurePlacementContext} expressed in the structure's own frame
+     * from the player's current look direction, the clicked local face and the
+     * stack, then asks {@link Block#getStateForPlacement(BlockPlaceContext)}.
+     * The hit point and look vector are transformed through
+     * {@code pose^-1}, so stairs, slabs, trapdoors, fences, logs and pillars
+     * honour the structure-local yaw/pitch, face and click fraction. This also
+     * handles directional-gravity cameras because the world look vector already
+     * comes from {@link PlayerGravity#lookDirection(Player)}. {@code
+     * BlockItem.getPlacementState} is protected; calling the public block hook
+     * avoids an accessor while keeping the exact state semantics.</p>
+     *
+     * <p>Placement validation is separate: it uses the virtual structure level
+     * for {@code canSurvive}, replacement and entity obstruction. We
+     * intentionally do not call {@code BlockItem.canPlace} against the real
+     * {@code Level} because structure voxels are not part of it.</p>
      *
      * <p>The {@code minecraft:block_state} component carried by the stack (for
      * example a debug-stick-styled item or a loot-table-defined item) is applied
@@ -375,7 +422,7 @@ public final class StructureInteraction {
             return null;
         }
         final BlockState placed = blockItem.getBlock().getStateForPlacement(
-                new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack, hit));
+                StructurePlacementContext.create(player, stack, hit));
         final BlockState resolved = placed != null
                 ? placed
                 : blockItem.getBlock().defaultBlockState();
@@ -404,9 +451,18 @@ public final class StructureInteraction {
     /**
      * Adds a block into the structure voxel adjacent to the hit face.
      *
-     * <p>If the target is inside the current bounds it must be empty. If it is
-     * outside (building on an outer face), the grid is expanded by one cell and
-     * copied into a new mutable volume; a restored
+     * <p>All vanilla placement rules are checked before any mutation: the
+     * target must be replaceable, it must survive at the virtual structure
+     * position, it must be exposed by a solid structure voxel (or be itself a
+     * replaceable cell), and the exact placed collision shape must not
+     * intersect a player, mob, item frame or other blocking entity in world
+     * space. A rejected placement returns {@link PlaceResult#FAILED} without
+     * copying/expanding the volume, reindexing the body, playing feedback or
+     * consuming the stack.</p>
+     *
+     * <p>If the target is inside the current bounds it must be empty or
+     * replaceable. If it is outside (building on an outer face), the grid is
+     * expanded by one cell and copied into a new mutable volume; a restored
      * {@code RestoredStructureVolume} therefore becomes editable after the
      * first outside placement. A small reaction impulse is applied, mirroring
      * the mining response.</p>
@@ -414,7 +470,8 @@ public final class StructureInteraction {
     public static PlaceResult placeBlock(ServerPlayer player, StructureBlockHitResult hit, BlockState state) {
         if (MinecraftPhysics.config() == null
                 || !MinecraftPhysics.config().structureBlockInteractionEnabled
-                || hit == null || hit.structure() == null || state == null || state.isAir()) {
+                || player == null || hit == null || hit.structure() == null
+                || state == null || state.isAir()) {
             return PlaceResult.FAILED;
         }
         final PhysicsStructure structure = hit.structure();
@@ -431,15 +488,28 @@ public final class StructureInteraction {
         final int z = hit.adjacentZ();
         final IntBounds3 bounds = volume.bounds();
         final boolean inside = bounds.contains(x, y, z);
-        if (inside && volume.isSolid(x, y, z)) {
+        final ServerLevel level = (ServerLevel) player.level();
+        final double blockScale = structure.blockScale();
+
+        final StructurePlacementLevel virtualLevel = new StructurePlacementLevel(
+                level, structure.pose(), blockScale, bounds,
+                (sx, sy, sz) -> stateAt(volume, structure, sx, sy, sz));
+        final StructurePlacementValidation.Result validation =
+                StructurePlacementValidation.validate(
+                        state, volume, virtualLevel,
+                        StructurePlacementContext.create(player, player.getMainHandItem(), hit),
+                        x, y, z,
+                        hit.voxelX(), hit.voxelY(), hit.voxelZ(),
+                        blockingEntityBoxes(player, level, structure, x, y, z),
+                        structure.pose(), blockScale);
+        if (!validation.valid()) {
             return PlaceResult.FAILED;
         }
-        final LevelPhysics physics = MinecraftPhysics.getIfPresent((ServerLevel) player.level());
+
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(level);
         if (physics == null) {
             return PlaceResult.FAILED;
         }
-        final ServerLevel level = (ServerLevel) player.level();
-        final double blockScale = structure.blockScale();
         // Resolve the world centre before expanding/reindexing the volume.
         // reindex keeps the world pose stable, so this is the final location of
         // the placed voxel as well.
@@ -606,6 +676,37 @@ public final class StructureInteraction {
         }
     }
 
+    /**
+     * Collects world-space entity boxes that should block a structure
+     * placement. Vanilla's {@code isUnobstructed} only considers entities with
+     * {@code blocksBuilding} (players and mobs); hanging entities such as item
+     * frames do not set that flag, but a block placed through a frame is just as
+     * wrong, so they are included explicitly.
+     */
+    private static List<AABB> blockingEntityBoxes(ServerPlayer player, ServerLevel level,
+                                                  PhysicsStructure structure,
+                                                  int x, int y, int z) {
+        final AABB query = StructurePlacementValidation.worldVoxelBounds(
+                structure.pose(), x, y, z, structure.blockScale()).inflate(1.0e-7);
+        final List<Entity> entities = level.getEntities((Entity) null, query,
+                (Entity entity) -> blocksPlacement(entity, player));
+        final List<AABB> boxes = new ArrayList<>(entities.size());
+        for (Entity entity : entities) {
+            boxes.add(entity.getBoundingBox());
+        }
+        return boxes;
+    }
+
+    private static boolean blocksPlacement(Entity entity, Player player) {
+        if (entity == null || entity.isRemoved() || !entity.isAlive() || entity.isSpectator()) {
+            return false;
+        }
+        if (player != null && entity.isPassengerOfSameVehicle(player)) {
+            return false;
+        }
+        return entity.blocksBuilding || entity instanceof HangingEntity;
+    }
+
     private static void copyVolume(PhysicsStructure structure, VoxelVolume from,
                                    MutableVoxelVolume to) {
         final IntBounds3 bounds = from.bounds();
@@ -627,17 +728,112 @@ public final class StructureInteraction {
     }
 
     /**
-     * Placeholder for future right-click behaviour on structure blocks.
+     * Runs vanilla block-use logic for the structure voxel under an
+     * authoritative hit.
      *
-     * @return the side-table state at the hit voxel, or {@code null}. No
-     *         mutation or vanilla block-use dispatch is performed yet.
+     * <p>The live block is read from the auxiliary void level, so buttons,
+     * levers, doors and other stateful blocks interact with the same ticking
+     * copy that drives their block logic. Containers open their menu through
+     * the block state's {@link MenuProvider}; all other blocks are dispatched
+     * through {@link BlockState#useItemOn} / {@link BlockState#useWithoutItem}
+     * exactly like vanilla's server use-on-block path.</p>
+     *
+     * <p>The auxiliary level has no players. While vanilla logic runs, its
+     * sounds, level events and particles are projected to the host level at the
+     * structure's current world position, so nearby players see and hear the
+     * interaction.</p>
+     *
+     * <p>Returns {@link InteractionResult#PASS} when the structure, voxel or
+     * live auxiliary block is unavailable. Only a consuming result
+     * ({@link InteractionResult#consumesAction()}) should cancel vanilla and
+     * suppress item use.</p>
      */
-    public static BlockState interactBlock(ServerPlayer player, StructureBlockHitResult hit) {
-        if (hit == null || hit.structure() == null || hit.structure().closed()) {
-            return null;
+    public static InteractionResult interactBlock(ServerPlayer player, StructureBlockHitResult hit) {
+        final CrythstConfig config = MinecraftPhysics.config();
+        if (config == null || !config.structureBlockInteractionEnabled
+                || player == null || hit == null || hit.structure() == null) {
+            return InteractionResult.PASS;
         }
-        return stateAt(hit.structure().volume(), hit.structure(),
-                hit.voxelX(), hit.voxelY(), hit.voxelZ());
+        final PhysicsStructure structure = hit.structure();
+        if (structure.closed()) {
+            return InteractionResult.PASS;
+        }
+        final VoxelVolume volume = structure.volume();
+        final int x = hit.voxelX();
+        final int y = hit.voxelY();
+        final int z = hit.voxelZ();
+        if (!volume.bounds().contains(x, y, z) || !volume.isSolid(x, y, z)
+                || !(hit.distance() <= player.blockInteractionRange() + 1.0e-6)
+                || !isStructureInFrontOfRealBlocks(player, hit)) {
+            return InteractionResult.PASS;
+        }
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent((ServerLevel) player.level());
+        if (physics == null) {
+            return InteractionResult.PASS;
+        }
+        final EmptyPhysicsLevel.LiveBlock live = physics.liveBlock(structure, x, y, z);
+        if (live == null) {
+            // The auxiliary chunk is not loaded (or the block was never copied).
+            // Do not fall back to the stale side table: menus and block logic
+            // need the live block entity/state.
+            return InteractionResult.PASS;
+        }
+
+        final Level auxiliaryLevel = live.level();
+        final BlockPos auxiliaryPos = live.pos();
+        final BlockState state = live.state();
+        final BlockHitResult auxiliaryHit = auxiliaryHit(structure, hit, auxiliaryPos);
+
+        final boolean projecting = physics.beginAuxiliaryAudioProjection(structure);
+        try {
+            final MenuProvider menu = state.getMenuProvider(auxiliaryLevel, auxiliaryPos);
+            if (menu != null && player.openMenu(menu).isPresent()) {
+                return InteractionResult.SUCCESS;
+            }
+
+            final ItemStack stack = player.getMainHandItem();
+            InteractionResult result;
+            if (stack.isEmpty()) {
+                result = state.useWithoutItem(auxiliaryLevel, player, auxiliaryHit);
+            } else {
+                result = state.useItemOn(stack, auxiliaryLevel, player,
+                        InteractionHand.MAIN_HAND, auxiliaryHit);
+                if (result instanceof InteractionResult.TryEmptyHandInteraction) {
+                    // Mirror vanilla ServerPlayerGameMode: a block that reports
+                    // "try with an empty hand" gets its no-item use executed.
+                    result = state.useWithoutItem(auxiliaryLevel, player, auxiliaryHit);
+                }
+            }
+            return result == null ? InteractionResult.PASS : result;
+        } finally {
+            physics.flushAuxiliaryBlockStates();
+            if (projecting) {
+                physics.endAuxiliaryAudioProjection();
+            }
+        }
+    }
+
+    /**
+     * Rebuilds the click in the auxiliary level's coordinate space. Local face
+     * and voxel-relative hit fractions are preserved, which matters for blocks
+     * such as bells that inspect the clicked height.
+     */
+    private static BlockHitResult auxiliaryHit(PhysicsStructure structure,
+                                               StructureBlockHitResult hit,
+                                               BlockPos auxiliaryPos) {
+        final Vector3d voxel = structure.worldToVoxel(new Vector3d(), hit.worldHit());
+        final double localX = clampFraction(voxel.x - hit.voxelX());
+        final double localY = clampFraction(voxel.y - hit.voxelY());
+        final double localZ = clampFraction(voxel.z - hit.voxelZ());
+        final Vec3 location = new Vec3(
+                auxiliaryPos.getX() + localX,
+                auxiliaryPos.getY() + localY,
+                auxiliaryPos.getZ() + localZ);
+        return new BlockHitResult(location, hit.localFace(), auxiliaryPos, false);
+    }
+
+    private static double clampFraction(double value) {
+        return Math.max(0.0, Math.min(1.0, value));
     }
 
     /**
@@ -705,6 +901,7 @@ public final class StructureInteraction {
             case MINE -> {
                 final StructureBlockHitResult hit = raycast(player);
                 yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
+                        && beginMine(player)
                         && breakBlock(player, hit).success();
             }
             case PLACE -> {
@@ -732,6 +929,11 @@ public final class StructureInteraction {
                 }
                 yield result.success();
             }
+            case USE -> {
+                final StructureBlockHitResult hit = raycast(player);
+                yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
+                        && interactBlock(player, hit).consumesAction();
+            }
             case PICK, PICK_WITH_DATA -> {
                 final StructureBlockHitResult hit = raycast(player);
                 yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
@@ -748,11 +950,17 @@ public final class StructureInteraction {
      * closer than a structure behind it.
      */
     public static boolean isStructureInFront(StructureBlockHitResult hit, Vec3 vanillaPoint, ServerPlayer player) {
-        if (hit == null || vanillaPoint == null) {
+        return isStructureInFront(hit, vanillaPoint, player == null ? null : player.getEyePosition());
+    }
+
+    /**
+     * Pure distance check used by the occlusion test and unit tests.
+     */
+    static boolean isStructureInFront(StructureBlockHitResult hit, Vec3 vanillaPoint, Vec3 eye) {
+        if (hit == null || vanillaPoint == null || eye == null) {
             return false;
         }
-        return hit.distance() + FRONT_SLACK
-                <= player.getEyePosition().distanceTo(vanillaPoint);
+        return hit.distance() + FRONT_SLACK <= eye.distanceTo(vanillaPoint);
     }
 
     /**

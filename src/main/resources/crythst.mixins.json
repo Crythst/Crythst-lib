@@ -4,6 +4,7 @@
   "package": "io.mikaple.crythst.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
+    "AuxiliaryMenuPositionMixin",
     "entity.EntityCollideInvoker",
     "entity.EntityStructureCollisionMixin",
     "LivingEntityTravelMixin",

@@ -19,7 +19,12 @@ public enum StructureAction {
      * Pick the structure block and include block data where the player has
      * infinite materials (vanilla Ctrl+middle-click).
      */
-    PICK_WITH_DATA;
+    PICK_WITH_DATA,
+    /**
+     * Use/activate the structure block under the crosshair. The server
+     * re-raycasts and runs vanilla block use against the live auxiliary block.
+     */
+    USE;
 
     private static final StructureAction[] VALUES = values();
 

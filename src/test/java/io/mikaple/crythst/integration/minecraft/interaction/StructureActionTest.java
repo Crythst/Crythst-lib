@@ -18,6 +18,7 @@ class StructureActionTest {
     void pickActionsAppendAfterExistingIds() {
         assertEquals(StructureAction.PICK, StructureAction.fromId(3));
         assertEquals(StructureAction.PICK_WITH_DATA, StructureAction.fromId(4));
+        assertEquals(StructureAction.USE, StructureAction.fromId(5));
     }
 
     @Test

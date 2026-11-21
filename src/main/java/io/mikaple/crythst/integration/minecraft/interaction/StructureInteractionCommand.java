@@ -55,7 +55,7 @@ public final class StructureInteractionCommand {
                             + String.format("%.2f", player.blockInteractionRange()) + " blocks"));
             return 0;
         }
-        final BlockState state = StructureInteraction.interactBlock(player, hit);
+        final BlockState state = hit.blockState();
         final var structure = hit.structure();
         final var volume = structure.volume();
         source.sendSuccess(() -> Component.literal(

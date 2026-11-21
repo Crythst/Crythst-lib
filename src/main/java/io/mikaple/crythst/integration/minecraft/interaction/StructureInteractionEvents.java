@@ -86,10 +86,11 @@ public final class StructureInteractionEvents {
     }
 
     /**
-     * Server half of right-clicking a block. A held block item is placed into
-     * the adjacent structure voxel, while spawn eggs, item frames and
-     * registered entity items are placed at the structure surface when the
-     * structure is in front of the vanilla hit.
+     * Server half of right-clicking a block. Handled placement items (block
+     * items, spawn eggs, item frames and registered entity items) place into the
+     * structure as before; every other stack runs the live vanilla block-use
+     * path in {@link StructureInteraction#interactBlock}. Always resolves one
+     * authoritative structure hit first, so a closer real block keeps vanilla.
      */
     private static InteractionResult onUseBlock(Player player, Level level,
                                                 InteractionHand hand, BlockHitResult hitResult) {
@@ -100,13 +101,18 @@ public final class StructureInteractionEvents {
             return InteractionResult.PASS;
         }
         final ItemStack stack = serverPlayer.getMainHandItem();
-        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-            return InteractionResult.PASS;
-        }
         final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
+        }
+        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
+            // Empty hand, tools, buckets, food, ...: run the vanilla block-use
+            // path against the live structure voxel instead of letting the item
+            // use through the structure.
+            return StructureInteraction.interactBlock(serverPlayer, hit).consumesAction()
+                    ? InteractionResult.SUCCESS_SERVER
+                    : InteractionResult.PASS;
         }
         if (!StructureInteraction.beginPlacement(serverPlayer)) {
             return InteractionResult.SUCCESS_SERVER;
@@ -132,8 +138,8 @@ public final class StructureInteractionEvents {
     /**
      * Fallback for right-clicking air. Vanilla still sends a use-item packet
      * in this case on most clients; without this hook placement would only
-     * work when a real block happened to be behind the structure. Block items
-     * and handled entity items both use the same authoritative structure hit.
+     * work when a real block happened to be behind the structure. Placement
+     * items and ordinary block use share the same authoritative structure hit.
      */
     private static InteractionResult onUseItem(Player player, Level level, InteractionHand hand) {
         if (!(player instanceof net.minecraft.server.level.ServerPlayer serverPlayer)
@@ -143,13 +149,17 @@ public final class StructureInteractionEvents {
             return InteractionResult.PASS;
         }
         final ItemStack stack = serverPlayer.getMainHandItem();
-        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-            return InteractionResult.PASS;
-        }
         final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
+        }
+        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
+            // Use-on-air with an ordinary item over a structure is still a
+            // structure use, not an item use through the body.
+            return StructureInteraction.interactBlock(serverPlayer, hit).consumesAction()
+                    ? InteractionResult.SUCCESS_SERVER
+                    : InteractionResult.PASS;
         }
         if (!StructureInteraction.beginPlacement(serverPlayer)) {
             return InteractionResult.SUCCESS_SERVER;

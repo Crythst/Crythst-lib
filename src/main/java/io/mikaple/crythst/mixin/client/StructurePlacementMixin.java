@@ -24,12 +24,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  *
  * <p>For a {@code StructureBlockHitResult} this injector consumes the click at
  * the head of {@code useItemOn}, before prediction starts, and sends only the
- * authoritative {@code crythst:structure_action} payload. This covers block
- * items, spawn eggs, item frames and registered entity items. Vanilla never
- * sends a use-on-block packet and never runs {@code BlockItem.place},
- * {@code SpawnEggItem.useOn} or a hanging-entity placement for this click.
- * Returning {@code CONSUME} rather than {@code SUCCESS} avoids a second arm
- * swing because {@link ClientStructureInteraction} already swings.</p>
+ * authoritative {@code crythst:structure_action} payload. Block items, spawn
+ * eggs, item frames and registered entity items use {@code PLACE}; an empty
+ * hand, tools, buckets, food and other items use {@code USE}, which runs the
+ * live vanilla block-use path on the server. Vanilla never sends a use-on-block
+ * packet and never runs {@code BlockItem.place}, {@code SpawnEggItem.useOn} or
+ * a hanging-entity placement for this click. Returning {@code CONSUME} rather
+ * than {@code SUCCESS} avoids a second arm swing because
+ * {@link ClientStructureInteraction} already swings.</p>
  */
 @Mixin(MultiPlayerGameMode.class)
 public abstract class StructurePlacementMixin {
@@ -37,7 +39,7 @@ public abstract class StructurePlacementMixin {
     private void crythst$consumeStructurePlacement(LocalPlayer player, InteractionHand hand,
                                                    BlockHitResult hitResult,
                                                    CallbackInfoReturnable<InteractionResult> callback) {
-        if (ClientStructureInteraction.requestStructurePlacement(player, hand, hitResult)) {
+        if (ClientStructureInteraction.requestStructureUse(player, hand, hitResult)) {
             callback.setReturnValue(InteractionResult.CONSUME);
         }
     }

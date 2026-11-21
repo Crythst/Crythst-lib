@@ -6,6 +6,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
+import org.joml.Vector3dc;
 
 /**
  * Pure world-space geometry for placing into a physics structure.
@@ -89,6 +90,116 @@ public final class StructurePlacementMath {
         final double insideZ = worldHit.z - worldFace.getStepZ() * FACE_EPSILON;
         final BlockPos pos = BlockPos.containing(insideX, insideY, insideZ);
         return new BlockHitResult(location, worldFace, pos, false);
+    }
+
+    /**
+     * Converts a world-space point to structure-local voxel metres.
+     *
+     * <p>The block scale is part of the coordinate conversion, not only of the
+     * render pose: a structure with {@code blockScale == 2} has two-metre
+     * voxels, so a world click at the centre of the first voxel is local
+     * {@code (1, 1, 1)} rather than {@code (0.5, 0.5, 0.5)}.</p>
+     */
+    public static Vector3d localPoint(Transform3d pose, Vector3dc worldPoint, double blockScale) {
+        final double scale = positiveScale(blockScale);
+        final Vector3d local = pose == null
+                ? new Vector3d(worldPoint)
+                : pose.inverseTransformPoint(worldPoint);
+        return local.div(scale);
+    }
+
+    /**
+     * Rotates a world-space look vector into the structure-local frame. Look
+     * vectors are directions, so the block scale is intentionally not applied.
+     */
+    public static Vector3d localLook(Transform3d pose, Vector3dc worldLook) {
+        return pose == null
+                ? new Vector3d(worldLook)
+                : pose.inverseTransformDirection(worldLook);
+    }
+
+    /**
+     * Minecraft yaw for a view vector: {@code 0} is south, {@code -90} east,
+     * {@code 90} west and {@code 180} north.
+     */
+    public static float lookYaw(Vector3dc look) {
+        return (float) Math.toDegrees(Math.atan2(-look.x(), look.z()));
+    }
+
+    /**
+     * Minecraft pitch for a view vector: positive looks down.
+     */
+    public static float lookPitch(Vector3dc look) {
+        final double horizontal = Math.hypot(look.x(), look.z());
+        return (float) -Math.toDegrees(Math.atan2(look.y(), horizontal));
+    }
+
+    /**
+     * Vanilla horizontal facing for a yaw angle.
+     */
+    public static Direction horizontalDirection(float yaw) {
+        return Direction.fromYRot(yaw);
+    }
+
+    /**
+     * Equivalent of {@link Direction#orderedByNearest(net.minecraft.world.entity.Entity)}
+     * using a view vector instead of an entity. The result follows the same
+     * branch structure as vanilla: the axes are ordered by the absolute look
+     * component, while each direction keeps the component's sign.
+     */
+    public static Direction[] orderedLookingDirections(Vector3dc look) {
+        final double x = look.x();
+        final double y = look.y();
+        final double z = look.z();
+        final double ax = Math.abs(x);
+        final double ay = Math.abs(y);
+        final double az = Math.abs(z);
+        final Direction xDir = x > 0.0 ? Direction.EAST : Direction.WEST;
+        final Direction yDir = y > 0.0 ? Direction.UP : Direction.DOWN;
+        final Direction zDir = z > 0.0 ? Direction.SOUTH : Direction.NORTH;
+
+        if (ax > az) {
+            if (ay > ax) {
+                return new Direction[]{yDir, xDir, zDir};
+            }
+            if (az > ay) {
+                return new Direction[]{xDir, zDir, yDir};
+            }
+            return new Direction[]{xDir, yDir, zDir};
+        }
+        if (ay > az) {
+            return new Direction[]{yDir, zDir, xDir};
+        }
+        if (ax > ay) {
+            return new Direction[]{zDir, xDir, yDir};
+        }
+        return new Direction[]{zDir, yDir, xDir};
+    }
+
+    /**
+     * Builds the vanilla-shaped click used by a structure-local placement
+     * context. Unlike {@link #blockHit(Vector3d, Direction)} this does not
+     * floor world coordinates: the clicked voxel and the hit point are already
+     * expressed in the structure's own grid.
+     *
+     * @param localPoint local click point in voxel metres
+     * @param localFace  local outward face
+     * @param clickedX   structure-local coordinates of the hit voxel
+     * @param clickedY   structure-local coordinates of the hit voxel
+     * @param clickedZ   structure-local coordinates of the hit voxel
+     */
+    public static BlockHitResult localBlockHit(Vector3dc localPoint, Direction localFace,
+                                               int clickedX, int clickedY, int clickedZ) {
+        final Direction face = localFace == null ? Direction.UP : localFace;
+        return new BlockHitResult(
+                new Vec3(localPoint.x(), localPoint.y(), localPoint.z()),
+                face,
+                new BlockPos(clickedX, clickedY, clickedZ),
+                false);
+    }
+
+    private static double positiveScale(double value) {
+        return value > 0.0 && Double.isFinite(value) ? value : 1.0;
     }
 
     /**

@@ -40,4 +40,25 @@ public final class StructureItemUse {
         }
         return item instanceof BlockItem || StructureEntityPlacement.handles(item);
     }
+
+    /**
+     * Chooses the structure action for a right-click on a structure voxel.
+     * Handled block/entity placement items keep {@link StructureAction#PLACE};
+     * everything else (empty hand, tools, buckets, food, ...) uses the vanilla
+     * block-interaction path through {@link StructureAction#USE}.
+     *
+     * <p>Keeping this decision here makes the client mixin and the server
+     * callbacks agree on one routing rule and lets it be unit tested without a
+     * running client.</p>
+     */
+    public static StructureAction actionForUse(@Nullable ItemStack stack) {
+        return shouldHandleStructureUse(stack) ? StructureAction.PLACE : StructureAction.USE;
+    }
+
+    /**
+     * Item-type overload used by tests and callers that already know the item.
+     */
+    public static StructureAction actionForUse(@Nullable net.minecraft.world.item.Item item) {
+        return shouldHandleStructureUse(item) ? StructureAction.PLACE : StructureAction.USE;
+    }
 }
