@@ -97,10 +97,12 @@ OBB whose local `+Y` follows `PlayerGravity.up(player)`.
 
 `EntityHitboxDebugRendererMixin` cancels `showHitboxes` for those players, and
 `PlayerObbDebugRenderer` (registered while `ENTITY_HITBOXES` is enabled) draws
-the same OBB the collision pass uses. Its centre is shifted by the entity's
-render interpolation so it coincides with the rendered avatar. The camera,
-avatar and this OBB all consume the same `PlayerGravity.viewRotation` /
-`up` frame; see [player-gravity-camera.md](player-gravity-camera.md).
+the same OBB the collision pass uses. Its feet anchor is the entity position,
+so its centre is `position + up * (bbHeight / 2)`, and it is shifted by the
+entity's render interpolation so it coincides with the rendered avatar. The
+camera, avatar and this OBB all consume the same feet frame and
+`PlayerGravity.viewRotation` / `up`; see
+[player-gravity-camera.md](player-gravity-camera.md).
 
 ## Related diagnostics
 

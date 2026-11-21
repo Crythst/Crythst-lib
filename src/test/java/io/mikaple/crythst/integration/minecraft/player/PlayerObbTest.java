@@ -15,10 +15,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Pure anchor and terrain-push tests for the rotated player box.
  *
- * <p>Minecraft {@code position()} is the bottom-centre of the vanilla Y-up
- * AABB. Rotating gravity must not reinterpret that point as gravity feet: the
- * OBB centre has to stay on the AABB centre or the body shifts sideways into
- * blocks.</p>
+ * <p>Under directional gravity {@code Minecraft.position()} is the feet anchor
+ * in the gravity frame. The body extends along {@code up}, so the OBB centre is
+ * {@code position + up * (height / 2)} and the feet point
+ * {@code centre - up * (height / 2)} stays exactly at the entity position for
+ * every gravity direction.</p>
  */
 class PlayerObbTest {
     private static final double WIDTH = 0.6;
@@ -31,7 +32,7 @@ class PlayerObbTest {
     }
 
     @Test
-    void vanillaUpKeepsTheAabbCentreAnchor() {
+    void vanillaUpKeepsTheFeetAnchor() {
         final OrientedBox box = PlayerObb.box(3.0, 4.0, 5.0, WIDTH, HEIGHT, unit(0, 1, 0));
 
         assertEquals(3.0, box.center().x, EPS);
@@ -39,40 +40,53 @@ class PlayerObbTest {
         assertEquals(4.0 + HEIGHT * 0.5, box.center().y, EPS);
         assertEquals(HEIGHT * 0.5, box.halfExtents().y, EPS);
         assertEquals(WIDTH * 0.5, box.halfExtents().x, EPS);
+        assertEquals(3.0, box.center().x - box.axes()[1].x * box.halfExtents().y, EPS);
+        assertEquals(4.0, box.center().y - box.axes()[1].y * box.halfExtents().y, EPS);
+        assertEquals(5.0, box.center().z - box.axes()[1].z * box.halfExtents().y, EPS);
     }
 
     @Test
-    void rotatedUpNeverShiftsTheAnchorSideways() {
+    void rotatedUpExtendsTheBoxAlongTheGravityAxis() {
         final Vector3d[] ups = {
                 unit(1, 0, 0),
                 unit(0, 0, 1),
                 unit(-1, 0, 0),
                 unit(0, 0, -1),
-                unit(0.6, 0.8, 0.0)
+                unit(0.6, 0.8, 0.0),
+                unit(-0.3, 0.4, 0.8660254037844386)
         };
         for (Vector3d up : ups) {
-            final OrientedBox box = PlayerObb.box(7.0, 2.0, -4.0, WIDTH, HEIGHT, up);
+            final Vector3d position = new Vector3d(7.0, 2.0, -4.0);
+            final OrientedBox box = PlayerObb.box(position.x, position.y, position.z,
+                    WIDTH, HEIGHT, up);
             final Vector3d center = box.center();
-            assertEquals(7.0, center.x, EPS,
-                    "up " + up + " must not move the body in X");
-            assertEquals(2.0 + HEIGHT * 0.5, center.y, EPS,
-                    "up " + up + " must not move the body in Y");
-            assertEquals(-4.0, center.z, EPS,
-                    "up " + up + " must not move the body in Z");
+
+            assertVectorEquals(new Vector3d(position).fma(HEIGHT * 0.5, up), center,
+                    "up " + up + " must place the centre at position + up * halfHeight");
+
+            // The feet point is fixed: centre - up * halfHeight == position.
+            final Vector3d feet = new Vector3d(center).fma(-HEIGHT * 0.5, up);
+            assertVectorEquals(position, feet,
+                    "up " + up + " must not move the feet anchor");
+
+            // Local +Y (the OBB's second axis) follows gravity up.
+            assertVectorEquals(up, box.axes()[1],
+                    "up " + up + " must become the box local +Y");
         }
     }
 
     @Test
-    void crouchHeightOnlyChangesTheVerticalCentre() {
+    void crouchHeightMovesTheCentreAlongTheGravityAxis() {
+        final Vector3d up = unit(0, 1, 0);
         final OrientedBox standing = PlayerObb.box(1.0, 2.0, 3.0,
-                WIDTH, HEIGHT, unit(0, 1, 0));
+                WIDTH, HEIGHT, up);
         final OrientedBox crouched = PlayerObb.box(1.0, 2.0, 3.0,
-                WIDTH, CROUCH_HEIGHT, unit(0, 1, 0));
+                WIDTH, CROUCH_HEIGHT, up);
 
-        assertEquals(standing.center().x, crouched.center().x, EPS);
-        assertEquals(standing.center().z, crouched.center().z, EPS);
+        assertEquals(2.0 + HEIGHT * 0.5, standing.center().y, EPS);
         assertEquals(2.0 + CROUCH_HEIGHT * 0.5, crouched.center().y, EPS);
-        assertEquals(CROUCH_HEIGHT * 0.5, crouched.halfExtents().y, EPS);
+        assertEquals(0.0, standing.center().y - HEIGHT * 0.5 - 2.0, EPS);
+        assertEquals(0.0, crouched.center().y - CROUCH_HEIGHT * 0.5 - 2.0, EPS);
     }
 
     @Test
@@ -91,17 +105,15 @@ class PlayerObbTest {
         final Vector3d[] ups = {unit(1, 0, 0), unit(0, 1, 0), unit(0, 0, 1)};
 
         for (Vector3d up : ups) {
-            // Place the vanilla AABB centre 0.05 m inside the floor along the
-            // gravity axis: floor top is 1.0, OBB half-height is 0.9, so the
-            // centre is at 1.85. Vanilla position is always the Y-up AABB
-            // bottom-centre, not gravity feet.
+            // Put the feet 0.05 below the floor top along the gravity axis:
+            // floor top is 1.0, so feet = 0.95 and the OBB centre = 1.85.
             final Vector3d position = new Vector3d(5.0, 5.0, 5.0);
             if (Math.abs(up.x) > 0.99) {
-                position.x = 1.85;
+                position.x = 0.95;
             } else if (Math.abs(up.y) > 0.99) {
                 position.y = 0.95;
             } else {
-                position.z = 1.85;
+                position.z = 0.95;
             }
             final Aabb floor = floorBelow(up);
             final OrientedBox box = PlayerObb.box(position.x, position.y, position.z,
@@ -167,6 +179,12 @@ class PlayerObbTest {
             center = center.add(push);
             center.fma(-0.02, up);
         }
+    }
+
+    private static void assertVectorEquals(Vector3d expected, Vector3d actual, String message) {
+        assertEquals(expected.x, actual.x, EPS, message + " (x)");
+        assertEquals(expected.y, actual.y, EPS, message + " (y)");
+        assertEquals(expected.z, actual.z, EPS, message + " (z)");
     }
 
     /**

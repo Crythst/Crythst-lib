@@ -2,15 +2,14 @@ package io.mikaple.crythst.mixin.client;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.player.PlayerRenderFrame;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.entity.LivingEntityRenderer;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
-import org.joml.Matrix4f;
 import org.joml.Quaterniond;
-import org.joml.Quaternionf;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -18,21 +17,29 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Rotates a player model into the directional-gravity frame.
+ * Rotates a player model into the directional-gravity feet frame.
  *
- * <p>The model's local {@code +Y} is vanilla up. At the head of
- * {@code LivingEntityRenderer.setupRotations} the pose stack is already
- * translated to the entity's feet (and scaled by {@code state.scale}), so
- * right-multiplying the current matrix by {@code rotation(Q)} appends a
- * world-space rotation applied <em>after</em> vanilla's body-yaw/pose
- * transforms. The whole avatar therefore turns about its feet into the gravity
- * frame:</p>
+ * <p>The pose stack at the head of {@code LivingEntityRenderer.setupRotations}
+ * is already translated to the entity's render position (its feet, including
+ * {@code getRenderOffset}) and scaled by {@code state.scale}. Right-multiplying
+ * by {@code rotation(Q)} therefore appends a world-space rotation whose fixed
+ * point is exactly that feet anchor:</p>
  *
- * <pre>pose = T_feet * Q * R_bodyYaw * ...</pre>
+ * <pre>
+ * pose = T_feet * S(state.scale) * Q * R_bodyYaw
+ *        * S(-1, -1, 1) * S_model * T(0, -1.501, 0)
+ * </pre>
+ *
+ * <p>The {@code (-1, -1, 1)} flip and the {@code -1.501} translation are
+ * <em>inside</em> {@code Q} (to its right), so they only place the model in the
+ * upright frame; they cannot move the rotation pivot. This is the same feet
+ * anchor that {@link io.mikaple.crythst.integration.minecraft.player.PlayerObb}
+ * uses ({@code position()}) and that the camera eye is rotated about.</p>
  *
  * <p>Held items and armour are layers submitted inside the same pose stack, so
  * they follow automatically. The name tag is submitted after the model stack is
- * popped; {@code AvatarNameTagGravityMixin} rotates its attachment offset.</p>
+ * popped; {@code AvatarNameTagGravityMixin} rotates its attachment about the
+ * same feet anchor.</p>
  *
  * <p>{@code setupRotations} is declared on {@code LivingEntityRenderer}, not on
  * {@code AvatarRenderer}, so this mixin targets the declaring class and filters
@@ -52,16 +59,9 @@ public abstract class AvatarRendererGravityMixin {
         if (rotation == null) {
             return;
         }
-        // The player OBB is centred on the vanilla AABB centre, so rotate the
-        // avatar around the same centre, not around its feet. Otherwise the
-        // rendered model and the F3+B/collision box visibly diverge when up is
-        // tilted. setupRotations starts at the feet.
-        final float halfHeight = Math.max(0.0f, avatar.boundingBoxHeight * 0.5f);
-        pose.translate(0.0f, halfHeight, 0.0f);
-        pose.mulPose(new Matrix4f().rotation(new Quaternionf(
-                (float) rotation.x, (float) rotation.y,
-                (float) rotation.z, (float) rotation.w)));
-        pose.translate(0.0f, -halfHeight, 0.0f);
+        // The pose origin is the feet anchor. Do not add a half-height pivot:
+        // the collision OBB, the eye and the avatar all rotate around the feet.
+        pose.rotate(PlayerRenderFrame.toFloat(rotation));
     }
 
     /**

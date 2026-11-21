@@ -15,9 +15,11 @@ import org.joml.Vector3d;
  * <p>Vanilla Minecraft always uses a Y-up axis-aligned bounding box. When a
  * player's gravity is non-default, Crythst instead treats the player as a box
  * whose local {@code +Y} axis follows the opposite of the gravity direction.
- * The box is centred on the <em>vanilla AABB centre</em>, with half extents
- * taken from the current player dimensions, so rotating the gravity frame
- * never moves the body sideways.</p>
+ * The box is anchored at the player's <em>feet</em>: {@code position()} is the
+ * feet point in the gravity frame and the body extends
+ * {@code bbHeight} along {@code up}. The box centre is therefore
+ * {@code position() + up * (bbHeight / 2)}, matching the avatar and camera feet
+ * frame.</p>
  *
  * <p>This class is deliberately stateless and has no tick logic; the
  * {@link PlayerObbCollision} tick coordinator applies the push vectors it
@@ -68,22 +70,20 @@ public final class PlayerObb {
     /**
      * Builds the player's world-space oriented box.
      *
-     * <p>Minecraft's {@code position()} is the bottom-centre of the vanilla
-     * <em>Y-up</em> bounding box, not the player's feet in the gravity frame.
-     * The oriented box therefore stays anchored at the vanilla AABB centre
-     * ({@code position + (0, height / 2, 0)}) and only its orientation changes.
-     * This keeps the body volume in the same place for every gravity direction;
-     * treating {@code position} as gravity feet would translate the box
-     * sideways by {@code halfHeight * up} when gravity is rotated and clip the
-     * player into terrain.</p>
+     * <p>Minecraft's {@code position()} is treated as the <em>feet anchor</em>
+     * of the gravity frame. The oriented box extends from that point along the
+     * gravity up direction, so its centre is
+     * {@code position + up * (height / 2)} and its local {@code +Y} axis is
+     * {@code up}. The avatar and the camera use the same feet anchor, which
+     * keeps the rendered body, the F3 + B box and the eye together for every
+     * gravity direction.</p>
      *
      * <p>Frame mapping:</p>
      * <ul>
-     *   <li>vanilla AABB bottom-centre = {@code position()}</li>
-     *   <li>vanilla AABB centre = {@code position() + (0, height / 2, 0)}</li>
-     *   <li>eye = {@code position() + (0, eyeHeight, 0)} in vanilla space</li>
-     *   <li>gravity feet = {@code obb.center() - halfHeight * up} (informational
-     *       only; it generally does <em>not</em> equal {@code position()})</li>
+     *   <li>feet anchor = {@code position()}</li>
+     *   <li>OBB centre = {@code position() + up * (height / 2)}</li>
+     *   <li>eye = {@code position() + Q * (0, eyeHeight, 0)} (see
+     *       {@code PlayerRenderFrame#eye})</li>
      * </ul>
      */
     public static OrientedBox obb(Player player) {
@@ -99,11 +99,12 @@ public final class PlayerObb {
     /**
      * Pure anchor/box constructor shared by the live player and unit tests.
      *
-     * <p>The box centre is the centre of the vanilla Y-up AABB, so rotating
-     * {@code up} never changes the centre's X/Z coordinates and never shifts
-     * the box sideways relative to the body.</p>
+     * <p>The box is built around the feet anchor: {@code position} is the
+     * bottom-centre of the body in the gravity frame, not the vanilla Y-up AABB
+     * centre. Rotating {@code up} therefore moves the body volume onto the new
+     * gravity axis instead of changing only its orientation.</p>
      *
-     * @param position  vanilla AABB bottom-centre
+     * @param position  feet anchor (the vanilla entity position)
      * @param width     vanilla AABB width
      * @param height    vanilla AABB height (1.5 while crouching)
      * @param up        gravity up direction
@@ -120,9 +121,10 @@ public final class PlayerObb {
             axis.normalize();
         }
 
-        // Vanilla position is the Y-up AABB bottom-centre. Keep the OBB on the
-        // same centre instead of interpreting position as gravity feet.
-        final Vector3d center = new Vector3d(positionX, positionY + halfHeight, positionZ);
+        // The entity position is the gravity-frame feet anchor. The body
+        // extends along +up, so the centre is one half-height along that axis.
+        final Vector3d center = new Vector3d(positionX, positionY, positionZ)
+                .fma(halfHeight, axis);
 
         final Quaterniond rotation = new Quaterniond().rotationTo(VANILLA_UP, axis);
         return new OrientedBox(

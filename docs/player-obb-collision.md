@@ -55,15 +55,20 @@ when gravity is non-default.
 
 ### OBB construction
 
-Minecraft's entity position is the **bottom centre** of the vanilla box.
-For player gravity up direction `u` (unit vector, opposite to
-`PlayerGravity.direction(player)`), the OBB is:
+Minecraft's entity position is the **feet anchor** of the gravity frame: the
+body extends from `position` along the gravity up direction. For player gravity
+up direction `u` (unit vector, opposite to `PlayerGravity.direction(player)`),
+the OBB is:
 
 ```text
 half extents: (bbWidth / 2, bbHeight / 2, bbWidth / 2)
 centre:       position + u * (bbHeight / 2)
+feet:         centre - u * (bbHeight / 2) == position
 rotation:     shortest quaternion mapping local +Y to u
 ```
+
+The same feet anchor is used by the rendered avatar and by the one eye position
+`position + Q * (0, eyeHeight, 0)`, so all three stay together when `u` changes.
 
 Because player width is applied on both local X and Z, the arbitrary roll
 component of the rotation does not affect the collision shape.

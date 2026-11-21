@@ -10,7 +10,8 @@ The feature is implemented by:
 | File | Purpose |
 | --- | --- |
 | `integration/minecraft/PlayerGravity.java` | Per-player gravity direction plus the gravity-frame math (`up`, `viewRotation`, `lookDirection`, `rotationForUp`, `rotateOffset`, `hasDirectionalGravity`). |
-| `mixin/client/CameraGravityMixin.java` | Rotates the extracted camera render state and third-person offset into the gravity frame. |
+| `integration/minecraft/player/PlayerRenderFrame.java` | Pure feet-frame helpers shared by the camera, avatar, name tag and tests. |
+| `mixin/client/CameraGravityMixin.java` | Places the extracted camera eye/position and orientation in the feet frame. |
 | `mixin/client/AvatarRendererGravityMixin.java` | Rotates the third-person avatar around its feet. |
 | `mixin/client/AvatarNameTagGravityMixin.java` | Moves the name-tag anchor into the same frame. |
 | `integration/fabric/client/PlayerObbDebugRenderer.java` | Draws the oriented F3 + B hitbox. |
@@ -56,7 +57,9 @@ Vector3d look = PlayerGravity.lookDirection(player);      // q * vanilla look
   it is a plain copy of the vanilla look vector.
 * `rotateOffset(rotation, eye, cameraPosition)` applies the same rotation to a
   camera offset: `eye + Q * (cameraPosition - eye)`. A zero offset (first
-  person) is unchanged.
+  person) is unchanged. The live client camera uses the feet-frame equivalent
+  (`PlayerRenderFrame`: `feet + Q * (vanillaCameraPosition - feet)`) so its eye
+  moves with the avatar and OBB; see [Camera math](#camera-math).
 
 ### `LOOK` mode is a snapshot
 
@@ -131,25 +134,38 @@ preserved). The view matrix is rebuilt exactly like vanilla:
 state.viewRotationMatrix.rotation(conjugate(state.orientation));
 ```
 
-### Third-person position
+### Camera position: feet frame
 
-Vanilla places the third-person camera at `eye + offset` in the world-up frame.
-The whole view is composed by `Q`, so the offset must rotate too:
+Vanilla places the camera at
+`position + (0, eyeHeight, 0) + thirdPersonOffset` in the world-up frame.
+Crythst uses the same feet anchor as the avatar and the OBB and rotates that
+whole vector around `position`:
 
 ```java
-state.pos = eye + Q * (vanillaCameraPosition - eye);
+state.pos = position + Q * (vanillaCameraPosition - position);
 state.blockPos = BlockPos.containing(state.pos);
 ```
+
+This is exactly:
+
+```text
+eye'    = position + Q * (0, eyeHeight, 0)
+camera' = eye' + Q * thirdPersonOffset
+```
+
+for third person, and `camera' = eye'` in first person. The first-person eye is
+therefore moved too: it is no longer the vanilla vertical eye. That is required
+for consistency — the (invisible) avatar and its collision OBB pivot around the
+feet, so the camera must pivot around the same point or the view drifts away
+from the body when gravity is tilted.
 
 `state.xRot`/`state.yRot` are then derived from the rotated forward vector.
 The culling frustum is rebuilt from the rotated view matrix,
 `state.projectionMatrix` and `state.pos`. The camera's
 `forwardVector()`, `upVector()` and `leftVector()` are also rotated, keeping
 sound, particles and other camera-basis consumers consistent with the picture.
-
-In first person the offset is zero; the vanilla position and block position are
-written back untouched, so the eye does not move. The orientation still rotates
-(that is the point of the feature).
+The orientation still rotates independently of the position; that is the point
+of the feature.
 
 Once per second the client logs the applied frame:
 
@@ -157,7 +173,7 @@ Once per second the client logs the applied frame:
 Crythst gravity camera: q=(x, y, z, w) up=(x, y, z) forward=(x, y, z) posOffset=(x, y, z)
 ```
 
-`posOffset` is `state.pos - eye`, so it is `(0.000, 0.000, 0.000)` in first
+`posOffset` is `state.pos - eye'`, so it is `(0.000, 0.000, 0.000)` in first
 person and the rotated camera offset in third person. The line is emitted at
 most once per second while gravity is directional, `playerCameraGravity` is
 enabled and the camera belongs to the local player.
@@ -166,20 +182,32 @@ enabled and the camera belongs to the local player.
 
 `AvatarRendererGravityMixin` targets `LivingEntityRenderer.setupRotations` (the
 declaring class, filtered to `AvatarRenderState`) and injects at its head. The
-pose stack is already translated to the entity's feet, so right-multiplying the
-current matrix by `rotation(Q)` yields
-`T_feet * Q * R_bodyYaw * ...`: the whole model turns around its feet, after
-vanilla's yaw/pose transforms, in the same world frame as the camera. Held items
-and armour are layers inside that pose stack and rotate with it.
-`AvatarNameTagGravityMixin` rotates the name-tag attachment by `Q` separately
-because it is submitted after the model stack is popped; the text stays
-camera-billboarded.
+pose stack is already translated to the entity's feet and uniformly scaled, so
+right-multiplying the current matrix by `rotation(Q)` yields
+
+```text
+T_feet * S(state.scale) * Q * R_bodyYaw
+       * S(-1, -1, 1) * S_model * T(0, -1.501, 0)
+```
+
+The whole model turns around its feet, before vanilla's yaw/pose transforms in
+matrix order but in the same world frame as the camera. The `(-1,-1,1)` flip
+and `-1.501` translation are inside `Q`, so they cannot move the pivot. Held
+items and armour are layers inside that pose stack and rotate with it.
+
+`AvatarNameTagGravityMixin` moves the name-tag attachment separately because it
+is submitted after the model stack is popped. `submitNameTag` adds its own
+world-space `+0.5` after the attachment, so the mixin stores
+`Q * (attachment + (0, 0.5, 0)) - (0, 0.5, 0)`. The final world anchor is then
+`position + Q * (attachment + (0, 0.5, 0))`, above the rotated head. The text
+stays camera-billboarded.
 
 For F3 + B, `EntityHitboxDebugRendererMixin` cancels vanilla's axis-aligned
 `showHitboxes` for directional-gravity players and `PlayerObbDebugRenderer`
-draws the OBB built from the same `PlayerGravity.up(player)` vector. Its centre
-is shifted by the entity's render interpolation so it sits on the rendered
-avatar rather than one tick behind it.
+draws the OBB built from the same `PlayerGravity.up(player)` vector. The OBB
+centre is `position + up * (bbHeight / 2)` and its feet point is the entity
+position. The debug box is shifted by the entity's render interpolation so it
+sits on the rendered avatar rather than one tick behind it.
 
 ## Mouse look and view direction
 

@@ -48,9 +48,10 @@ public final class PlayerObbDebugRenderer implements DebugRenderer.SimpleDebugRe
                     && minecraft.options.getCameraType().isFirstPerson())) {
                 continue;
             }
-            // The collision OBB is built from the tick position. Shift it by
-            // the same interpolation the entity renderer uses, so the F3 + B
-            // box sits exactly on the rendered avatar.
+            // The collision OBB is built from the tick position, which is the
+            // feet anchor in the gravity frame. Shift it by the same
+            // interpolation the entity renderer uses, so the F3 + B box sits
+            // exactly on the rendered avatar.
             final Vec3 tickPosition = player.position();
             final Vec3 renderPosition = player.getPosition(partialTicks);
             final Vec3 delta = renderPosition.subtract(tickPosition);

@@ -3,6 +3,7 @@ package io.mikaple.crythst.mixin.client;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.player.PlayerRenderFrame;
 import io.mikaple.crythst.integration.portal.PortalTransform;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
@@ -48,10 +49,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * vanilla value makes the injection idempotent and never applies {@code Q}
  * twice.</p>
  *
- * <p>The third-person camera position is computed by vanilla in the world-up
- * frame. Its offset from the player's eye is rotated by the same {@code Q}, so
- * the camera stays behind the rotated view. First-person offsets are zero and
- * the vanilla position is written back untouched.</p>
+ * <p>The camera position is built in the same <em>feet frame</em> as the
+ * avatar and the collision OBB. Vanilla computes
+ * {@code feet + (0, eyeHeight, 0) + thirdPersonOffset}; rotating that whole
+ * vector about {@code feet} gives both a gravity-frame eye
+ * {@code feet + Q * (0, eyeHeight, 0)} and a rotated third-person offset. This
+ * also moves the first-person eye, which keeps the camera, the (invisible)
+ * avatar and the F3 + B box anchored to the same point.</p>
  *
  * <p>When {@code Q} is the identity (no override, or gravity pointing straight
  * down) the injection returns before touching the render state. This keeps the
@@ -79,25 +83,27 @@ public abstract class CameraGravityMixin {
                 ((Camera) (Object) this).rotation());
         state.orientation.set(new Quaternionf(gravity).mul(vanillaOrientation));
 
-        // Rotate the third-person offset from the eye into the gravity frame.
-        // In first person the offset is zero, so leave the vanilla position and
-        // block position exactly as extracted.
+        // Rebuild the camera position in the same feet frame as the avatar and
+        // the collision OBB. Vanilla's camera position is
+        // feet + (0, eyeHeight, 0) + thirdPersonOffset; rotating the whole
+        // vector about the feet gives
+        //   eye'    = feet + Q * (0, eyeHeight, 0)
+        //   camera' = eye' + Q * thirdPersonOffset
+        // for both first and third person.
         final Vec3 vanillaPosition = ((Camera) (Object) this).position();
-        final Vec3 eyePosition = player.getEyePosition(state.cameraEntityPartialTicks);
-        final Vector3d eye = new Vector3d(eyePosition.x, eyePosition.y, eyePosition.z);
+        final Vec3 feetPosition = player.getPosition(state.cameraEntityPartialTicks);
+        final Vector3d feet = new Vector3d(
+                feetPosition.x, feetPosition.y, feetPosition.z);
         final Vector3d vanilla = new Vector3d(
                 vanillaPosition.x, vanillaPosition.y, vanillaPosition.z);
-        final Vector3d rotatedPosition = state.isFirstPerson
-                ? vanilla
-                : PlayerGravity.rotateOffset(
-                        new Quaterniond(gravity.x, gravity.y, gravity.z, gravity.w),
-                        eye, vanilla);
-        final Vector3d offset = new Vector3d(rotatedPosition).sub(eye);
-        if (!state.isFirstPerson) {
-            state.pos = new Vec3(rotatedPosition.x, rotatedPosition.y, rotatedPosition.z);
-        } else {
-            state.pos = vanillaPosition;
-        }
+        final Quaterniond rotation = new Quaterniond(
+                gravity.x, gravity.y, gravity.z, gravity.w);
+        final Vector3d rotatedPosition = PlayerRenderFrame.rotateAboutAnchor(
+                rotation, feet, vanilla);
+        final Vector3d gravityEye = PlayerRenderFrame.eye(
+                feet, rotation, player.getEyeHeight());
+        final Vector3d offset = new Vector3d(rotatedPosition).sub(gravityEye);
+        state.pos = new Vec3(rotatedPosition.x, rotatedPosition.y, rotatedPosition.z);
         state.blockPos = BlockPos.containing(state.pos);
 
         // The direction the rotated camera shows, and the gravity up. These are
