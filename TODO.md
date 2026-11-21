@@ -114,4 +114,19 @@
 - [ ] 调试接触点层需要显式 `setDebugContactCapture(true)`；当前集成没有自动开启，所以该层通常只显示原点/重力轴
 - [ ] 多人结构的渲染/选择使用延迟姿态，而客户端碰撞使用最新快照；快速移动的远端结构可能有一个同步间隔的碰撞/视觉差异
 - [ ] `PlayerObbCollision` 仍是移动后校正，且其结构查询只在服务端；`Entity.move` 碰撞已覆盖普通实体移动
-- [ ] `PlayerObbCollision` 的结构盒仍用 `structure.pose()` 再减一次 COM；主碰撞/渲染使用未偏移体素，非零 COM 时两者可能错位，待统一
+
+### Native API v2
+
+- [x] `StructureContainer` / `ServerStructureContainer` / `StructureObserver` / `StructureContainerEvents` / `StructureArgumentType`
+- [x] `api/client`：`StructureRenderView` / `StructureRenderData` / `StructureRenderPose` / `StructurePoseProvider` / `StructureClipExtension` / `StructurePickExtension` / `EntityStructureTracking`
+- [x] `api/assembly`：`StructureGather`（26 邻接）、`StructureAssembly`、`AssemblyOptions`、`DisassembleOptions`、`AssemblyTransform`
+- [x] `api/block`：`BlockEntityStructureActor` + `StructurePhysicsContext`
+- [x] `api/physics/force`：`ForceGroup` / `QueuedForceGroup`（N、N·m，子步结束转冲量）
+- [x] `api/math/StructureMath` 与 `EntityStructureUtil` 的 `projectOutOfStructure` / `distanceSquaredWithStructures` / `getEyePositionInterpolated`
+- [x] `PlayerObbCollision` 结构盒改为 structure pose + 未偏移体素（不再二次减 COM）
+- [ ] constraints：fixed / rotary / generic 6-DOF、持久化和句柄
+- [ ] ropes / box physics objects
+- [ ] loading tickets、tracking-point SavedData、schematic 上下文
+- [ ] plot / plot-yard / `SubLevel` 风格的第二 `Level` 视图（Create Aeronautics drop-in 的阻塞项）
+- [ ] force totals / force debug UI、propeller / lift-provider / 完整 actor parity
+- [ ] 网络客户端容器仍是只读 `ClientStructureSnapshot`，不提供客户端 `PhysicsStructure`

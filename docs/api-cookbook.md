@@ -1,6 +1,6 @@
 # Crythst API 配方
 
-本文给出常见任务的完整调用方式。所有类名、方法名和参数顺序都以仓库源码为准。
+本文给出常见任务的完整调用方式，覆盖 native v2 API（容器、客户端视图、组装、actor/force 等）。所有类名、方法名和参数顺序都以仓库源码为准。
 
 > **线程规则**：`PhysicsWorld`、`BodyHandle`、`PhysicsStructure`、约束、角色控制器都只能在**服务端线程**使用。渲染线程只读取 `BodySnapshot`、`StructureRenderState`、`PhysicsDebugSnapshot` 等不可变快照。
 
@@ -950,3 +950,271 @@ physics.invalidateTerrain();   // 丢弃所有地形缓存（下一次 tick 重�
   "worldCollisionLookahead": 32.0
 }
 ```
+
+---
+
+## 17. 结构容器、观察者与命令参数
+
+```java
+import io.mikaple.crythst.api.CrythstApi;
+import io.mikaple.crythst.api.sublevel.ServerStructureContainer;
+import io.mikaple.crythst.api.sublevel.StructureContainer;
+import io.mikaple.crythst.api.sublevel.StructureContainerEvents;
+import io.mikaple.crythst.api.sublevel.StructureObserver;
+
+ServerStructureContainer container = CrythstApi.container(serverLevel);
+if (container != null) {
+    PhysicsStructure byId = container.byId(bodyId);
+    PhysicsStructure byName = container.byName("ship");
+    PhysicsStructure containing = container.containing(worldPoint);
+    List<PhysicsStructure> nearby = container.intersecting(aabb);
+
+    // 会通过容器自己的 create/remove/refresh 立即通知观察者
+    PhysicsStructure created = container.createStructure(definition);
+    container.removeStructure(created);
+}
+
+AutoCloseable ready = StructureContainerEvents.registerContainerReady(container -> {
+    // 每个服务端物理世界创建一次
+});
+
+StructureObserver observer = new StructureObserver() {
+    @Override public void onStructureAdded(PhysicsStructure structure) { }
+    @Override public void onStructureRemoved(PhysicsStructure structure) { }
+    @Override public void onStructureRefreshed(PhysicsStructure structure) { }
+};
+AutoCloseable observerHandle = StructureContainerEvents.registerObserver(observer);
+```
+
+命令参数：
+
+```java
+import io.mikaple.crythst.api.sublevel.StructureArgumentType;
+
+.then(Commands.argument("structure", StructureArgumentType.structure())
+        .executes(ctx -> {
+            PhysicsStructure structure =
+                    StructureArgumentType.getStructure(ctx, "structure");
+            return 1;
+        }))
+```
+
+支持 `42`、`0x2a`、`#42`、`name:ship`（或直接 `ship`）。结构没有独立名称字段；
+非数字名称只在 body user data 的字符串形式匹配时生效。
+
+> 客户端 `CrythstApi.container(clientLevel)` 在多人游戏里 `structures()` 为空，
+> 应使用 `ClientStructureContainer#snapshots()` / `snapshot(id)` 或第 18 节的
+> `StructureRenderView`。网络容器返回不可变快照，不返回 `PhysicsStructure`。
+
+---
+
+## 18. 客户端渲染视图、姿态、选择与追踪
+
+只在客户端加载 `io.mikaple.crythst.api.client.*`。
+
+### 18.1 Render view / pose
+
+```java
+import io.mikaple.crythst.api.client.StructureRenderPose;
+import io.mikaple.crythst.api.client.StructureRenderView;
+
+List<StructureRenderView> views = StructureRenderView.all();
+StructureRenderView view = StructureRenderView.get(bodyId);
+
+Transform3d pose = view.pose();
+Transform3d previous = view.previousPose();
+Transform3d current = view.currentPose();
+Aabb bounds = view.aabb();
+Vector3d velocity = view.velocityAt(worldPoint); // m/s
+
+StructureRenderPose renderPose = view.renderPose();
+Vector3d linear = renderPose.linearVelocity();    // m/s
+Vector3d angular = renderPose.angularVelocity();  // rad/s
+```
+
+集成服务器（单人）结构和网络结构都使用同一套 timestamped 时间线。同一 body id
+时集成服务器数据优先。`StructureRenderPose` 的端点与速度是渲染时间线有限差分，
+不是权威物理速度。
+
+### 18.2 自定义姿态 provider
+
+```java
+import io.mikaple.crythst.api.client.StructurePoseProvider;
+
+AutoCloseable handle = StructurePoseProvider.register((bodyId, partialTick, frameNanos) -> {
+    if (bodyId != myBodyId) {
+        return null; // 交给下一个 provider / 默认时间线
+    }
+    return StructureRenderPose.sampled(bodyId, myPose);
+});
+```
+
+后注册的 provider 优先；返回 `null` 会继续回退。默认 provider 忽略 `partialTick`，
+按帧时间采样一 tick 延迟的时间线。
+
+### 18.3 Clip / pick 扩展
+
+```java
+import io.mikaple.crythst.api.client.StructureClipExtension;
+import io.mikaple.crythst.api.client.StructurePickExtension;
+
+BlockHitResult merged = StructureClipExtension.clip(clientLevel, clipContext);
+
+try (AutoCloseable ignored = StructureClipExtension.ignore(bodyId)) {
+    // 当前线程的后续 clip 忽略该结构
+}
+try (AutoCloseable ignored = StructureClipExtension.ignoreAll()) {
+    // 当前线程的后续 clip 只考虑真实方块
+}
+
+StructureBlockHitResult hitNow = StructurePickExtension.current();
+StructureBlockHitResult hitRay = StructurePickExtension.raycast(reach);
+```
+
+`ignore` 是线程本地且可嵌套；它不会修改世界或结构，也不重写已经生成的命中对象。
+真实方块始终优先。
+
+### 18.4 客户端追踪 / 继承速度
+
+```java
+import io.mikaple.crythst.api.client.EntityStructureTracking;
+
+StructureRenderView tracking =
+        EntityStructureTracking.getTrackingStructure(entity);
+Vector3d inherited = EntityStructureTracking.getInheritedVelocity(entity); // m/s
+
+EntityStructureTracking.track(entity, tracking); // 有接触时显式记录，最准确
+EntityStructureTracking.track(entity, bodyId);
+EntityStructureTracking.clear(entity);
+```
+
+没有显式记录时，会先用最近一次客户端碰撞 trace（必须新鲜且几何上覆盖实体），
+再退回最近的渲染 AABB。速度来自渲染姿态有限差分，包含角速度项，不读 Bullet body。
+
+---
+
+## 19. 世界方块组装与拆解
+
+```java
+import io.mikaple.crythst.api.assembly.AssemblyOptions;
+import io.mikaple.crythst.api.assembly.DisassembleOptions;
+import io.mikaple.crythst.api.assembly.StructureAssembly;
+import io.mikaple.crythst.api.assembly.StructureGather;
+
+StructureGather.GatherResult gathered =
+        StructureGather.gatherConnectedBlocks(serverLevel, origin, 4096, pos -> true);
+if (!gathered.success()) {
+    return; // NO_BLOCKS / TOO_MANY
+}
+
+PhysicsStructure structure = StructureAssembly.assemble(
+        serverLevel,
+        gathered.bounds().min(),
+        gathered.blocks(),
+        AssemblyOptions.defaults()
+                .withType(BodyType.DYNAMIC)
+                .withBlockScale(1.0)
+                .withRemoveFromWorld(true)
+                .withBlockEntities(true));
+
+StructureAssembly.disassemble(serverLevel, structure,
+        DisassembleOptions.defaults()
+                .withRemoveStructure(true)
+                .withBlockEntities(true)
+                .withDrops(false));
+```
+
+- 采集使用 **26 邻接**；空气、流体、无碰撞形状方块不参与也不传播。
+- 结果按 `x,y,z` 确定性排序；`MAX_BLOCKS = 1_000_000`。
+- `assemble` 先创建 volume/body，再移除世界方块；失败会回滚已移除方块并关闭 body。
+- 移除使用抑制更新的 flags，不走 `destroyBlock`，所以不会掉落物品。
+- 方块实体 NBT 会捕获，并在辅助空 Level 启用时重挂；实体**不会**被搬进结构。
+- `AssemblyOptions.pose` 相对 anchor：默认选项下捕获区域最小方块保持原世界位置。
+- `disassemble` 按当前 pose + `blockScale` 把未偏移体素写回世界；越界或不可替换的位置
+  默认跳过，`withDrops(true)` 才会掉落。
+
+坐标工具：
+
+```java
+import io.mikaple.crythst.api.assembly.AssemblyTransform;
+
+AssemblyTransform transform =
+        new AssemblyTransform(structure.pose(), structure.blockScale());
+Vector3d centre = transform.voxelCenter(x, y, z);
+BlockPos worldPos = transform.voxelToWorldBlock(x, y, z);
+Vector3d voxel = transform.worldToVoxel(worldPoint);
+```
+
+> 这是**世界空间**组装，不是 Sable 的 plot / sub-level 组装：没有 plot 分配、
+> plot chunk holder 或第二个 `Level` 视图。需要 CA 风格 `SubLevel` 的代码必须移植。
+
+---
+
+## 20. 方块实体 actor 与力组
+
+```java
+import io.mikaple.crythst.api.block.BlockEntityStructureActor;
+import io.mikaple.crythst.api.block.StructurePhysicsContext;
+import io.mikaple.crythst.api.physics.force.ForceGroup;
+import io.mikaple.crythst.api.physics.force.QueuedForceGroup;
+
+public final class ThrusterBlockEntity extends BlockEntity
+        implements BlockEntityStructureActor {
+    private static final ForceGroup THRUST = new ForceGroup(
+            Component.literal("thruster"), null, 0x66CCFF, true);
+
+    @Override
+    public void structurePhysicsTick(StructurePhysicsContext context) {
+        QueuedForceGroup group = context.forceGroup(THRUST);
+        double throttle = 1.0;
+        group.applyPointForce(
+                context.centerOfMassWorld(),
+                new Vector3d(0.0, 500.0 * throttle, 0.0)); // N
+    }
+}
+```
+
+- actor 每个固定物理子步在积分前调用一次；用 `timeStepSeconds`，不要假设 1/20s。
+- 只有位于**辅助空 Level** 的方块实体才会被发现；`subLevelEnabled=false` 或空 Level
+  创建失败时没有 actor。
+- actor 列表按 structure 缓存，在创建、refresh/reindex、持久化恢复和移除后重建。
+  运行中给已有方块实体新增 actor 实现而不同步刷新，不会被发现。
+- `context` 和 `QueuedForceGroup` 只在本次回调有效，不要跨子步保存。
+- `ForceGroup` 是稳定 key（record equality）；用相同实例/相同字段值避免缓存膨胀。
+- 力单位是 N，torque 是 N·m；Crythst 在子步结束用 `dt` 转成 N·s / N·m·s 后施加。
+  不要自己乘 `dt`。
+- `StructurePhysicsRuntime` 由 `LevelPhysics` 持有并在 `beforeStep` 调用；普通模组
+  不需要自己创建。它缓存每个 structure 每个 force group 的累加器，refresh/remove
+  会丢弃缓存。
+
+---
+
+## 21. 坐标 / 四元数工具
+
+```java
+import io.mikaple.crythst.api.math.StructureMath;
+
+Vector3d blockCentre = StructureMath.atCenterOf(blockPos);       // (x+0.5, y+0.5, z+0.5)
+Vector3d blockLower = StructureMath.atLowerCornerOf(blockPos);   // (x, y, z)
+Vec3 mc = StructureMath.toMojang(jomlVec);
+Vector3d joml = StructureMath.toJoml(mc);
+Quaterniond q = StructureMath.toJoml(mcQuaternion);
+Quaternionf f = StructureMath.toMojang(jomlQuaternion);
+```
+
+`StructureMath` 是纯函数，客户端/服务端都可加载；带 `dest` 的重载会覆盖并返回 dest。
+`ZERO` / `QUAT_IDENTITY` 以只读 JOML 接口暴露，不要强转后修改。
+
+---
+
+## 22. 新 API 的限制
+
+- 网络客户端容器返回 `ClientStructureSnapshot`，不是 `PhysicsStructure`；
+  `byId` / `containing` 在多人客户端不会解析网络快照。
+- 组装是**世界空间**操作，不提供 plot / plot-yard / 第二 `Level` 视图。
+- actor 需要辅助空 Level；没有它就没有 actor 发现。
+- actor 发现和 force-group 缓存都需要 refresh/reindex/remove 来清理旧状态。
+- 尚未提供：constraints、ropes、box objects、loading tickets、tracking-point
+  SavedData、schematic 上下文、propeller/lift-provider、force totals/debug UI。
+- 不提供 `dev.ryanhcode.sable.*` shim，也不是 Create Aeronautics 的二进制 drop-in
+  替代。完整差距矩阵见 [`API_GAP_ANALYSIS.md`](../API_GAP_ANALYSIS.md)。

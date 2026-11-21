@@ -116,23 +116,20 @@ body AABB does not intersect the player's expanded AABB. Otherwise every merged
 `structure.pose()`:
 
 ```text
-localCentre = (voxelCentre * blockScale) - (centreOfMass * blockScale)
+localCentre = voxelCentre * blockScale
 worldCentre = pose.transformPoint(localCentre)
 halfExtents = (voxelSize * blockScale) / 2
 rotation    = pose.rotation()
 ```
 
+The voxel centres are **unshifted**, matching the render convention and the
+main `Entity.move` collision path. `structure.pose()` is already the
+structure-origin pose; subtracting the centre of mass again would shift every
+box by `-R*COM`.
+
 The player OBB is then tested against each oriented voxel box. The structure
 boxes are physics-collider boxes, not individual block states, so a merged box
 is treated as one solid rectangular obstacle.
-
-> Convention note: the main movement collision and the structure renderer use
-> `structure.pose()` with **unshifted** voxel coordinates. This older OBB pass
-> currently also subtracts the centre of mass from each local box centre, which
-> can offset its structure approximation relative to the rendered surface when
-> the centre of mass is not at the structure origin. The terrain part of the
-> pass is unaffected. This is a code-level convention mismatch to fix; do not
-> copy this formula into new collision code.
 
 ## Correction loop
 

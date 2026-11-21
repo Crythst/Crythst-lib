@@ -144,25 +144,30 @@
 
 ---
 
-## 公开 API（v1）
+## 公开 API（native v2）
 
 第三方模组应优先使用 `io.mikaple.crythst.api`：
 
 | 能力 | 入口 |
 | --- | --- |
-| 结构/刚体查询 | `CrythstApi.structures`, `structuresIn`, `structureAt`, `body` |
+| 结构/刚体查询 | `CrythstApi.structures`, `container`, `structuresIn`, `structureAt`, `body` |
 | 物理操作 | `CrythstApi.physics(ServerLevel)` → `PhysicsPipeline` / `RigidBodyHandle` |
+| 结构容器/观察者 | `StructureContainer`, `ServerStructureContainer`, `StructureContainerEvents`, `StructureObserver`, `StructureArgumentType` |
 | 方块钩子 | `StructureBlockHooks` + `BlockStructure*` 接口 |
-| 实体工具 | `EntityStructureUtil` |
-| 事件 | `CrythstEvents`（固定物理子步的 pre/post tick、容器就绪） |
+| 实体工具 | `EntityStructureUtil`（containing、velocity、distance、eye interpolation、local push/pop、projectOutOfStructure） |
+| 组装/拆解 | `StructureGather`, `StructureAssembly`, `AssemblyOptions`, `DisassembleOptions`, `AssemblyTransform` |
+| 方块实体 actor/力 | `BlockEntityStructureActor`, `StructurePhysicsContext`, `ForceGroup`, `QueuedForceGroup` |
+| 客户端视图/姿态/选择 | `api/client` 的 render view、pose provider、clip/pick extension、tracking |
+| 数学工具 | `StructureMath` |
+| 事件 | `CrythstEvents`（固定物理子步 pre/post tick）+ `StructureContainerEvents` |
 
 ```java
+ServerStructureContainer container = CrythstApi.container(serverLevel);
 PhysicsPipeline physics = CrythstApi.physics(serverLevel);
 physics.applyImpulseAtPoint(bodyId, worldPoint, new Vector3d(0.0, 800.0, 0.0));
 ```
 
-完整签名、单位、线程约束、钩子优先级和 v1 缺口见 [docs/api.md](docs/api.md)。
-公开 API 不提供 `dev.ryanhcode.sable.*` 兼容包。
+完整签名、单位、线程约束、钩子优先级、组装/actor/force 语义和当前缺口见 [docs/api.md](docs/api.md)，常见配方见 [docs/api-cookbook.md](docs/api-cookbook.md)。多人客户端容器返回只读 `ClientStructureSnapshot`，不是 `PhysicsStructure`；组装是世界空间操作，不是 plot/sub-level 组装。公开 API 不提供 `dev.ryanhcode.sable.*` 兼容包；Create Aeronautics 差距分析见 [API_GAP_ANALYSIS.md](API_GAP_ANALYSIS.md)。
 
 ## 快速开始
 
@@ -546,6 +551,7 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 - 物品 star special model、无 BER submit 的方块特殊渲染；
 - 灰度图多公式、外轮廓、原版钻石素材、运行时实体纹理（无资源重载）；
 - F3+F6 分层的 `crythst:physics*` 调试渲染（默认关闭）和 `crythst:structure_target` 屏幕文本；
+- native API v2：结构容器/观察者/命令参数、客户端 render view/pose provider/clip/pick/tracking、世界空间组装/拆解、方块实体 actor + force group、`StructureMath`；
 - 结构持久化（含方块实体 NBT）、多人结构同步；
 - 沉浸式传送门 v1（传送、玩家/实体/物理体、动画表面）。
 
@@ -554,6 +560,7 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 - 传送门“看到另一侧”的实时视口、递归/模板缓冲；
 - 移动传送门、跨维度传送、传送门持久化与同步；
 - 结构方块实体客户端渲染与更完整的 BE tick；
+- native API 后续：constraints、ropes、box objects、loading tickets、tracking points、force totals/debug UI；
 - 真正的 swept OBB 玩家移动求解（`PlayerObbCollision` 当前仍是移动后校正）；
 - 更多 Create 渲染/交互兼容和性能剖析。
 
@@ -596,7 +603,8 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 - [结构持久化](docs/structure-persistence.md)
 - [多人同步](docs/multiplayer-sync.md)
 - [平台与原生库](docs/platforms.md)
-- [公开 API（v1）](docs/api.md)
+- [公开 API（native v2）](docs/api.md)
 - [API 配方](docs/api-cookbook.md)
+- [Create Aeronautics API 差距分析](API_GAP_ANALYSIS.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)
 - [设计声明](NOTICE)

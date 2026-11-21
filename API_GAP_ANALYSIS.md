@@ -2,6 +2,13 @@
 
 Date: 2026-11-22
 
+> **API status update:** native API v2 has since landed structure containers and
+> observers, client render views/pose providers/clip-pick extensions, world-space
+> assembly/disassembly, block-entity actors and queued force groups, and
+> `StructureMath`. The remaining blockers below are still accurate: a
+> `SubLevel`/plot-like level view, constraints/ropes, tickets/tracking points and
+> render/BE compatibility. See [`docs/api.md`](docs/api.md) for the current API.
+
 Scope: analysis of `~/IdeaProjects/create-aeronautics-fabric` (Create Aeronautics,
 Offroad, Simulated) against the current Crythst native API and internals. The goal is
 to answer one question:
@@ -63,7 +70,8 @@ Implemented and stable enough to build on:
 - Voxel collision, terrain collision, OBB SAT, ray/sweep, characters.
 - Auxiliary void `ServerLevel` (`EmptyPhysicsLevel`) that ticks copied structure blocks
   and block entities in remapped regions.
-- Batched structure rendering, per-structure render poses, block-entity rendering.
+- Batched structure rendering, per-structure render poses and block-state rendering
+  (block-entity render dispatch is still missing).
 - Structure persistence and multiplayer sync.
 - Movement-integrated entity collision and `ClientLevel.clip` structure selection.
 - Native API v1:
@@ -73,21 +81,27 @@ Implemented and stable enough to build on:
   - `EntityStructureUtil` (containing, local projection, velocity)
   - `CrythstEvents` pre/post physics tick, container-ready
   - `CrythstApi` facade.
-- In progress: block-entity physics actor callbacks and queued force groups
-  (needed by EnderTech).
+- API v2: block-entity physics actors and queued force groups (needed by EnderTech).
+- API v2: per-level server/client structure containers, observers and ready events.
+- API v2: world-space gather/assemble/disassemble and `AssemblyTransform`.
+- API v2: client render views, pose providers, clip/pick extensions and tracking.
+- API v2: `StructureMath`.
 
 What it does **not** have:
 
 - A public `SubLevel`-like object that behaves like a `Level` over a structure's blocks.
 - Plot/plot-yard allocation, plot-local coordinates, plot chunk holders.
-- Per-level server/client sub-level containers and observers.
-- Assembly/disassembly that moves blocks between the world and a sub-level.
+- Assembly semantics that move blocks into a plot/sub-level; current assembly is
+  world-space only.
 - Physics constraints, ropes, box physics objects, force totals.
-- Sub-level render-data API and Create renderer compatibility.
+- Block-entity render dispatch and full Create renderer compatibility.
 - Loading tickets, tracking points, water occlusion, heat maps, sub-level storage.
+- A client network container that returns `PhysicsStructure`; it returns immutable
+  snapshots.
 - Mixin-facing extension interfaces used by downstream mods
   (`ClipContextExtension`, `LevelPoseProviderExtension`, `EntityMovementExtension`,
-  `SubLevelContainerHolder`, …).
+  `SubLevelContainerHolder`, …), although equivalent native operations exist for
+  clip, tracking and pose sampling.
 
 ---
 
@@ -99,22 +113,22 @@ gameplay features; **P2** = integration/polish; **P3** = optional.
 | Area | Create Aeronautics usage | Crythst now | Gap | Priority |
 |---|---|---|---|---|
 | Sub-level as a level | `SubLevel` used as `Level`: `getBlockState`, `setBlockAndUpdate`, `getBlockEntity`, `addFreshEntity`, `addParticle`, `playSound`, `getChunkSource`, `registryAccess`, `dimension`, `getGameTime` | `EmptyPhysicsLevel` exists internally but is not exposed as a per-structure `Level` view; coordinates are remapped to void regions | **StructureLevelView** with world↔local/plot coordinate projection, block/fluid/BE/entity access, sound/particles, chunk/registry access | **P0** |
-| Containers/lifecycle | `SubLevelContainer.getContainer(level)`, `ServerSubLevelContainer`, `ClientSubLevelContainer`, observers, container-ready events | `LevelPhysics` per dimension, no public container/observer/allocate API | `StructureContainer` (common/server/client), lookup by level/position/id, allocate/remove, observers, ready event | **P0** |
-| Assembly/disassembly | `SubLevelAssemblyHelper.assembleBlocks`, `gatherConnectedBlocks`, `moveBlocks`, `moveTrackingPoints`, `AssemblyTransform` | World-space structures are created by commands/interaction; no general assembly/disassembly API | gather + assemble/disassemble + preserve pose/velocity/BE/entities; plot-center semantics or an equivalent | **P0** |
-| Entity/world queries | `Sable.HELPER.getContaining`, `getContainingClient`, `getTrackingSubLevel`, `projectOutOfSubLevel`, `distanceSquaredWithSubLevels`, `getEyePositionInterpolated`, `getVelocity` | `EntityStructureUtil` covers containing/local projection/velocity, server-oriented | client interpolation, `projectOutOfSubLevel`, sub-level-aware distance/clip helpers, tracking structure | **P0/P1** |
+| Containers/lifecycle | `SubLevelContainer.getContainer(level)`, `ServerSubLevelContainer`, `ClientSubLevelContainer`, observers, container-ready events | API v2 `StructureContainer`/`ServerStructureContainer`, observers, ready events and `StructureArgumentType`; client network container returns snapshots | Plot/sub-level lifecycle and client `PhysicsStructure` containers | **P0/P1** |
+| Assembly/disassembly | `SubLevelAssemblyHelper.assembleBlocks`, `gatherConnectedBlocks`, `moveBlocks`, `moveTrackingPoints`, `AssemblyTransform` | API v2 world-space `StructureGather`/`StructureAssembly`/`AssemblyTransform`; captures BE NBT, leaves entities in world | plot-center/sub-level assembly and entity transfer | **P0/P1** |
+| Entity/world queries | `Sable.HELPER.getContaining`, `getContainingClient`, `getTrackingSubLevel`, `projectOutOfSubLevel`, `distanceSquaredWithSubLevels`, `getEyePositionInterpolated`, `getVelocity` | API v2 `EntityStructureUtil` adds `projectOutOfStructure`, `distanceSquaredWithStructures`, interpolated eye position; `EntityStructureTracking` covers client tracking/inherited velocity | Sable-named adapters and client `PhysicsStructure` lookup | **P1** |
 | Physics handles | `RigidBodyHandle` velocities, impulses, mass | `RigidBodyHandle`/`PhysicsPipeline` v1 | mostly covered; verify force/torque units and per-body handles | **P1** |
-| Force groups | `ForceGroup`, `QueuedForceGroup`, `applyAndRecordPointForce`, `ForceGroups`, `ForceTotal` | v2 in progress (actor + queued forces) | force totals/groups, per-group debug/tracking | **P1** |
+| Force groups | `ForceGroup`, `QueuedForceGroup`, `applyAndRecordPointForce`, `ForceGroups`, `ForceTotal` | API v2 `ForceGroup`/`QueuedForceGroup` with N and N·m, per-substep conversion; actor discovery needs auxiliary level | force totals and debug UI | **P1/P2** |
 | Constraints | fixed/free/rotary/generic configurations and handles; `addConstraint/removeConstraint` | none | Bullet 6-DOF/fixed/rotary adapters, persistence and handles | **P1** |
 | Ropes/box objects | rope/box physics objects and handles | none | rope/box bodies and handles | **P2** |
-| Block hooks/actors | `BlockEntitySubLevelActor`, `BlockSubLevelAssemblyListener`, `BlockSubLevelLiftProvider`, `BlockSubLevelCollisionShape`, propellers | actor + shape + assembly/change hooks partially/landing | lift provider, propeller interface, block-BE actor parity | **P1** |
+| Block hooks/actors | `BlockEntitySubLevelActor`, `BlockSubLevelAssemblyListener`, `BlockSubLevelLiftProvider`, `BlockSubLevelCollisionShape`, propellers | API v2 `BlockEntityStructureActor`, shape/assembly/change hooks | lift provider, propeller interface, broader actor parity | **P1/P2** |
 | Mass/COM | `getMassTracker().getMass/getCenterOfMass`, per-block mass | `MassData`/`RigidBodyHandle` | merged mass tracker and per-cell APIs | **P1** |
-| Client render | `SubLevel#renderPose`, `getRenderData`, custom BE renderers, render regions | own batched renderer; no public sub-level render-data API | `StructureRenderData`/pose/client container, BE render dispatcher integration | **P2** |
-| Selection/clip extensions | `ClipContextExtension` (ignored sub-level, ignore main level), `LevelPoseProviderExtension` | `ClientLevel.clip` integration works internally; extension interfaces not public | publish `StructureClipContext`/ignore API and client pose provider | **P2** |
-| Movement extensions | `EntityMovementExtension` tracking sub-level/inherited velocity; `LivingEntityMovementExtension` | movement-integrated collision internally | expose tracking structure/inherited velocity for CA music/camera logic | **P2** |
+| Client render | `SubLevel#renderPose`, `getRenderData`, custom BE renderers, render regions | API v2 `StructureRenderView`/`StructureRenderData`/`StructureRenderPose`/`StructurePoseProvider`; own batched renderer | block-entity render dispatcher integration | **P2** |
+| Selection/clip extensions | `ClipContextExtension` (ignored sub-level, ignore main level), `LevelPoseProviderExtension` | API v2 `StructureClipExtension` (thread-local ignore) and `StructurePickExtension`; client pose provider | Sable-named interface adapters | **P2** |
+| Movement extensions | `EntityMovementExtension` tracking sub-level/inherited velocity; `LivingEntityMovementExtension` | API v2 `EntityStructureTracking` exposes tracking structure and inherited velocity client-side | Sable extension interfaces and authoritative client containers | **P2** |
 | Persistence/storage | `SubLevelData`, holding sub-levels, `GlobalSavedSubLevelPointer` | structure persistence exists, different model | plot/sub-level storage compatibility or adapter | **P2** |
 | Tickets/tracking points | `SubLevelLoadingTicket`, `SubLevelTrackingPointSavedData`, `TrackingPoint` | none | loading tickets + world tracking points | **P2** |
 | Water/heat | `WaterOcclusionContainer`, `SubLevelHeatMapManager` | none | optional systems | **P3** |
-| Platform/commands | `SableEventPlatform`, `SubLevelArgumentType`, command helpers | `CrythstEvents`, no `SubLevel` argument type | event bridge + command argument | **P2** |
+| Platform/commands | `SableEventPlatform`, `SubLevelArgumentType`, command helpers | API v2 `StructureContainerEvents`, `CrythstEvents`, `StructureArgumentType` | Sable platform bridge and broader command helpers | **P2** |
 | Internals used by CA | `LevelPlot`, `PlotChunkHolder`, `ServerLevelPlot`, render dispatcher, mixin interfaces | different architecture | cannot be covered by a clean native API; CA needs porting or an emulation layer | **blocking for drop-in** |
 
 ---
@@ -162,13 +176,13 @@ independent-implementation policy.
 ### Stage B — physics parity (P1)
 
 - Constraints: fixed/free/rotary/generic configurations, handles, add/remove.
-- Force groups/totals (v2 in progress) and per-body mass tracker.
-- Block-entity actors (v2 in progress), lift providers, propellers.
-- Expose tracking structure and inherited velocity.
+- Force totals/debug UI (force groups themselves are v2) and per-body mass tracker.
+- Lift providers, propellers and broader block-entity actor parity.
+- Tracking structure and inherited velocity are exposed by `EntityStructureTracking`.
 
 ### Stage C — client/render + compatibility (P2)
 
-- Public `StructureRenderData`/pose/render-region API.
+- `StructureRenderData`/pose API exists; render-region integration remains.
 - Block-entity render dispatch for structure BEs.
 - Clip-context extension and client pose-provider extension.
 - Create/Sable renderer compatibility bridge (if porting CA).
