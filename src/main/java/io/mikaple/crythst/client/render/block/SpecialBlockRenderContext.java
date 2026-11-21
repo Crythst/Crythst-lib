@@ -9,7 +9,13 @@ import net.minecraft.world.phys.Vec3;
  * Immutable data passed to a {@link SpecialBlockRenderer} for one block in one
  * frame.
  *
- * @param pos         immutable block position
+ * <p>For an ordinary world block, {@code pos} is the actual block position. For
+ * a block inside a rotating physics structure it is a representative world cell
+ * chosen for level/light lookups; the exact rotated block centre is supplied
+ * separately to the additive {@link SpecialBlockRenderer} structure overload.
+ * The pose is exact in both cases.</p>
+ *
+ * @param pos         immutable block position (representative for structures)
  * @param state       the block state currently stored at {@code pos}
  * @param level       the client level containing the block
  * @param partialTick the current frame's partial tick, for animation

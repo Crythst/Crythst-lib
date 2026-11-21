@@ -579,9 +579,10 @@ final class StructureBatchCache {
 
         long countVertices() {
             long count = 0L;
+            final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
             for (BlockState state : states) {
                 if (state == null || state.isAir()
-                        || SpecialBlockRenderers.isRegistered(state.getBlock())) {
+                        || (anySpecial && SpecialBlockRenderers.isRegistered(state.getBlock()))) {
                     continue;
                 }
                 final BlockGeometry geometry = BlockGeometryCache.get(state);

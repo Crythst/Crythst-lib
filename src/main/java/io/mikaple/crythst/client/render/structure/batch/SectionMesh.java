@@ -65,12 +65,13 @@ final class SectionMesh {
      * bounds. Thin sections therefore do not pay for a full 4096-entry array.</p>
      */
     static SectionMesh[] build(BlockState[] states, int sizeX, int sizeY, int sizeZ) {
+        final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
         final BlockGeometry[] geometries = new BlockGeometry[states.length];
         final int[] vertexCounts = new int[3];
         for (int index = 0; index < states.length; index++) {
             final BlockState state = states[index];
             if (state == null || state.isAir()
-                    || SpecialBlockRenderers.isRegistered(state.getBlock())) {
+                    || (anySpecial && SpecialBlockRenderers.isRegistered(state.getBlock()))) {
                 continue;
             }
             final BlockGeometry geometry = BlockGeometryCache.get(state);

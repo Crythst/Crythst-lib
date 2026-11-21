@@ -10,10 +10,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * Client-side registry mapping a {@link Block} to its special renderer.
  *
  * <p>Registration is expected during client initialisation. The registry is
- * only consulted by {@link SpecialBlockRenderManager}'s client-tick scanner;
- * adding a renderer after the first scan simply takes effect on the next scan.
- * The map is concurrent so a registration cannot corrupt an in-flight render
- * iteration.</p>
+ * consulted by {@link SpecialBlockRenderManager}'s client-tick scanner and by
+ * the batched structure renderer. Adding a renderer after the first scan takes
+ * effect on the next scan (world blocks) or triggers a structure geometry
+ * rebuild on the next frame (physics-body blocks). The map is concurrent so a
+ * registration cannot corrupt an in-flight render iteration.</p>
  */
 public final class SpecialBlockRenderers {
     private static final Map<Block, SpecialBlockRenderer> RENDERERS = new ConcurrentHashMap<>();

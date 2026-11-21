@@ -561,12 +561,13 @@ public final class BatchedStructureRenderer {
         final Transform3d pose = body.framePose;
         final double scale = body.blockScale;
         final int light = lightAt(section.frameCenterX, section.frameCenterY, section.frameCenterZ);
+        final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
         int submitted = 0;
 
         for (int index = 0; index < section.states.length && submitted < budget; index++) {
             final BlockState blockState = section.states[index];
             if (blockState == null || blockState.isAir()
-                    || SpecialBlockRenderers.isRegistered(blockState.getBlock())) {
+                    || (anySpecial && SpecialBlockRenderers.isRegistered(blockState.getBlock()))) {
                 continue;
             }
             final BlockGeometry geometry = BlockGeometryCache.get(blockState);
