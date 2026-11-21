@@ -170,7 +170,7 @@ public final class PortalManager {
         synchronized (LOCK) {
             final List<PortalSnapshot> result = new ArrayList<>(BY_NAME.size());
             for (Portal portal : BY_NAME.values()) {
-                result.add(portal.snapshot());
+                result.add(PortalSnapshot.of(portal, BY_ID.get(portal.linkedPortalId())));
             }
             return List.copyOf(result);
         }
@@ -181,7 +181,7 @@ public final class PortalManager {
             final List<PortalSnapshot> result = new ArrayList<>();
             for (Portal portal : BY_NAME.values()) {
                 if (portal.dimension().equals(dimension)) {
-                    result.add(portal.snapshot());
+                    result.add(PortalSnapshot.of(portal, BY_ID.get(portal.linkedPortalId())));
                 }
             }
             return List.copyOf(result);

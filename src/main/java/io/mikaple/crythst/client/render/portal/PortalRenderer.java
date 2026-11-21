@@ -2,6 +2,7 @@ package io.mikaple.crythst.client.render.portal;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
@@ -11,27 +12,33 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
+import org.joml.Matrix4f;
 import org.joml.Vector3d;
+import org.joml.Vector4f;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Renders the animated portal surface from {@code LevelRenderEvents.BEFORE_GIZMOS}.
+ * Renders the portal surface from {@code LevelRenderEvents.BEFORE_GIZMOS}.
  *
- * <p>Every portal is submitted as one camera-relative quad with the procedural
- * {@code crythst:core/portal} shader. Only faces turned towards the camera are
- * emitted (the pipeline itself disables hardware culling, so a portal seen from
- * behind is drawn with reversed winding and mirrored UVs rather than
- * disappearing).</p>
+ * <p>For a portal with a fresh destination capture, the quad samples the
+ * offscreen texture using the portal's screen-space UVs. The destination view
+ * was rendered from the main camera transformed by the portal link, with the
+ * same projection, so the image lines up exactly with the portal opening.</p>
  *
- * <p>This is the v1 surface, not a recursive view: it shows an animated star
- * field instead of the space behind the linked portal. Recursive/template
- * rendering is a later TODO item.</p>
+ * <p>When no capture is available (first frames, throttling, cross-dimension,
+ * invisible destination, shader failure) the same quad falls back to the
+ * procedural animated surface. Nested portals inside a capture pass are drawn
+ * with the procedural shader too, which keeps the recursion depth at one and
+ * prevents texture feedback.</p>
  */
 public final class PortalRenderer {
     private static final double MAX_RENDER_DISTANCE = 512.0;
@@ -43,13 +50,14 @@ public final class PortalRenderer {
     private static final float FALLBACK_ALPHA = 0.72f;
 
     private static volatile boolean registered;
+    private static volatile boolean viewFailureLogged;
 
     private PortalRenderer() {
     }
 
     /**
-     * Registers the client-tick snapshot refresh and the level render hook.
-     * Call once from the client initializer.
+     * Registers the client-tick snapshot refresh, the destination capture hook
+     * and the level render hook. Call once from the client initializer.
      */
     public static void register() {
         if (registered) {
@@ -57,9 +65,10 @@ public final class PortalRenderer {
         }
         registered = true;
         PortalClientView.register();
+        PortalCapture.register();
         LevelRenderEvents.BEFORE_GIZMOS.register(PortalRenderer::render);
-        io.mikaple.crythst.Crythst.LOGGER.info(
-                "Crythst portal surface renderer registered (procedural star shader)");
+        Crythst.LOGGER.info(
+                "Crythst portal renderer registered (destination capture + procedural fallback)");
     }
 
     public static void render(LevelRenderContext context) {
@@ -80,40 +89,90 @@ public final class PortalRenderer {
         }
 
         final ResourceKey<Level> dimension = minecraft.level.dimension();
-        final List<Quad> quads = new ArrayList<>(snapshots.size());
+        final Matrix4f viewProjection = new Matrix4f(camera.projectionMatrix)
+                .mul(camera.viewRotationMatrix);
+
+        final Map<RenderType, List<Quad>> groups = new LinkedHashMap<>();
+        final List<Quad> coloredQuads = new ArrayList<>();
+        final boolean shaderAvailable = PortalRenderTypes.available();
+        final boolean capturing = PortalCapture.isCapturing();
+
         for (PortalSnapshot snapshot : snapshots) {
             if (!snapshot.dimension().equals(dimension)) {
                 continue;
             }
-            final Quad quad = buildQuad(snapshot, camera);
-            if (quad != null) {
-                quads.add(quad);
+            final Quad quad = buildQuad(snapshot, camera, viewProjection);
+            if (quad == null) {
+                continue;
+            }
+
+            if (!shaderAvailable) {
+                coloredQuads.add(quad);
+                continue;
+            }
+
+            final RenderType type = chooseType(snapshot, capturing);
+            if (type == null) {
+                coloredQuads.add(quad);
+            } else {
+                groups.computeIfAbsent(type, key -> new ArrayList<>()).add(quad);
             }
         }
-        if (quads.isEmpty()) {
-            return;
-        }
 
-        // The pipeline does not write depth, so draw far portals first for a
-        // stable painter's order when two surfaces overlap on screen.
-        quads.sort(Comparator.comparingDouble(Quad::distanceSquared).reversed());
-
-        if (PortalRenderTypes.available()) {
+        for (Map.Entry<RenderType, List<Quad>> entry : groups.entrySet()) {
+            final List<Quad> quads = entry.getValue();
+            quads.sort(Comparator.comparingDouble(Quad::distanceSquared).reversed());
+            final RenderType type = entry.getKey();
             try {
-                final RenderType type = PortalRenderTypes.portal();
                 collector.submitCustomGeometry(new PoseStack(), type,
                         (pose, consumer) -> emitShader(quads, pose, consumer));
-                return;
             } catch (Throwable error) {
+                if (!viewFailureLogged) {
+                    viewFailureLogged = true;
+                    Crythst.LOGGER.warn("Crythst portal geometry submission failed; "
+                            + "using coloured fallback", error);
+                }
                 PortalRenderTypes.markFailed(error);
+                coloredQuads.addAll(quads);
             }
         }
 
-        collector.submitCustomGeometry(new PoseStack(), RenderTypes.debugFilledBox(),
-                (pose, consumer) -> emitFallback(quads, pose, consumer));
+        if (!coloredQuads.isEmpty()) {
+            coloredQuads.sort(Comparator.comparingDouble(Quad::distanceSquared).reversed());
+            collector.submitCustomGeometry(new PoseStack(), RenderTypes.debugFilledBox(),
+                    (pose, consumer) -> emitFallback(coloredQuads, pose, consumer));
+        }
     }
 
-    private static Quad buildQuad(PortalSnapshot snapshot, CameraRenderState camera) {
+    /**
+     * Picks the captured-view render type when a texture is ready, otherwise
+     * the procedural surface.
+     */
+    private static RenderType chooseType(PortalSnapshot snapshot, boolean capturing) {
+        if (!capturing && PortalCapture.hasView(snapshot.id())) {
+            final Identifier textureId = PortalCapture.textureId(snapshot.id());
+            if (textureId != null) {
+                try {
+                    return PortalRenderTypes.view(textureId);
+                } catch (Throwable error) {
+                    if (!viewFailureLogged) {
+                        viewFailureLogged = true;
+                        Crythst.LOGGER.warn("Crythst portal view render type failed; "
+                                + "falling back to the procedural surface", error);
+                    }
+                }
+            }
+        }
+        try {
+            return PortalRenderTypes.procedural();
+        } catch (Throwable error) {
+            PortalRenderTypes.markFailed(error);
+            return null;
+        }
+    }
+
+    private static Quad buildQuad(PortalSnapshot snapshot, CameraRenderState camera,
+                                  Matrix4f viewProjection) {
         final var plane = snapshot.plane();
         final Vector3d origin = plane.origin();
         final double dx = camera.pos.x - origin.x;
@@ -136,26 +195,30 @@ public final class PortalRenderer {
         final boolean front = dx * normal.x + dy * normal.y + dz * normal.z >= 0.0;
 
         final Vector3d[] corners = plane.corners();
-        // Corners are bottom-left, bottom-right, top-right, top-left as seen
-        // from the +normal side. Viewing from behind uses reversed winding and
-        // mirrored U coordinates.
-        final int[] order = front
-                ? new int[]{0, 1, 2, 3}
-                : new int[]{1, 0, 3, 2};
-        final float[][] uv = front
-                ? new float[][]{{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}}
-                : new float[][]{{1.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
-
         final Vertex[] vertices = new Vertex[4];
         for (int i = 0; i < 4; i++) {
-            final Vector3d corner = corners[order[i]];
-            vertices[i] = new Vertex(
-                    (float) (corner.x - camera.pos.x),
-                    (float) (corner.y - camera.pos.y),
-                    (float) (corner.z - camera.pos.z),
-                    uv[i][0], uv[i][1]);
+            final Vector3d corner = corners[i];
+            final float x = (float) (corner.x - camera.pos.x);
+            final float y = (float) (corner.y - camera.pos.y);
+            final float z = (float) (corner.z - camera.pos.z);
+
+            // Screen-space UV for the projective portal mapping. This matches
+            // the full-screen triangle convention in vanilla screenquad.vsh
+            // (NDC y = -1 maps to v = 0).
+            final Vector4f clip = viewProjection.transform(new Vector4f(x, y, z, 1.0f));
+            if (clip.w <= 1.0e-4f) {
+                return null;
+            }
+            final float u = clip.x / clip.w * 0.5f + 0.5f;
+            final float v = clip.y / clip.w * 0.5f + 0.5f;
+            vertices[i] = new Vertex(x, y, z, u, v);
         }
-        return new Quad(vertices, dx * dx + dy * dy + dz * dz);
+
+        // Reverse winding for the back side; per-corner screen UVs stay intact.
+        final Vertex[] ordered = front
+                ? vertices
+                : new Vertex[]{vertices[1], vertices[0], vertices[3], vertices[2]};
+        return new Quad(ordered, dx * dx + dy * dy + dz * dz);
     }
 
     private static void emitShader(List<Quad> quads, PoseStack.Pose pose, VertexConsumer consumer) {

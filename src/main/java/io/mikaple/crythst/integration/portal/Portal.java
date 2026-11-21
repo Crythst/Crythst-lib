@@ -84,7 +84,7 @@ public final class Portal {
     }
 
     public PortalSnapshot snapshot() {
-        return new PortalSnapshot(id, name, dimension, plane, linkedPortalId);
+        return PortalSnapshot.of(this, null);
     }
 
     @Override

@@ -1,7 +1,6 @@
 package io.mikaple.crythst.client.render.portal;
 
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
-import com.mojang.renderpearl.api.pipeline.BlendFunction;
 import com.mojang.renderpearl.api.pipeline.ColorTargetState;
 import com.mojang.renderpearl.api.pipeline.CompareOp;
 import com.mojang.renderpearl.api.pipeline.DepthStencilState;
@@ -14,55 +13,89 @@ import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.resources.Identifier;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
- * The procedural portal-surface render type.
+ * Render types for the portal surface.
  *
- * <p>The pipeline is built directly (rather than copying a vanilla pipeline)
- * so its vertex format can carry both UV and colour while the fragment shader
- * generates the animated star surface from {@code GameTime}. No texture is
- * bound; there is therefore no resource reload or dynamic texture involved.</p>
+ * <p>Two pipelines share the same vertex shader and vertex layout:</p>
+ * <ul>
+ *     <li>{@code crythst:core/portal} - procedural animated star surface
+ *     (fallback, and used for nested portals during a capture pass);</li>
+ *     <li>{@code crythst:core/portal_view} - samples the destination scene
+ *     captured into an offscreen texture and mapped with screen-space UVs.</li>
+ * </ul>
  *
- * <p>If the pipeline cannot be created at all, {@link #available()} returns
- * false and {@link PortalRenderer} draws a plain translucent quad instead.</p>
+ * <p>Both pipelines are <b>opaque</b> (depth write enabled, no blending). The
+ * captured destination scene is already fully composited, and an opaque
+ * surface avoids the 26.3 OIT pipeline set requirement for custom translucent
+ * render types. The surface is drawn in the solid feature phase and depth-tests
+ * correctly against terrain in front of the portal frame.</p>
+ *
+ * <p>Pipelines are compiled on demand from the current resource pack. No
+ * resource reload or dynamic texture reload is triggered.</p>
  */
 public final class PortalRenderTypes {
-    /** Shader id: {@code crythst:core/portal}. */
+    /** Procedural surface shader: {@code crythst:core/portal}. */
     public static final Identifier PORTAL_SHADER =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal");
-    /** Pipeline location: {@code crythst:portal_surface}. */
+    /** Destination-view surface shader: {@code crythst:core/portal_view}. */
+    public static final Identifier PORTAL_VIEW_SHADER =
+            Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal_view");
     public static final Identifier PORTAL_PIPELINE =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_surface");
-    private static final String RENDER_TYPE_NAME = "crythst_portal_surface";
+    public static final Identifier PORTAL_VIEW_PIPELINE =
+            Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_view_surface");
 
-    private static volatile RenderType portalType;
+    private static final String PROCEDURAL_TYPE_NAME = "crythst_portal_surface";
+
+    private static final Map<Identifier, RenderType> VIEW_TYPES = new ConcurrentHashMap<>();
+
+    private static volatile RenderType proceduralType;
     private static volatile boolean failed;
 
     private PortalRenderTypes() {
     }
 
-    /** Returns the portal render type, creating it on first use. */
-    public static RenderType portal() {
-        RenderType result = portalType;
+    /** The animated procedural surface (fallback / recursion depth limit). */
+    public static RenderType procedural() {
+        RenderType result = proceduralType;
         if (result != null) {
             return result;
         }
         synchronized (PortalRenderTypes.class) {
-            result = portalType;
+            result = proceduralType;
             if (result == null) {
-                result = create();
-                portalType = result;
+                result = createProcedural();
+                proceduralType = result;
             }
             return result;
         }
     }
 
-    /** True when the custom pipeline was created successfully. */
+    /** Compatibility alias for the previous milestone. */
+    public static RenderType portal() {
+        return procedural();
+    }
+
+    /**
+     * A render type sampling {@code textureId} as {@code Sampler0}.
+     *
+     * @param textureId a texture registered with the vanilla texture manager
+     *                  (the portal capture manager registers one per portal)
+     */
+    public static RenderType view(Identifier textureId) {
+        return VIEW_TYPES.computeIfAbsent(textureId, PortalRenderTypes::createView);
+    }
+
+    /** True when the procedural pipeline could be created. */
     public static boolean available() {
         if (failed) {
             return false;
         }
         try {
-            portal();
+            procedural();
             return true;
         } catch (Throwable error) {
             failed = true;
@@ -85,25 +118,45 @@ public final class PortalRenderTypes {
                 + "falling back to coloured quads", error);
     }
 
-    private static RenderType create() {
-        final RenderPipeline pipeline = RenderPipeline.builder()
-                .withLocation(PORTAL_PIPELINE)
-                .withVertexShader(PORTAL_SHADER)
-                .withFragmentShader(PORTAL_SHADER)
+    private static RenderType createProcedural() {
+        final RenderPipeline pipeline = basePipeline(PORTAL_PIPELINE, PORTAL_SHADER, PORTAL_SHADER)
+                .build();
+        return CrythstRenderTypes.create(PROCEDURAL_TYPE_NAME, setup(pipeline));
+    }
+
+    private static RenderType createView(Identifier textureId) {
+        final RenderPipeline pipeline = basePipeline(PORTAL_VIEW_PIPELINE, PORTAL_SHADER, PORTAL_VIEW_SHADER)
+                .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
+                .build();
+        final RenderSetup setup = RenderSetup.builder(pipeline)
+                .withTexture("Sampler0", textureId)
+                .setOutline(RenderSetup.OutlineProperty.NONE)
+                .createRenderSetup();
+        return CrythstRenderTypes.create("crythst_portal_view_" + textureId.getPath().replace('/', '_'),
+                setup);
+    }
+
+    private static RenderSetup setup(RenderPipeline pipeline) {
+        return RenderSetup.builder(pipeline)
+                .setOutline(RenderSetup.OutlineProperty.NONE)
+                .createRenderSetup();
+    }
+
+    private static RenderPipeline.Builder basePipeline(Identifier location,
+                                                       Identifier vertexShader,
+                                                       Identifier fragmentShader) {
+        return RenderPipeline.builder()
+                .withLocation(location)
+                .withVertexShader(vertexShader)
+                .withFragmentShader(fragmentShader)
                 .withBindGroupLayout(BindGroupLayouts.GLOBALS)
                 .withBindGroupLayout(BindGroupLayouts.PROJECTION)
                 .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
                 .withBindGroupLayout(BindGroupLayouts.FOG)
                 .withVertexBinding(0, DefaultVertexFormat.POSITION_TEX_COLOR)
                 .withPrimitiveTopology(PrimitiveTopology.QUADS)
-                .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
-                .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, false))
-                .withCull(false)
-                .build();
-
-        final RenderSetup setup = RenderSetup.builder(pipeline)
-                .setOutline(RenderSetup.OutlineProperty.NONE)
-                .createRenderSetup();
-        return CrythstRenderTypes.create(RENDER_TYPE_NAME, setup);
+                .withColorTargetState(ColorTargetState.DEFAULT)
+                .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, true))
+                .withCull(false);
     }
 }

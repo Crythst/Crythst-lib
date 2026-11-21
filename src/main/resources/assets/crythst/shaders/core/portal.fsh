@@ -9,6 +9,7 @@ layout(location = 0) in vec2 texCoord0;
 layout(location = 1) in vec4 vertexColor;
 layout(location = 2) in float sphericalVertexDistance;
 layout(location = 3) in float cylindricalVertexDistance;
+layout(location = 4) in vec3 localPosition;
 
 layout(location = 0) out vec4 fragColor;
 
@@ -42,7 +43,8 @@ float starLayer(vec2 uv, float scale, float speed, float seed, float threshold) 
 }
 
 void main() {
-    // p is in [-1, 1]^2; radius reaches sqrt(2) in the corners.
+    // texCoord0 is the portal's screen-space UV. Fallback surfaces therefore
+    // cover exactly the same screen footprint as the captured view would.
     vec2 p = texCoord0 * 2.0 - 1.0;
     float radius = length(p);
     float angle = atan(p.y, p.x);
@@ -70,13 +72,9 @@ void main() {
     // Soft core glow.
     color += vec3(0.10, 0.03, 0.18) * pow(max(0.0, 1.0 - radius), 3.0);
 
-    vec4 outColor = vec4(color, 0.94) * vertexColor;
+    // Opaque surface: the pipeline uses the solid phase and writes depth.
+    vec4 outColor = vec4(color, 1.0) * vertexColor;
     outColor *= ColorModulator;
-    if (outColor.a < 0.01) {
-        discard;
-    }
-
-    fragColor = apply_fog(outColor, sphericalVertexDistance, cylindricalVertexDistance,
-            FogEnvironmentalStart, FogEnvironmentalEnd,
-            FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
+    outColor.a = 1.0;
+    fragColor = outColor;
 }
