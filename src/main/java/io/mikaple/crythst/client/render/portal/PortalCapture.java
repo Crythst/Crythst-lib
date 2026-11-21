@@ -18,6 +18,7 @@ import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.ViewArea;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
@@ -109,6 +110,9 @@ public final class PortalCapture {
     private static boolean registered;
     private static boolean failureLogged;
     private static boolean firstCaptureLogged;
+    /** Rate limit for the "invalid portal camera" debug message. */
+    private static final long INVALID_CAMERA_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static long lastInvalidCameraLogNanos = -INVALID_CAMERA_LOG_INTERVAL_NANOS;
 
     private PortalCapture() {
     }
@@ -243,6 +247,11 @@ public final class PortalCapture {
         final LevelRenderer renderer = context.levelRenderer();
         final var savedVisibleSections = List.copyOf(renderer.visibleSections());
         final var savedNearbySections = List.copyOf(renderer.nearbyVisibleSections());
+        // The normal main pass will reposition the ViewArea to the current main
+        // camera, but restore the centre that existed before capture first so
+        // this hook leaves the renderer in the state extraction produced.
+        final SectionPos savedViewAreaCenter = renderer.viewArea() == null
+                ? null : renderer.viewArea().getCameraSectionPos();
 
         capturing = true;
         final Set<UUID> captured = new HashSet<>();
@@ -254,7 +263,7 @@ public final class PortalCapture {
                 }
                 final PortalTransform transform = PortalTransform.between(
                         portal.plane(), portal.destinationPlane());
-                final CameraRenderState portalCamera = createPortalCamera(mainCamera, transform);
+                final CameraRenderState portalCamera = createPortalCamera(portal, mainCamera, transform);
                 if (portalCamera == null) {
                     continue;
                 }
@@ -273,11 +282,11 @@ public final class PortalCapture {
                 boolean rendered = false;
                 try {
                     levelState.cameraRenderState = portalCamera;
-                    rebuildVisibleSections(renderer, portalCamera);
-                    if (renderer.visibleSections().isEmpty()) {
-                        // The occlusion graph has no sections around the exit
-                        // (e.g. destination outside the loaded/main view area).
-                        // Skipping is better than capturing a sky-only image.
+                    final int sectionCount = rebuildVisibleSections(level, renderer, portalCamera);
+                    if (sectionCount <= 0 || renderer.visibleSections().isEmpty()) {
+                        // The destination neighbourhood is outside the loaded
+                        // chunks or has no sections in view. Skipping is better
+                        // than capturing a sky-only image.
                         continue;
                     }
                     renderer.render(resourcePool, false, portalCamera,
@@ -325,6 +334,13 @@ public final class PortalCapture {
                 renderer.clearVisibleSections();
                 renderer.visibleSections().addAll(savedVisibleSections);
                 renderer.nearbyVisibleSections().addAll(savedNearbySections);
+                // Capture moved the rotating section storage to each portal
+                // camera. Put the main camera's centre back so the next main
+                // pass does not have to do an extra relocate/invalidate cycle.
+                if (renderer.viewArea() != null && savedViewAreaCenter != null
+                        && savedViewAreaCenter.x() != Integer.MIN_VALUE) {
+                    renderer.viewArea().repositionCamera(savedViewAreaCenter);
+                }
             } catch (Throwable error) {
                 if (!failureLogged) {
                     failureLogged = true;
@@ -357,32 +373,44 @@ public final class PortalCapture {
     }
 
     /**
-     * Rebuilds {@code LevelRenderer.visibleSections} for a camera.
+     * Rebuilds {@code LevelRenderer.visibleSections} for a portal camera.
      *
      * <p>{@code LevelExtractor} populates this list for the <em>main</em>
      * camera during extraction. A second {@code LevelRenderer.render} call
      * does not re-extract it, so without this the portal camera would reuse
      * the main camera's visible-section set and could show only sky when the
      * destination is outside the player's current view.</p>
+     *
+     * <p>This intentionally does <em>not</em> call
+     * {@code SectionOcclusionGraph.addSectionsInFrustum}: that method's
+     * {@code offsetToFullyIncludeCameraCube} loop is unbounded and can hang the
+     * render thread for degenerate portal cameras. Instead
+     * {@link PortalSectionSelection} performs an explicitly budgeted scan over
+     * the loaded section neighbourhood.</p>
+     *
+     * @return the number of visible sections selected
      */
-    private static void rebuildVisibleSections(LevelRenderer renderer, CameraRenderState camera) {
+    private static int rebuildVisibleSections(ClientLevel level, LevelRenderer renderer,
+                                              CameraRenderState camera) {
         renderer.clearVisibleSections();
-        if (camera == null || camera.cullFrustum == null) {
-            return;
+        if (camera == null || camera.cullFrustum == null || camera.pos == null) {
+            return 0;
         }
-        if (camera.pos != null) {
-            // Position the rotating section storage before querying the
-            // occlusion graph, so the graph and section objects match the
-            // portal camera's neighbourhood.
-            renderer.viewArea().repositionCamera(SectionPos.of(camera.pos));
+        final ViewArea viewArea = renderer.viewArea();
+        if (viewArea == null) {
+            return 0;
         }
-        renderer.sectionOcclusionGraph().addSectionsInFrustum(
-                camera.cullFrustum,
-                renderer.visibleSections(),
-                renderer.nearbyVisibleSections());
+        // Position the rotating section storage before querying it, so the
+        // section objects match the portal camera's neighbourhood. The centre
+        // is restored in captureDestinationViews' finally block.
+        final SectionPos center = SectionPos.of(camera.blockPos);
+        viewArea.repositionCamera(center);
+        return PortalSectionSelection.collect(level, viewArea, camera.cullFrustum, center,
+                renderer.visibleSections(), renderer.nearbyVisibleSections());
     }
 
-    private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {        if (camera.pos.distanceToSqr(
+    private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {
+        if (camera.pos.distanceToSqr(
                 portal.plane().origin().x, portal.plane().origin().y, portal.plane().origin().z)
                 > MAX_CAPTURE_DISTANCE_SQUARED) {
             return false;
@@ -400,17 +428,35 @@ public final class PortalCapture {
      * Builds the camera that looks through the portal. The main camera is
      * transformed by the same rigid link transform used for entities, so the
      * destination view is exactly what the player would see from the exit.
+     *
+     * <p>Returns {@code null} when the transformed state is degenerate. The
+     * caller must then fall back to the procedural portal surface instead of
+     * entering vanilla culling/rendering.</p>
      */
-    private static CameraRenderState createPortalCamera(CameraRenderState main, PortalTransform transform) {
+    private static CameraRenderState createPortalCamera(PortalSnapshot portal, CameraRenderState main,
+                                                        PortalTransform transform) {
+        if (main == null || main.pos == null || main.projectionMatrix == null
+                || transform == null || transform.rotation() == null) {
+            logSkippedInvalidCamera(portal, "missing camera matrix");
+            return null;
+        }
         final Vector3d position = transform.transformPoint(
                 new Vector3d(main.pos.x, main.pos.y, main.pos.z));
+        if (!PortalCameraSanity.isFinitePosition(position.x, position.y, position.z)) {
+            logSkippedInvalidCamera(portal, "non-finite camera position");
+            return null;
+        }
 
         final CameraRenderState camera = new CameraRenderState();
         camera.pos = new Vec3(position.x, position.y, position.z);
         camera.blockPos = BlockPos.containing(camera.pos);
         camera.initialized = true;
         camera.isPanoramicMode = false;
-        camera.isFrustumCaptured = false;
+        // We select visible sections ourselves (PortalSectionSelection). Marking
+        // the frustum as captured makes SectionOcclusionGraph.update skip its
+        // own frustum-offset path during the capture render, so no unbounded
+        // vanilla loop can run for portal camera state.
+        camera.isFrustumCaptured = true;
         camera.isFirstPerson = false;
         camera.smartCull = main.smartCull;
         camera.cameraEntityPartialTicks = main.cameraEntityPartialTicks;
@@ -426,8 +472,21 @@ public final class PortalCapture {
                 ? new Quaternionf()
                 : new Quaternionf(main.orientation);
         final Quaternionf orientation = baseOrientation.premul(rotation);
+        if (!PortalCameraSanity.isSaneOrientation(orientation)) {
+            logSkippedInvalidCamera(portal, "non-finite orientation");
+            return null;
+        }
+        // Normalize so viewRotationMatrix is a pure rotation (determinant ~ 1)
+        // even if an upstream quaternion drifted slightly.
+        orientation.normalize();
         camera.orientation = orientation;
         camera.viewRotationMatrix = new Matrix4f().rotation(new Quaternionf(orientation).conjugate());
+
+        if (!PortalCameraSanity.isUsable(camera.projectionMatrix, camera.viewRotationMatrix,
+                camera.orientation, camera.pos.x, camera.pos.y, camera.pos.z)) {
+            logSkippedInvalidCamera(portal, "degenerate projection or view rotation");
+            return null;
+        }
 
         final Vector3f forward = orientation.transform(new Vector3f(0.0f, 0.0f, -1.0f));
         final float[] yawPitch = PortalTransform.yawPitch(
@@ -439,6 +498,20 @@ public final class PortalCapture {
         frustum.prepare(camera.pos.x, camera.pos.y, camera.pos.z);
         camera.cullFrustum = frustum;
         return camera;
+    }
+
+    /**
+     * Debug-only, rate-limited so a permanently broken link cannot flood the
+     * log every capture tick.
+     */
+    private static void logSkippedInvalidCamera(PortalSnapshot portal, String reason) {
+        final long now = System.nanoTime();
+        if (now - lastInvalidCameraLogNanos < INVALID_CAMERA_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastInvalidCameraLogNanos = now;
+        Crythst.LOGGER.debug("Crythst skipped portal capture for '{}': {}",
+                portal == null ? "<unknown>" : portal.name(), reason);
     }
 
     private static void ensureResources() {
