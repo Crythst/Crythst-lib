@@ -115,7 +115,9 @@ for some cases; **MISSING** = not implemented.
    ticks, game events, etc.).
 3. **No structure level view.** Most vanilla logic needs a `Level`/`BlockGetter`
    that maps structure-local coordinates; the void copy is hidden behind a
-   region remap and is not a public level.
+   region remap and is not a public level. A lightweight `StructureLevelView`
+   now exists (P2), but there is still no full `Level` facade or AI/pathfinding
+   bridge.
 4. **Interactions are implemented per action**, not by letting vanilla run
    against a real level. This is why drops, tool rules, menus, projectiles and
    redstone each need separate bridges.
@@ -140,11 +142,16 @@ for some cases; **MISSING** = not implemented.
 - Survival mining progress + crack overlay — in progress.
 - Item-frame/seat stability and moving-structure attachment.
 
-### P2 — structure level view
-- Public `StructureLevelView` (`BlockGetter`/`CollisionGetter`, then optionally a
-  full `Level` facade) used by AI, projectiles, redstone, pathfinding and mods.
+### P2 — structure level view — **implemented (lightweight view)**
+- Public `StructureLevelView` over the auxiliary void region, with
+  `BlockGetter`/`CollisionGetter` adapters and exact block shapes. Used by
+  raycasts/outline now; AI/pathfinding integration is still deferred.
+- Server views read through `EmptyPhysicsLevel.liveBlock`, write through the
+  void block grid and rely on the P0 edit-propagation pass. `operationTarget`
+  exposes the void `ServerLevel`/position for a future player-operation
+  redirector. A full `Level` facade is deferred.
 - Structure-aware `getBlockState`/`getFluidState`/`getBlockEntity` for host
-  queries; host↔structure neighbour and game-event bridges.
+  queries; host↔structure neighbour and game-event bridges remain deferred.
 
 ### P3 — advanced parity
 - Explosions affecting structure bodies and host entities; TNT physics.

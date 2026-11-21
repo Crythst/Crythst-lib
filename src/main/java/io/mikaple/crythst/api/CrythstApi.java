@@ -132,6 +132,22 @@ public final class CrythstApi {
     }
 
     /**
+     * Returns the level-like view for one structure body in a container.
+     */
+    public static @Nullable io.mikaple.crythst.api.sublevel.view.StructureLevelView view(
+            StructureContainer container, long bodyId) {
+        return container == null ? null : container.view(bodyId);
+    }
+
+    /**
+     * Returns the level-like view for a live server structure.
+     */
+    public static @Nullable io.mikaple.crythst.api.sublevel.view.StructureLevelView view(
+            PhysicsStructure structure) {
+        return io.mikaple.crythst.api.sublevel.view.StructureLevelViews.of(structure);
+    }
+
+    /**
      * Returns structures whose world AABB overlaps {@code box}.
      */
     public static List<PhysicsStructure> structuresIn(Level level, Aabb box) {

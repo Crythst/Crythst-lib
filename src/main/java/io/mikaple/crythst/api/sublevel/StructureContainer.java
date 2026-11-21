@@ -50,6 +50,22 @@ public interface StructureContainer {
     }
 
     /**
+     * Returns a level-like block view over the structure with the given body
+     * id, or {@code null} when no such structure is visible.
+     *
+     * <p>Server containers return an authoritative writable view. Client
+     * containers return a read-only view over the integrated-client render
+     * structure or the synced network snapshot. The returned view is not
+     * stable across edits, reindexing, splits or removal; reacquire it when
+     * {@link io.mikaple.crythst.api.sublevel.view.StructureLevelView#isCurrent()}
+     * becomes {@code false}. See
+     * {@link io.mikaple.crythst.api.sublevel.view.StructureLevelViews}.</p>
+     */
+    default @Nullable io.mikaple.crythst.api.sublevel.view.StructureLevelView view(long bodyId) {
+        return io.mikaple.crythst.api.sublevel.view.StructureLevelViews.of(this, bodyId);
+    }
+
+    /**
      * Resolves a structure by a display label or by its decimal body id.
      *
      * <p>Crythst structures do not currently carry a dedicated name field. A

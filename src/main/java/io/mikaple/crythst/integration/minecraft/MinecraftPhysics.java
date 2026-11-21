@@ -90,6 +90,17 @@ public final class MinecraftPhysics {
         return LEVELS.get(level.dimension());
     }
 
+    /**
+     * Immutable snapshot of the physics worlds that currently exist.
+     *
+     * <p>Used by read-only facades that need to locate the world owning a
+     * structure without creating a physics world. Must be called from the
+     * server thread when the result is used to mutate or tick physics state.</p>
+     */
+    public static java.util.List<LevelPhysics> levelPhysicsSnapshot() {
+        return java.util.List.copyOf(LEVELS.values());
+    }
+
     public static void tick(MinecraftServer server) {
         if (!available || !config.enabled) {
             return;

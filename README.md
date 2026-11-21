@@ -577,6 +577,8 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 - [玩家 ↔ 结构交互](docs/player-structure-interaction.md)
 - [实体 ↔ 结构碰撞](docs/entity-physics-collision.md)
 - [实体停留在结构上](docs/entity-structure-riding.md)
+- [辅助空世界实体投影](docs/structure-entity-projection.md)
+- [辅助空世界方块逻辑](docs/structure-world-logic.md)
 - [结构分裂](docs/structure-splitting.md)
 - [玩家 OBB 碰撞（非默认重力）](docs/player-obb-collision.md)
 - [玩家重力与相机](docs/player-gravity-camera.md)
