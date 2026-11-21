@@ -54,7 +54,7 @@ Each server tick:
    - current `PhysicsStructure.pose()` (local voxel metres → world),
    - the merged `VoxelBox` list from `VoxelColliderData`,
    - `blockScale`,
-   - a world AABB from `PhysicsStructure.obb()` for the broad phase.
+   - the body's world AABB from `PhysicsStructure.aabb()` for the broad phase.
 2. Iterate `ServerLevel.getAllEntities()` and skip ineligible entities.
 3. Broad phase: keep structures whose world AABB intersects the entity AABB
    expanded by the collision margin. Only the nearest eight are resolved.
@@ -70,6 +70,10 @@ Each server tick:
      a diagonal cross axis is unstable at edges, so it is not used for motion.
    - Bias ties toward the upward escape. This keeps entities resting on a floor
      instead of being squeezed sideways by floating-point ties.
+   - Choose the sign of each face axis using the entity AABB centre from the
+     previous tick when available. This sends an entity back toward the side it
+     entered from instead of through a thin wall after it crossed the wall's
+     mid-plane.
 5. Add the configured `entityCollisionMargin` to the MTV and translate the
    entity. Up to three passes are run per structure so one merged box cannot
    leave the entity inside a neighbouring box.
@@ -94,7 +98,29 @@ The shallowest penetration axis naturally distinguishes the two cases:
   the wall and the inward velocity component is removed.
 
 A tie-break prefers an upward normal when two face axes have effectively equal
-depth.
+depth. The previous-tick hint only changes the sign, never which axis is
+shallowest.
+
+### Pose convention and broad phase
+
+The solver receives the structure-origin pose (`structure.pose()`) and the
+unshifted merged boxes. This is equivalent to the body convention:
+
+```text
+structurePose * (voxel * blockScale)
+bodyPose   * (voxel * blockScale - centreOfMassOffset)
+```
+
+`PhysicsStructure#pose()` already subtracts the rotated centre-of-mass offset
+from the body position, so both expressions map the same voxel centre into the
+world. `EntityStructureSolverTest#structurePoseAndBodyPoseProduceTheSameWorldBox`
+guards this equivalence.
+
+The broad phase deliberately uses `PhysicsStructure#aabb()` (Bullet's
+world AABB) rather than reconstructing one from `collider.localBounds()`.
+`localBounds()` is centre-of-mass-relative and must be paired with the body
+pose; pairing it with the structure-origin pose shifts the bounds by a rotated
+COM offset.
 
 ### Players
 
@@ -125,6 +151,24 @@ EntityPhysicsCollisionManager.setEntityFilter(entity ->
 Returning `false` is a blacklist. Combined with a type check it can also act as
 a whitelist. The filter is evaluated after the base exclusions.
 
+## Diagnostics
+
+`/crythst entitydebug` (permission level: game masters) inspects up to four
+entities within eight blocks of the command source. For each entity it prints:
+
+- the entity type, UUID, world position and world AABB,
+- each nearby structure's body id, collision pose (position + quaternion), body
+  AABB and the local voxel query box,
+- the chosen MTV (`hit normal`, penetration depth and world offset), or
+  `hit=none`,
+- `centerInside`, i.e. whether the entity centre lies in the structure OBB.
+
+The command runs even when `entityPhysicsCollisionEnabled` is `false`, so a
+presumed collision failure can be inspected without changing the config. The
+same data is available programmatically through
+`EntityPhysicsCollisionManager.inspect(level, entity)` and
+`EntityPhysicsCollisionManager.inspectNear(level, centre, radius, max)`.
+
 ## Performance
 
 The design bounds every loop:
@@ -153,8 +197,10 @@ Additional properties:
 ## Limitations and approximations
 
 - **No swept collision.** The pass resolves overlaps after the entity has
-  moved. A very fast entity can tunnel through a thin structure between two
-  samples. Normal walking, falling and item motion are covered.
+  moved. The previous-centre hint prevents most mid-plane crossings on thin
+  structures, but an entity that starts a tick already past the far side of a
+  structure can still be resolved to that side. Extremely fast entities can
+  still tunnel completely between samples.
 - **Entity AABB only.** Living entities are treated as axis-aligned boxes, not
   capsules or oriented boxes. This is the same shape vanilla uses for most
   entity collision, but it is approximate for tall mobs and rotated poses.
@@ -163,8 +209,10 @@ Additional properties:
   it does not replace or disable vanilla movement.
 - **Client-side prediction.** Structures are not part of the vanilla chunk
   collision data. Singleplayer/dedicated clients cannot predict collisions with
-  them, which is why players are corrected via teleport. A client-aware
-  prediction layer is out of scope for this task.
+  them, which is why players are corrected via teleport. While a player rests
+  on a structure the server may need to send a correction every tick; the
+  riding layer may also send its own carry teleport. A client-aware prediction
+  layer is out of scope for this task.
 - **No structure reaction.** By design, an entity cannot push, rotate or wake a
   structure. Two entities cannot use a structure as a shared movable platform
   with mass transfer.

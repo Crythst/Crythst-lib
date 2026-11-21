@@ -82,6 +82,45 @@ class EntityStructureSolverPhysicsTest {
         }
     }
 
+    @Test
+    void rotatedStructureBroadphaseCoversEveryBlockCorner() {
+        try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
+            final IntBounds3 bounds = new IntBounds3(0, 0, 0, 3, 2, 3);
+            final MutableVoxelVolume volume = VoxelVolumes.filled(bounds, 1000.0, PhysicsMaterial.STONE);
+            final Quaterniond rotation = new Quaterniond()
+                    .rotateX(0.41)
+                    .rotateY(0.93)
+                    .rotateZ(-0.37);
+            final Vector3d translation = new Vector3d(1.0, 8.0, -2.0);
+            final PhysicsStructure structure = new PhysicsStructure(world, StructureDef.builder(volume)
+                    .type(BodyType.STATIC)
+                    .pose(Transform3d.of(translation, rotation))
+                    .build());
+
+            final Aabb bulletBounds = structure.aabb();
+            final Aabb derivedBounds = structure.obb().toAabb();
+            final double scale = structure.blockScale();
+            for (VoxelBox box : structure.collider().boxes()) {
+                for (int i = 0; i < 8; i++) {
+                    final Vector3d corner = structure.pose().transformPoint(new Vector3d(
+                            ((i & 1) == 0 ? box.minX() : box.minX() + box.sizeX()) * scale,
+                            ((i & 2) == 0 ? box.minY() : box.minY() + box.sizeY()) * scale,
+                            ((i & 4) == 0 ? box.minZ() : box.minZ() + box.sizeZ()) * scale
+                    ));
+                    assertTrue(bulletBounds.expand(1.0e-6).contains(corner),
+                            "Bullet AABB missed corner " + corner);
+                    assertTrue(derivedBounds.expand(1.0e-6).contains(corner),
+                            "OrientedBox AABB missed corner " + corner);
+                }
+            }
+            // Bullet's AABB includes its collision margin, so it should contain
+            // the tight derived AABB rather than match it exactly.
+            assertTrue(bulletBounds.expand(0.25).contains(derivedBounds.min()));
+            assertTrue(bulletBounds.expand(0.25).contains(derivedBounds.max()));
+            structure.close();
+        }
+    }
+
     private static PhysicsStructure createTiltedStructure(PhysicsWorld world) {
         final IntBounds3 bounds = new IntBounds3(0, 0, 0, 3, 1, 3);
         final MutableVoxelVolume volume = VoxelVolumes.filled(bounds, 1000.0, PhysicsMaterial.STONE);

@@ -94,6 +94,80 @@ public final class EntityPhysicsCollisionManager {
         return lastStats;
     }
 
+    /** Effective margin used by the tick and by the diagnostics. */
+    public static double effectiveMargin() {
+        return Math.clamp(MinecraftPhysics.config().entityCollisionMargin, 0.0, MAX_MARGIN);
+    }
+
+    /**
+     * Full collision snapshot for one entity, used by
+     * {@code /crythst entitydebug}. Runs regardless of the config switch so a
+     * disabled feature can still be inspected.
+     */
+    public static DebugReport inspect(ServerLevel level, Entity entity) {
+        final double margin = effectiveMargin();
+        final Aabb entityBox = coreAabb(entity.getBoundingBox());
+        final Aabb query = entityBox.expand(margin);
+        final Vector3d center = entityBox.center();
+        final List<StructureDebug> structures = new ArrayList<>();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(level);
+        if (physics != null && !physics.closed()) {
+            for (PhysicsStructure structure : physics.structures()) {
+                if (structure.closed()) {
+                    continue;
+                }
+                if (structures.size() >= MAX_STRUCTURES_PER_ENTITY) {
+                    break;
+                }
+                final VoxelColliderData collider = structure.collider();
+                if (collider.isEmpty()) {
+                    continue;
+                }
+                final Transform3d pose = structure.pose();
+                final Aabb bounds = structure.aabb();
+                if (!bounds.expand(1.0).intersects(query)) {
+                    continue;
+                }
+                final Aabb localQuery = EntityStructureSolver.localQueryBox(
+                        pose, entityBox.expand(margin), structure.blockScale());
+                final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
+                        entityBox, previousCenter(entity, center), pose, collider.boxes(),
+                        structure.blockScale(), margin, MAX_BOXES_PER_STRUCTURE);
+                final boolean centerInside = structure.obb().contains(center);
+                structures.add(new StructureDebug(structure.body().id(), pose, bounds,
+                        localQuery, hit, centerInside));
+            }
+        }
+        return new DebugReport(entity.getUUID().toString(), entity.getType().toString(),
+                new Vector3d(entity.getX(), entity.getY(), entity.getZ()), entityBox, structures);
+    }
+
+    /**
+     * Inspects the nearest entities to a point. Intended for diagnostics.
+     */
+    public static List<DebugReport> inspectNear(ServerLevel level, Vector3d center,
+                                                double radius, int maxEntities) {
+        final List<DebugReport> reports = new ArrayList<>();
+        if (maxEntities <= 0) {
+            return reports;
+        }
+        final double radiusSquared = Math.max(0.0, radius) * Math.max(0.0, radius);
+        for (Entity entity : level.getAllEntities()) {
+            if (entity.isRemoved()) {
+                continue;
+            }
+            final Vector3d position = new Vector3d(entity.getX(), entity.getY(), entity.getZ());
+            if (position.distanceSquared(center) > radiusSquared) {
+                continue;
+            }
+            reports.add(inspect(level, entity));
+            if (reports.size() >= maxEntities) {
+                break;
+            }
+        }
+        return reports;
+    }
+
     /**
      * Fabric callback: resolve every level with at least one physics structure.
      */
@@ -103,7 +177,7 @@ public final class EntityPhysicsCollisionManager {
             return;
         }
         final long start = System.nanoTime();
-        final double margin = Math.clamp(config.entityCollisionMargin, 0.0, MAX_MARGIN);
+        final double margin = effectiveMargin();
         int levelCount = 0;
         int structureCount = 0;
         int entityCount = 0;
@@ -155,11 +229,10 @@ public final class EntityPhysicsCollisionManager {
                 continue;
             }
             // pose() maps local voxel metres to world space and already
-            // accounts for the centre-of-mass offset. Use the body OBB for the
-            // broad-phase bounds: collider.localBounds() is centre-of-mass
-            // relative, so it must be paired with the body pose, not pose().
+            // accounts for the centre-of-mass offset. Bounds come from the
+            // body's Bullet AABB, which is authoritative for rotated poses.
             final Transform3d pose = structure.pose();
-            final Aabb bounds = structure.obb().toAabb();
+            final Aabb bounds = structure.aabb();
             views.add(new StructureView(pose, bounds, bounds.center(), collider.boxes(),
                     structure.blockScale()));
         }
@@ -184,6 +257,7 @@ public final class EntityPhysicsCollisionManager {
         final Aabb entityBox = coreAabb(entity.getBoundingBox());
         final Aabb query = entityBox.expand(margin);
         final Vector3d entityCenter = entityBox.center();
+        final Vector3d previousCenter = previousCenter(entity, entityCenter);
 
         List<StructureView> candidates = null;
         for (StructureView structure : structures) {
@@ -210,8 +284,9 @@ public final class EntityPhysicsCollisionManager {
         for (StructureView structure : candidates) {
             for (int pass = 0; pass < MAX_PASSES_PER_STRUCTURE; pass++) {
                 final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
-                        entityBox.offset(totalOffset), structure.pose(), structure.boxes(),
-                        structure.blockScale(), margin, MAX_BOXES_PER_STRUCTURE);
+                        entityBox.offset(totalOffset), previousCenter, structure.pose(),
+                        structure.boxes(), structure.blockScale(), margin,
+                        MAX_BOXES_PER_STRUCTURE);
                 if (hit == null) {
                     break;
                 }
@@ -277,6 +352,21 @@ public final class EntityPhysicsCollisionManager {
         );
     }
 
+    /**
+     * The current AABB centre translated back to the previous tick's position.
+     * Entity AABBs are anchored to the entity position, so a translation is
+     * enough even when the bounding box changes with pose.
+     */
+    private static Vector3d previousCenter(Entity entity, Vector3d currentCenter) {
+        final Vec3 previous = entity.oldPosition();
+        final Vec3 position = entity.position();
+        return new Vector3d(
+                currentCenter.x + previous.x - position.x,
+                currentCenter.y + previous.y - position.y,
+                currentCenter.z + previous.z - position.z
+        );
+    }
+
     private static Aabb coreAabb(AABB box) {
         return new Aabb(
                 new Vector3d(box.minX, box.minY, box.minZ),
@@ -291,6 +381,34 @@ public final class EntityPhysicsCollisionManager {
         public boolean changedAnything() {
             return adjusted > 0;
         }
+    }
+
+    /**
+     * One entity's diagnostic snapshot from {@link #inspect}.
+     */
+    public record DebugReport(
+            String entityUuid,
+            String entityType,
+            Vector3d position,
+            Aabb entityBox,
+            List<StructureDebug> structures
+    ) {
+    }
+
+    /**
+     * One structure's diagnostic snapshot: the pose used for collision, its
+     * broad-phase AABB, the local voxel query box, and the MTV chosen by the
+     * solver. {@code centerInside} reports whether the entity centre is inside
+     * the structure OBB.
+     */
+    public record StructureDebug(
+            long bodyId,
+            Transform3d pose,
+            Aabb bounds,
+            Aabb localQuery,
+            EntityStructureSolver.Hit hit,
+            boolean centerInside
+    ) {
     }
 
     private record StructureView(

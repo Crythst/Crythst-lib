@@ -71,6 +71,23 @@ public final class EntityStructureSolver {
      */
     public static Hit resolve(Aabb entityBox, Transform3d pose, List<VoxelBox> boxes,
                               double blockScale, double margin, int maxBoxes) {
+        return resolve(entityBox, null, pose, boxes, blockScale, margin, maxBoxes);
+    }
+
+    /**
+     * Variant that uses the entity's previous centre to choose the exit side.
+     *
+     * <p>Without a hint the sign is taken from the current centre, so an entity
+     * that crossed the mid-plane of a thin wall between ticks is pushed out the
+     * far side. With a hint the correction returns it toward the side it came
+     * from, which prevents tunnelling through thin structures.</p>
+     *
+     * @param previousCenter entity AABB centre at the previous tick, or
+     *                       {@code null} to use the current centre
+     */
+    public static Hit resolve(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
+                              List<VoxelBox> boxes, double blockScale, double margin,
+                              int maxBoxes) {
         if (boxes.isEmpty() || maxBoxes <= 0 || blockScale <= 0.0) {
             return null;
         }
@@ -86,7 +103,7 @@ public final class EntityStructureSolver {
         final Vector3d b0 = axes[0];
         final Vector3d b1 = axes[1];
         final Vector3d b2 = axes[2];
-        final Aabb localQuery = localQuery(pose, entityBox.expand(safeMargin), blockScale);
+        final Aabb localQuery = localQueryBox(pose, entityBox.expand(safeMargin), blockScale);
         final Vector3d queryMin = localQuery.min();
         final Vector3d queryMax = localQuery.max();
 
@@ -131,6 +148,8 @@ public final class EntityStructureSolver {
             final double dx = center.x - boxCenter.x;
             final double dy = center.y - boxCenter.y;
             final double dz = center.z - boxCenter.z;
+            final Vector3d previousDelta = previousCenter == null
+                    ? null : new Vector3d(previousCenter).sub(boxCenter);
 
             // The nine cross axes only reject; they never become the MTV.
             if (separatedOnCrossAxes(dx, dy, dz, hx, hy, hz, hbx, hby, hbz, b0, b1, b2)) {
@@ -141,34 +160,34 @@ public final class EntityStructureSolver {
             // Entity face axes (world X/Y/Z).
             if (!considerFaceAxis(dx, dy, dz, hx,
                     hbx * Math.abs(b0.x) + hby * Math.abs(b1.x) + hbz * Math.abs(b2.x),
-                    1.0, 0.0, 0.0, boxBest)) {
+                    1.0, 0.0, 0.0, boxBest, previousDelta)) {
                 continue boxLoop;
             }
             if (!considerFaceAxis(dx, dy, dz, hy,
                     hbx * Math.abs(b0.y) + hby * Math.abs(b1.y) + hbz * Math.abs(b2.y),
-                    0.0, 1.0, 0.0, boxBest)) {
+                    0.0, 1.0, 0.0, boxBest, previousDelta)) {
                 continue boxLoop;
             }
             if (!considerFaceAxis(dx, dy, dz, hz,
                     hbx * Math.abs(b0.z) + hby * Math.abs(b1.z) + hbz * Math.abs(b2.z),
-                    0.0, 0.0, 1.0, boxBest)) {
+                    0.0, 0.0, 1.0, boxBest, previousDelta)) {
                 continue boxLoop;
             }
 
             // Structure face axes.
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b0.x) + hy * Math.abs(b0.y) + hz * Math.abs(b0.z),
-                    hbx, b0.x, b0.y, b0.z, boxBest)) {
+                    hbx, b0.x, b0.y, b0.z, boxBest, previousDelta)) {
                 continue boxLoop;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b1.x) + hy * Math.abs(b1.y) + hz * Math.abs(b1.z),
-                    hby, b1.x, b1.y, b1.z, boxBest)) {
+                    hby, b1.x, b1.y, b1.z, boxBest, previousDelta)) {
                 continue boxLoop;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b2.x) + hy * Math.abs(b2.y) + hz * Math.abs(b2.z),
-                    hbz, b2.x, b2.y, b2.z, boxBest)) {
+                    hbz, b2.x, b2.y, b2.z, boxBest, previousDelta)) {
                 continue boxLoop;
             }
 
@@ -195,8 +214,14 @@ public final class EntityStructureSolver {
     /**
      * Conservative local-space query box. The structure pose maps voxel metres
      * to world space, so the inverse plus the block scale yields voxel units.
+     *
+     * <p>Exposed for the {@code /crythst entitydebug} diagnostic so it reports
+     * exactly the same query that the resolver uses.</p>
      */
-    private static Aabb localQuery(Transform3d pose, Aabb worldBox, double blockScale) {
+    public static Aabb localQueryBox(Transform3d pose, Aabb worldBox, double blockScale) {
+        if (pose == null || worldBox == null || blockScale <= 0.0) {
+            throw new IllegalArgumentException("pose, box and a positive blockScale are required");
+        }
         final Transform3d inverse = pose.inverse();
         final Vector3d min = worldBox.min();
         final Vector3d max = worldBox.max();
@@ -281,7 +306,7 @@ public final class EntityStructureSolver {
     private static boolean considerFaceAxis(double dx, double dy, double dz,
                                             double entityProjection, double boxProjection,
                                             double axisX, double axisY, double axisZ,
-                                            Best best) {
+                                            Best best, Vector3d previousDelta) {
         final double distance = dx * axisX + dy * axisY + dz * axisZ;
         // Unnormalized cross axes are not passed here, so the distance is in
         // metres and can be compared directly with the projected half extents.
@@ -289,7 +314,14 @@ public final class EntityStructureSolver {
         if (overlap <= EPSILON) {
             return false;
         }
-        final double sign = distance >= 0.0 ? 1.0 : -1.0;
+        double sign = distance >= 0.0 ? 1.0 : -1.0;
+        if (previousDelta != null) {
+            final double previousDistance = previousDelta.x * axisX
+                    + previousDelta.y * axisY + previousDelta.z * axisZ;
+            if (Math.abs(previousDistance) > EPSILON) {
+                sign = previousDistance >= 0.0 ? 1.0 : -1.0;
+            }
+        }
         best.offer(overlap, axisX * sign, axisY * sign, axisZ * sign);
         return true;
     }

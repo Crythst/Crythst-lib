@@ -57,4 +57,50 @@ class PhysicsStructureTest {
             structure.close();
         }
     }
+
+    @Test
+    void restingStructureHasNoVisibleTickToTickPoseOscillation() {
+        try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
+            final MutableVoxelVolume ground = VoxelVolumes.filled(
+                    new IntBounds3(0, 0, 0, 9, 1, 9), 1000.0, PhysicsMaterial.STONE);
+            final PhysicsStructure floor = new PhysicsStructure(world,
+                    StructureDef.builder(ground)
+                            .type(io.mikaple.crythst.physics.body.BodyType.STATIC)
+                            .pose(Transform3d.of(new Vector3d(0, 0, 0)))
+                            .build());
+
+            final MutableVoxelVolume volume = VoxelVolumes.filled(
+                    new IntBounds3(0, 0, 0, 3, 3, 3), 1000.0, PhysicsMaterial.STONE);
+            final PhysicsStructure structure = new PhysicsStructure(world,
+                    StructureDef.builder(volume)
+                            .pose(Transform3d.of(new Vector3d(3.5, 8.5, 3.5)))
+                            .damping(0.02, 0.05)
+                            .build());
+
+            // Simulate at the integration's stable rate: 3 substeps per tick.
+            for (int tick = 0; tick < 500; tick++) {
+                for (int step = 0; step < 3; step++) {
+                    world.step(1.0 / 60.0);
+                }
+                structure.syncRenderPose();
+            }
+
+            // Once Bullet has put the body to sleep, consecutive render poses
+            // must be identical; any remaining micro-oscillation here would be
+            // visible as trembling regardless of alpha interpolation.
+            double maxDelta = 0.0;
+            for (int tick = 0; tick < 120; tick++) {
+                for (int step = 0; step < 3; step++) {
+                    world.step(1.0 / 60.0);
+                }
+                structure.syncRenderPose();
+                maxDelta = Math.max(maxDelta, structure.renderPoseTranslationDelta());
+            }
+            assertTrue(maxDelta < 0.01,
+                    "resting structure moved " + maxDelta + " m between ticks");
+
+            floor.close();
+            structure.close();
+        }
+    }
 }

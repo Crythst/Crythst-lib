@@ -73,11 +73,16 @@ public record OrientedBox(Vector3d center, Vector3d halfExtents, Quaterniond rot
     }
 
     public Vector3d[] axes() {
+        // JOML stores rotation matrices column-major: m00,m01,m02 are the
+        // world image of local +X, m10,m11,m12 of local +Y and m20,m21,m22 of
+        // local +Z. Taking (m00,m10,m20) here would return the transpose (the
+        // inverse rotation), which makes toAabb/corners/SAT wrong for general
+        // orientations.
         final Matrix3d matrix = new Matrix3d().rotation(rotation);
         return new Vector3d[]{
-                new Vector3d(matrix.m00, matrix.m10, matrix.m20),
-                new Vector3d(matrix.m01, matrix.m11, matrix.m21),
-                new Vector3d(matrix.m02, matrix.m12, matrix.m22)
+                new Vector3d(matrix.m00, matrix.m01, matrix.m02),
+                new Vector3d(matrix.m10, matrix.m11, matrix.m12),
+                new Vector3d(matrix.m20, matrix.m21, matrix.m22)
         };
     }
 
