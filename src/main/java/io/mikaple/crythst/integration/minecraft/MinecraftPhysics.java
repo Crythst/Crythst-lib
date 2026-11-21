@@ -2,6 +2,8 @@ package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.api.CrythstApi;
+import io.mikaple.crythst.api.CrythstEvents;
+import io.mikaple.crythst.api.event.StructureContainerReadyEvent;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.physics.PhysicsEngine;
 import io.mikaple.crythst.physics.PhysicsException;
@@ -68,11 +70,17 @@ public final class MinecraftPhysics {
         return engine;
     }
 
-    public static LevelPhysics get(ServerLevel level) {
-        return LEVELS.computeIfAbsent(level.dimension(), key -> {
-            Crythst.LOGGER.info("Creating physics world for {}", key.identifier());
-            return new LevelPhysics(level, engine(), config);
-        });
+    public static synchronized LevelPhysics get(ServerLevel level) {
+        LevelPhysics physics = LEVELS.get(level.dimension());
+        if (physics != null) {
+            return physics;
+        }
+        Crythst.LOGGER.info("Creating physics world for {}", level.dimension().identifier());
+        physics = new LevelPhysics(level, engine(), config);
+        LEVELS.put(level.dimension(), physics);
+        CrythstEvents.fireStructureContainerReady(
+                new StructureContainerReadyEvent(level, physics.apiPipeline()));
+        return physics;
     }
 
     public static LevelPhysics getIfPresent(ServerLevel level) {

@@ -1,6 +1,10 @@
 package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.api.CrythstEvents;
+import io.mikaple.crythst.api.block.StructureBlockHooks;
+import io.mikaple.crythst.api.event.PhysicsTickEvent;
+import io.mikaple.crythst.api.physics.PhysicsPipeline;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
@@ -9,6 +13,7 @@ import io.mikaple.crythst.physics.structure.StructureDef;
 import io.mikaple.crythst.physics.tick.PhysicsTimingMonitor;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.world.PhysicsWorld;
+import io.mikaple.crythst.physics.world.StepListener;
 import io.mikaple.crythst.physics.world.WorldSettings;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.TickRateManager;
@@ -29,6 +34,8 @@ public final class LevelPhysics implements AutoCloseable {
     private final UnstuckResolver unstuck;
     private final List<PhysicsStructure> structures = new ArrayList<>();
     private final PhysicsTimingMonitor timing = new PhysicsTimingMonitor();
+    private final PhysicsPipeline apiPipeline;
+    private long physicsTickIndex;
 
     /**
      * Auxiliary void level for block logic. Created lazily on the first
@@ -57,7 +64,30 @@ public final class LevelPhysics implements AutoCloseable {
                 .withDeterministic(config.deterministic));
         this.terrain = new TerrainCollision(level, world, config);
         this.unstuck = new UnstuckResolver(level, world, config);
+        this.apiPipeline = new PhysicsPipeline(this);
+        this.world.addStepListener(new StepListener() {
+            @Override
+            public void beforeStep(PhysicsWorld steppedWorld, double fixedTimeStep) {
+                CrythstEvents.firePrePhysicsTick(new PhysicsTickEvent(
+                        level, apiPipeline, fixedTimeStep, physicsTickIndex));
+            }
+
+            @Override
+            public void afterStep(PhysicsWorld steppedWorld, double fixedTimeStep,
+                                  io.mikaple.crythst.physics.world.StepStats stats) {
+                CrythstEvents.firePostPhysicsTick(new PhysicsTickEvent(
+                        level, apiPipeline, fixedTimeStep, physicsTickIndex));
+                physicsTickIndex++;
+            }
+        });
         PlayerGravity.setWorldDirection(level.dimension(), world.gravity());
+    }
+
+    /**
+     * API view of this level's physics world. Valid until the level unloads.
+     */
+    public PhysicsPipeline apiPipeline() {
+        return apiPipeline;
     }
 
     public ServerLevel level() {
@@ -90,6 +120,7 @@ public final class LevelPhysics implements AutoCloseable {
     }
 
     public PhysicsStructure createStructure(StructureDef definition) {
+        StructureBlockHooks.fireBeforeAssembly(level, definition.volume());
         final PhysicsStructure structure = new PhysicsStructure(world, definition);
         structures.add(structure);
         refreshRenderStructures();
@@ -108,6 +139,7 @@ public final class LevelPhysics implements AutoCloseable {
                 }
             }
         }
+        StructureBlockHooks.fireAfterAssembly(level, definition.volume(), structure);
         return structure;
     }
 

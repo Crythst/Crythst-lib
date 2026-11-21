@@ -144,6 +144,26 @@
 
 ---
 
+## 公开 API（v1）
+
+第三方模组应优先使用 `io.mikaple.crythst.api`：
+
+| 能力 | 入口 |
+| --- | --- |
+| 结构/刚体查询 | `CrythstApi.structures`, `structuresIn`, `structureAt`, `body` |
+| 物理操作 | `CrythstApi.physics(ServerLevel)` → `PhysicsPipeline` / `RigidBodyHandle` |
+| 方块钩子 | `StructureBlockHooks` + `BlockStructure*` 接口 |
+| 实体工具 | `EntityStructureUtil` |
+| 事件 | `CrythstEvents`（固定物理子步的 pre/post tick、容器就绪） |
+
+```java
+PhysicsPipeline physics = CrythstApi.physics(serverLevel);
+physics.applyImpulseAtPoint(bodyId, worldPoint, new Vector3d(0.0, 800.0, 0.0));
+```
+
+完整签名、单位、线程约束、钩子优先级和 v1 缺口见 [docs/api.md](docs/api.md)。
+公开 API 不提供 `dev.ryanhcode.sable.*` 兼容包。
+
 ## 快速开始
 
 > 所有 `PhysicsWorld` / `BodyHandle` 的调用都必须在**同一个线程**（通常是 Minecraft 服务端线程）上进行。渲染线程只读取不可变快照。
@@ -531,6 +551,7 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 
 - [架构说明](docs/architecture.md)
 - [平台与原生库](docs/platforms.md)
+- [公开 API（v1）](docs/api.md)
 - [API 配方](docs/api-cookbook.md)
 - [第三方声明](THIRD_PARTY_NOTICES.md)
 - [设计声明](NOTICE)

@@ -20,6 +20,7 @@ import java.util.List;
  */
 public final class VoxelColliderData {
     private final List<VoxelBox> boxes;
+    private final List<VoxelCellPart> customParts;
     private final double blockScale;
     private final double mass;
     private final Vector3d centerOfMass;
@@ -29,7 +30,14 @@ public final class VoxelColliderData {
     public VoxelColliderData(List<VoxelBox> boxes, double blockScale,
                              double mass, Vector3d centerOfMass,
                              Matrix3d inertia, Vector3d size) {
+        this(boxes, List.of(), blockScale, mass, centerOfMass, inertia, size);
+    }
+
+    public VoxelColliderData(List<VoxelBox> boxes, List<VoxelCellPart> customParts,
+                             double blockScale, double mass, Vector3d centerOfMass,
+                             Matrix3d inertia, Vector3d size) {
         this.boxes = List.copyOf(boxes);
+        this.customParts = List.copyOf(customParts);
         this.blockScale = blockScale;
         this.mass = mass;
         this.centerOfMass = new Vector3d(centerOfMass);
@@ -37,8 +45,26 @@ public final class VoxelColliderData {
         this.size = new Vector3d(size);
     }
 
+    /**
+     * Greedy-merged voxel boxes. Cells whose block supplied custom collision
+     * geometry are not present here; their parts are exposed by
+     * {@link #customParts()} and are still part of the Bullet compound shape.
+     * Legacy consumers that only walk {@link #boxes()} (entity collision,
+     * rendering fallbacks, buoyancy) therefore see a conservative coarse shape
+     * for those cells.
+     */
     public List<VoxelBox> boxes() {
         return boxes;
+    }
+
+    /**
+     * Fractional collision parts produced by a block's
+     * {@code BlockStructureCollisionShape} or {@code BlockStructureDynamicCollider}
+     * hook. Coordinates are unscaled voxels; the parts are included in
+     * {@link #mass()} and {@link #toCompoundShape()}.
+     */
+    public List<VoxelCellPart> customParts() {
+        return customParts;
     }
 
     public double blockScale() {
@@ -62,11 +88,11 @@ public final class VoxelColliderData {
     }
 
     public boolean isEmpty() {
-        return boxes.isEmpty();
+        return boxes.isEmpty() && customParts.isEmpty();
     }
 
     public Aabb localBounds() {
-        if (boxes.isEmpty()) {
+        if (isEmpty()) {
             return new Aabb(new Vector3d(), new Vector3d());
         }
         final Vector3d min = new Vector3d(Double.POSITIVE_INFINITY);
@@ -77,6 +103,11 @@ public final class VoxelColliderData {
             max.max(new Vector3d(box.minX() + box.sizeX(), box.minY() + box.sizeY(), box.minZ() + box.sizeZ())
                     .mul(blockScale).sub(comOffset));
         }
+        for (VoxelCellPart part : customParts) {
+            min.min(new Vector3d(part.minX(), part.minY(), part.minZ()).mul(blockScale).sub(comOffset));
+            max.max(new Vector3d(part.minX() + part.sizeX(), part.minY() + part.sizeY(),
+                    part.minZ() + part.sizeZ()).mul(blockScale).sub(comOffset));
+        }
         return Aabb.of(min, max);
     }
 
@@ -84,13 +115,19 @@ public final class VoxelColliderData {
      * Builds a compound shape whose origin coincides with the centre of mass.
      */
     public CompoundShape toCompoundShape() {
-        if (boxes.isEmpty()) {
+        if (isEmpty()) {
             throw new IllegalStateException("Cannot build a shape from an empty voxel collider");
         }
         final CompoundShape.Builder builder = CompoundShape.builder();
         for (VoxelBox box : boxes) {
             final Vector3d offset = box.center().sub(centerOfMass).mul(blockScale);
             final Vector3d halfExtents = new Vector3d(box.sizeX(), box.sizeY(), box.sizeZ()).mul(blockScale * 0.5);
+            builder.add(new BoxShape(halfExtents), Transform3d.of(offset));
+        }
+        for (VoxelCellPart part : customParts) {
+            final Vector3d offset = part.center().sub(centerOfMass).mul(blockScale);
+            final Vector3d halfExtents = new Vector3d(part.sizeX(), part.sizeY(), part.sizeZ())
+                    .mul(blockScale * 0.5);
             builder.add(new BoxShape(halfExtents), Transform3d.of(offset));
         }
         return builder.build();

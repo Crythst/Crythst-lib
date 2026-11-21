@@ -1,5 +1,7 @@
 package io.mikaple.crythst.physics.structure;
 
+import io.mikaple.crythst.api.block.StructureBlockHooks;
+import io.mikaple.crythst.api.block.StructureBlockStateSnapshot;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.InterpolatedPose;
 import io.mikaple.crythst.math.OrientedBox;
@@ -45,6 +47,8 @@ public final class PhysicsStructure implements AutoCloseable {
 
     private volatile VoxelColliderData collider;
     private volatile Vector3d centerOfMassOffset;
+    /** Only allocated when a block-change listener exists for this volume. */
+    private volatile StructureBlockStateSnapshot blockStateSnapshot;
     private boolean closed;
 
     public PhysicsStructure(PhysicsWorld world, StructureDef definition) {
@@ -53,10 +57,12 @@ public final class PhysicsStructure implements AutoCloseable {
         this.colliderOptions = definition.colliderOptions();
         this.blockScale = definition.colliderOptions().blockScale();
         this.massScale = definition.massScale();
-        this.collider = VoxelColliderBuilder.build(definition.volume(), definition.colliderOptions());
-        if (collider.mass() <= 0.0) {
-            throw new IllegalArgumentException("Structure volume contains no solid blocks");
+        this.collider = VoxelColliderBuilder.build(definition.volume(), definition.colliderOptions(),
+                StructureBlockHooks.colliderHooks(definition.volume()));
+        if (collider.mass() <= 0.0 || collider.isEmpty()) {
+            throw new IllegalArgumentException("Structure volume contains no solid blocks with collision geometry");
         }
+        this.blockStateSnapshot = StructureBlockHooks.captureBlockStates(definition.volume());
         this.centerOfMassOffset = collider.centerOfMass().mul(blockScale);
 
         final Transform3d bodyTransform = bodyTransformFor(definition.pose());
@@ -279,9 +285,11 @@ public final class PhysicsStructure implements AutoCloseable {
         final Vector3d structurePosition = new Vector3d(oldBodyPose.position())
                 .sub(new Vector3d(centerOfMassOffset).rotate(oldBodyPose.rotation()));
 
-        final VoxelColliderData newCollider = VoxelColliderBuilder.build(newVolume, colliderOptions);
-        if (newCollider.mass() <= 0.0) {
-            throw new IllegalArgumentException("New volume contains no solid blocks");
+        final StructureBlockStateSnapshot previousStates = this.blockStateSnapshot;
+        final VoxelColliderData newCollider = VoxelColliderBuilder.build(newVolume, colliderOptions,
+                StructureBlockHooks.colliderHooks(newVolume));
+        if (newCollider.mass() <= 0.0 || newCollider.isEmpty()) {
+            throw new IllegalArgumentException("New volume contains no solid blocks with collision geometry");
         }
 
         this.collider = newCollider;
@@ -301,6 +309,8 @@ public final class PhysicsStructure implements AutoCloseable {
         // block world pose is preserved, but the structure pose itself may have
         // shifted; do not interpolate across that re-anchor.
         renderTimeline.reset(pose(), System.nanoTime());
+        StructureBlockHooks.fireBlockChanges(this, previousStates, newVolume);
+        this.blockStateSnapshot = StructureBlockHooks.captureBlockStates(newVolume);
     }
 
     public void setMaterial(PhysicsMaterial material) {
