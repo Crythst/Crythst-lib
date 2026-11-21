@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "${mod_id}",
+  "version": "${version}",
+  "name": "${mod_name}",
+  "description": "${description}",
+  "authors": [
+    "${mod_author}"
+  ],
+  "contact": {
+    "sources": "https://github.com/mikaple/Crythst",
+    "issues": "https://github.com/mikaple/Crythst/issues"
+  },
+  "license": "${license}",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "io.mikaple.crythst.integration.fabric.CrythstFabric"
+    ],
+    "client": [
+      "io.mikaple.crythst.integration.fabric.client.CrythstClient"
+    ]
+  },
+  "mixins": [
+    "crythst.mixins.json",
+    "crythst-client.mixins.json",
+    "crythst-player.mixins.json",
+    "crythst-texture.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${fabric_loader_version}",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
