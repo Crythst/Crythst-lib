@@ -1,7 +1,11 @@
 package io.mikaple.crythst.api.physics;
 
+import io.mikaple.crythst.api.physics.constraint.StructureConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.StructureConstraintHandle;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.physics.body.BodyHandle;
+import io.mikaple.crythst.physics.constraint.ConstraintDef;
+import io.mikaple.crythst.physics.constraint.ConstraintHandle;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import net.minecraft.server.level.ServerLevel;
 import org.jetbrains.annotations.Nullable;
@@ -10,6 +14,7 @@ import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -58,6 +63,143 @@ public final class PhysicsPipeline {
     /** Number of loose and structure bodies currently in the world. */
     public int bodyCount() {
         return levelPhysics.world().bodyCount();
+    }
+
+    /**
+     * Creates a constraint between two structures.
+     *
+     * <p>Frames, anchors and axes in {@code config} are interpreted in
+     * structure-local metres and converted to each body's local frame using the
+     * live structure pose, body pose and centre of mass. The returned handle is
+     * a live view; call {@link StructureConstraintHandle#isValid()} before using
+     * it after body or structure changes.</p>
+     *
+     * @param a      structure A; must belong to this pipeline's level
+     * @param b      structure B; must belong to this pipeline's level and differ
+     *               from {@code a}
+     * @param config joint description
+     * @return a handle for the new constraint
+     * @throws IllegalArgumentException when a structure is closed, belongs to a
+     *                                  different world or level, or both
+     *                                  arguments name the same body
+     */
+    public StructureConstraintHandle addConstraint(PhysicsStructure a, PhysicsStructure b,
+                                                   StructureConstraintConfiguration config) {
+        requireStructure(a, "a");
+        requireStructure(b, "b");
+        if (a == b || a.body().id() == b.body().id()) {
+            throw new IllegalArgumentException("A constraint needs two distinct structures");
+        }
+        if (config == null) {
+            throw new NullPointerException("config");
+        }
+        final ConstraintDef definition = config.toDefinition(a, b);
+        final ConstraintHandle handle = levelPhysics.world().addConstraint(definition);
+        return new StructureConstraintHandle(levelPhysics.world(), handle, a, b);
+    }
+
+    /**
+     * Creates a constraint between one structure and the world.
+     *
+     * <p>The missing structure B is the world, whose pose is the identity. For
+     * {@code config}, structure-A frames/anchors/axes are structure-local metres;
+     * structure-B frames/anchors/axes are world-space metres.</p>
+     *
+     * @param a      structure to anchor; must belong to this pipeline's level
+     * @param config joint description
+     * @return a handle for the new constraint
+     * @throws IllegalArgumentException when the structure is closed or belongs
+     *                                  to a different world or level
+     */
+    public StructureConstraintHandle addConstraint(PhysicsStructure a,
+                                                   StructureConstraintConfiguration config) {
+        requireStructure(a, "a");
+        if (config == null) {
+            throw new NullPointerException("config");
+        }
+        final ConstraintDef definition = config.toDefinition(a, null);
+        final ConstraintHandle handle = levelPhysics.world().addConstraint(definition);
+        return new StructureConstraintHandle(levelPhysics.world(), handle, a, null);
+    }
+
+    /**
+     * Removes a constraint created through this pipeline.
+     *
+     * @param constraint handle to remove
+     * @return {@code true} when the joint was still present and has been removed
+     * @throws IllegalArgumentException when the handle belongs to another
+     *                                  pipeline world
+     */
+    public boolean removeConstraint(StructureConstraintHandle constraint) {
+        if (constraint == null) {
+            throw new NullPointerException("constraint");
+        }
+        if (!constraint.belongsTo(levelPhysics.world())) {
+            throw new IllegalArgumentException("Constraint does not belong to this pipeline");
+        }
+        if (!constraint.isValid()) {
+            return false;
+        }
+        constraint.remove();
+        return true;
+    }
+
+    /**
+     * Returns handles for all constraints in the world, including joints created
+     * through the raw physics world.
+     *
+     * <p>The returned list is an immutable snapshot. Structures are matched by
+     * body id when available; a constraint on loose bodies has no structure
+     * associated with it.</p>
+     */
+    public List<StructureConstraintHandle> constraints() {
+        final Collection<ConstraintHandle> raw = levelPhysics.world().constraints();
+        final List<StructureConstraintHandle> handles = new ArrayList<>(raw.size());
+        for (ConstraintHandle handle : raw) {
+            PhysicsStructure structureA = null;
+            PhysicsStructure structureB = null;
+            for (PhysicsStructure structure : levelPhysics.structures()) {
+                if (structure.closed() || !handle.involves(structure.body())) {
+                    continue;
+                }
+                if (structureA == null) {
+                    structureA = structure;
+                } else if (structureB == null) {
+                    structureB = structure;
+                } else {
+                    break;
+                }
+            }
+            handles.add(new StructureConstraintHandle(levelPhysics.world(), handle,
+                    structureA, structureB));
+        }
+        return List.copyOf(handles);
+    }
+
+    /** Number of constraints in the world. */
+    public int constraintCount() {
+        return levelPhysics.world().constraintCount();
+    }
+
+    private void requireStructure(PhysicsStructure structure, String name) {
+        if (structure == null) {
+            throw new NullPointerException(name);
+        }
+        if (structure.closed()) {
+            throw new IllegalArgumentException(name + " is closed");
+        }
+        if (structure.world() != levelPhysics.world()) {
+            throw new IllegalArgumentException(name + " belongs to a different physics world");
+        }
+        if (!structure.body().inWorld()) {
+            throw new IllegalArgumentException(name + " body is no longer in the world");
+        }
+        for (PhysicsStructure candidate : levelPhysics.structures()) {
+            if (candidate == structure) {
+                return;
+            }
+        }
+        throw new IllegalArgumentException(name + " is not registered with this level");
     }
 
     /**
