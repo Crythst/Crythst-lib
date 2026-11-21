@@ -19,6 +19,11 @@ import org.jetbrains.annotations.Nullable;
  * gone.</p>
  *
  * <p><strong>Threading:</strong> server thread only.</p>
+ *
+ * <p>Lifecycle methods that touch the joint ({@link #enabled()},
+ * {@link #setEnabled(boolean)} and the motor accessors) throw
+ * {@link IllegalStateException} after {@link #remove()}; read-only accessors
+ * such as {@link #id()} and {@link #type()} remain available.</p>
  */
 public final class StructureConstraintHandle {
     private final PhysicsWorld world;
@@ -144,7 +149,7 @@ public final class StructureConstraintHandle {
      * {@link RotaryConstraintConfiguration}.</p>
      */
     public boolean supportsMotor() {
-        return !removed && !world.closed()
+        return isValid()
                 && handle.type() == ConstraintType.HINGE
                 && handle instanceof MotorConstraintHandle;
     }
@@ -191,11 +196,8 @@ public final class StructureConstraintHandle {
     }
 
     private void ensureUsable() {
-        if (removed) {
-            throw new IllegalStateException("Constraint #" + handle.id() + " has been removed");
-        }
-        if (world.closed()) {
-            throw new IllegalStateException("Physics world is closed");
+        if (!isValid()) {
+            throw new IllegalStateException("Constraint #" + handle.id() + " is no longer valid");
         }
     }
 

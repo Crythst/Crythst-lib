@@ -21,6 +21,7 @@ class ConstraintFramesTest {
                     new Vector3d(12.0, 4.0, -7.0),
                     new Quaterniond().rotateY(Math.toRadians(30.0)).rotateX(Math.toRadians(10.0)));
             final PhysicsStructure structure = ConstraintTestSupport.createStructure(world, pose);
+            final Transform3d actualPose = structure.pose();
             final Vector3d centerOfMass = ConstraintTestSupport.centerOfMassOffset(structure);
 
             final Transform3d localFrame = Transform3d.of(
@@ -37,7 +38,8 @@ class ConstraintFramesTest {
                     1.0e-6);
 
             final Transform3d worldFrame = ConstraintFrames.structureToWorld(structure, localFrame);
-            assertVectorEquals(pose.transformPoint(localFrame.position()), worldFrame.position(), 1.0e-6);
+            assertVectorEquals(actualPose.transformPoint(localFrame.position()), worldFrame.position(),
+                    1.0e-6);
             assertTransformEquals(localFrame, ConstraintFrames.worldToStructure(structure, worldFrame),
                     1.0e-6);
 
@@ -47,7 +49,7 @@ class ConstraintFramesTest {
             assertVectorEquals(localPoint,
                     ConstraintFrames.bodyPointToStructure(structure, bodyPoint), 1.0e-6);
 
-            final Vector3d worldPoint = pose.transformPoint(localPoint);
+            final Vector3d worldPoint = actualPose.transformPoint(localPoint);
             assertVectorEquals(worldPoint,
                     ConstraintFrames.structurePointToWorld(structure, localPoint), 1.0e-6);
             assertVectorEquals(localPoint,
@@ -59,7 +61,7 @@ class ConstraintFramesTest {
             assertVectorEquals(localDirection,
                     ConstraintFrames.bodyDirectionToStructure(structure, localDirection), 1.0e-6);
 
-            final Vector3d worldDirection = pose.transformDirection(localDirection);
+            final Vector3d worldDirection = actualPose.transformDirection(localDirection);
             assertVectorEquals(worldDirection,
                     ConstraintFrames.structureDirectionToWorld(structure, localDirection), 1.0e-6);
             assertVectorEquals(localDirection,

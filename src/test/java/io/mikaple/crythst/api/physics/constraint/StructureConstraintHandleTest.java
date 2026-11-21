@@ -117,6 +117,30 @@ class StructureConstraintHandleTest {
         }
     }
 
+    @Test
+    void worldAnchoredFixedConstraintHoldsStructureAgainstGravity() {
+        try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
+            final PhysicsStructure structure =
+                    ConstraintTestSupport.createStructure(world, pose(0.0, 5.0, 0.0));
+            final Transform3d anchor = structure.pose();
+            final ConstraintHandle raw = world.addConstraint(
+                    FixedConstraintConfiguration.toWorld(anchor).toDefinition(structure, null));
+            assertEquals(1, world.constraintCount());
+
+            for (int i = 0; i < 120; i++) {
+                world.step(1.0 / 60.0);
+            }
+
+            final Transform3d after = structure.pose();
+            assertEquals(anchor.position().x, after.position().x, 0.1);
+            assertEquals(anchor.position().y, after.position().y, 0.1);
+            assertEquals(anchor.position().z, after.position().z, 0.1);
+
+            world.removeConstraint(raw);
+            structure.close();
+        }
+    }
+
     private static Transform3d pose(double x, double y, double z) {
         return Transform3d.of(new Vector3d(x, y, z),
                 new Quaterniond().rotateY(Math.toRadians(20.0)));

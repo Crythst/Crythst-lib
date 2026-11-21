@@ -21,7 +21,8 @@ import java.util.List;
  * Server-side API view of one level's physics pipeline.
  *
  * <p>The pipeline exposes the small set of operations third-party mods need:
- * looking up bodies, applying impulses, changing velocities and teleporting.
+ * looking up bodies, applying impulses, changing velocities, teleporting and
+ * creating or removing structure-to-structure and structure-to-world joints.
  * It intentionally does not expose raw world stepping. The simulation is
  * advanced by Crythst's fixed-step clock from the server tick; a mod that calls
  * {@code step} directly could desynchronise render interpolation, terrain
