@@ -23,9 +23,14 @@ public record OrientedBox(Vector3d center, Vector3d halfExtents, Quaterniond rot
     public OrientedBox {
         center = new Vector3d(Validate.notNull(center, "center"));
         halfExtents = new Vector3d(Validate.notNull(halfExtents, "halfExtents"));
-        Validate.positive(halfExtents.x, "halfExtents.x");
-        Validate.positive(halfExtents.y, "halfExtents.y");
-        Validate.positive(halfExtents.z, "halfExtents.z");
+        // Zero is legal: an Aabb may be flat (a plane/slab) or empty, and
+        // fromAabb must round-trip it. Only negative extents are invalid.
+        // Rejecting zero used to make OrientedBox.fromAabb throw for a legal
+        // Aabb, which took collision and render broad phases down instead of
+        // degrading to a point/segment/plane.
+        Validate.nonNegative(halfExtents.x, "halfExtents.x");
+        Validate.nonNegative(halfExtents.y, "halfExtents.y");
+        Validate.nonNegative(halfExtents.z, "halfExtents.z");
         rotation = new Quaterniond(Validate.notNull(rotation, "rotation"));
         if (rotation.lengthSquared() < 1.0e-20) {
             rotation.identity();
