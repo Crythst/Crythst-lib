@@ -52,6 +52,21 @@ class StructureRayMathTest {
     }
 
     @Test
+    void reportsTheEntrySurfaceNormal() {
+        final StructureRayMath.BoxHit hit = StructureRayMath.rayBoxHit(
+                new org.joml.Vector3d(-2.0, 0.5, 0.5),
+                new org.joml.Vector3d(1.0, 0.0, 0.0),
+                0.0, 0.0, 0.0,
+                1.0, 1.0, 1.0,
+                10.0);
+
+        assertEquals(2.0, hit.distance(), EPSILON);
+        assertEquals(-1.0, hit.normalX(), EPSILON);
+        assertEquals(0.0, hit.normalY(), EPSILON);
+        assertEquals(0.0, hit.normalZ(), EPSILON);
+    }
+
+    @Test
     void supportsNegativeCoordinates() {
         final double distance = StructureRayMath.rayBox(
                 new org.joml.Vector3d(-5.0, -0.5, -0.5),

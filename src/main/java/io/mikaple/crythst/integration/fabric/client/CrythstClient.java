@@ -49,7 +49,6 @@ public final class CrythstClient implements ClientModInitializer {
         });
         LevelRenderEvents.BEFORE_GIZMOS.register(StructureBlockRenderer::render);
         LevelRenderEvents.BEFORE_GIZMOS.register(LooseBodyRenderer::render);
-        LevelRenderEvents.BEFORE_GIZMOS.register(StructureSelectionRenderer::render);
         LevelRenderEvents.BEFORE_GIZMOS.register(PhysicsGizmoRenderer::render);
         Crythst.LOGGER.info("Crythst client renderers registered "
                 + "(structures, loose bodies, selection, debug gizmos)");

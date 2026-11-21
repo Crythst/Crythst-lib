@@ -3,10 +3,12 @@
 This document describes the first-version interaction layer for blocks that live
 inside a Crythst `PhysicsStructure` instead of Minecraft's block grid.
 
-Status: **server-authoritative core + optional client request hook**. The common
-and client registration lines are already present in the current tree. No new
-mixin is required; Fabric's existing interaction callbacks and one small custom
-payload are used instead.
+Status: **server-authoritative core + real client hit result**. The common and
+client registration lines are already present in the current tree. One client
+mixin replaces `Minecraft.hitResult` after `Minecraft.pick` so the outline,
+crosshair and click paths all target the same structure voxel; Fabric's
+interaction callbacks and one custom action payload remain the authoritative
+server path.
 
 ---
 
@@ -17,14 +19,17 @@ payload are used instead.
 | Left-click a structure block to break it (creative and survival) | `StructureInteraction.breakBlock(...)` via `AttackBlockCallback` and the client `MINE` payload |
 | Breaking applies a reaction impulse to the body | `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)` |
 | Right-click a structure block to place a block | `StructureInteraction.placeBlock(...)` via `UseBlockCallback`, `UseItemCallback`, and the `PLACE` payload for virtual-air targets |
+| Player-facing orientation on placement | server-built `BlockPlaceContext` + `Block#getStateForPlacement`, so stairs/slabs/logs/pillars/fences/trapdoors use yaw, pitch, clicked face and click position |
+| Selection outline | vanilla `BlockOutlineRenderState` supplied by `LevelExtractionEvents.AFTER_BLOCK_OUTLINE_EXTRACTION`; no custom white box |
+| Real selection target | `StructureHitResultMixin` installs a synthetic `BlockHitResult` in `Minecraft.hitResult` when a structure wins against the real block |
 | Shovel + left-click water applies player recoil | `StructureInteraction.shovelWater(...)` via the client `SHOVEL_WATER` payload |
 | Default behaviour unchanged | Every hook returns `PASS` unless a structure is actually in front of a real block / the ray is water and a shovel is held |
 | Restored structures can be edited | `RestoredStructureVolume.setBlock(...)` plus the interaction adapter |
 | Building on an outer face | the volume is expanded by one cell into a new mutable volume |
 
-There is no new mixin, so `crythst-interaction.mixins.json` is intentionally not
-created. The existing Fabric callbacks already run on the server at the correct
-`START_DESTROY_BLOCK` / `useItemOn` / `useItem` points.
+The synthetic hit is client-only. The existing Fabric callbacks already run on
+the server at the correct `START_DESTROY_BLOCK` / `useItemOn` / `useItem` points,
+and the server re-raycasts before changing physics state.
 
 ### 1.1 The click-count trap
 
@@ -49,11 +54,19 @@ New server/integration files:
 - `.../interaction/StructureInteractionEvents.java`
 - `.../interaction/StructureInteractionCommand.java`
 - `.../interaction/StructureRayMath.java`
+- `.../interaction/StructurePlacementMath.java` — pure synthetic-click / world
+  face geometry shared by placement and the client hit
 
 New client helper files:
 
 - `.../interaction/client/ClientStructureInteraction.java`
 - `.../interaction/client/ClientStructureRay.java`
+- `.../interaction/client/ClientStructureTargeting.java` — installs the real
+  `Minecraft.hitResult`
+- `.../client/render/structure/selection/StructureSelectionOutline.java` —
+  vanilla outline render-state override
+- `.../mixin/client/StructureHitResultMixin.java` — tail of
+  `Minecraft.pick(float)`
 
 Edited support files:
 
@@ -63,8 +76,9 @@ Edited support files:
   now reads explicit states from `StatefulVoxelVolume` (restored structures), so
   edits do not fall back to stone on the next save.
 
-No core physics file, config file, `fabric.mod.json`, mixin config or renderer
-file was edited.
+No core physics file, config file or `fabric.mod.json` was edited. The only
+mixin-config change is adding `StructureHitResultMixin` to
+`crythst-client.mixins.json`.
 
 ---
 
@@ -94,12 +108,28 @@ In `CrythstClient.onInitializeClient()`:
 io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInteraction.register();
 ```
 
-This registers `ClientPreAttackCallback` and an end-of-client-tick placement
-poll. The pre-attack hook only intercepts when the structure ray wins against a
-real-block clip, or when the main-hand item is in `ItemTags.SHOVELS` and the
-crosshair is over water. The placement poll only sends `PLACE` when the held
-item is a `BlockItem` and no real block is in reach; real block targets stay on
-the vanilla `useOn` path and are resolved by the server `UseBlockCallback`.
+This registers `ClientPreAttackCallback`, an end-of-client-tick placement poll,
+and the vanilla outline override. `StructureHitResultMixin` runs after
+`Minecraft.pick(float)` and replaces `Minecraft.hitResult` with a synthetic
+`BlockHitResult` for the structure voxel when the structure is strictly closer
+than the real block/entity. The pre-attack hook and placement poll read that
+same hit through `ClientStructureTargeting.activeHit(...)`; they do not
+re-raycast a second target. A real block in front means `activeHit` is null and
+vanilla keeps the click. `SHOVEL_WATER` still falls back to the real fluid clip
+when no structure target is active. The placement poll sends `PLACE` only when
+the held item is a `BlockItem` and the active hit is the structure.
+
+The old custom white-box renderer is disabled. The event registration is:
+
+```java
+LevelExtractionEvents.AFTER_BLOCK_OUTLINE_EXTRACTION.register(
+        StructureSelectionOutline::afterBlockOutlineExtraction);
+```
+
+It is called from `ClientStructureInteraction.register();`, so no extra
+entrypoint line is needed. The existing
+`LevelRenderEvents.BEFORE_GIZMOS.register(StructureSelectionRenderer::render);`
+line is now a no-op and may be deleted later.
 
 ### 3.3 Commands
 
@@ -143,10 +173,19 @@ StructureHit hit = StructureInteraction.raycast(ServerPlayer player, double reac
 StructureInteraction.BreakResult br = StructureInteraction.breakBlock(player, hit);
 // br.success(), br.structureRemoved(), br.previousState()
 
-// Place on the face adjacent to the hit. Works for mutable and restored
-// volumes; an outer-face target expands the volume by one cell.
+// Place the held stack's block on the face adjacent to the hit. The server
+// resolves orientation from the current look/face; no state crosses the wire.
+StructureInteraction.PlaceResult pr = StructureInteraction.placeBlock(
+        player, hit, player.getMainHandItem());
+
+// Lower-level overload when a state is already known.
 StructureInteraction.PlaceResult pr = StructureInteraction.placeBlock(
         player, hit, Blocks.STONE.defaultBlockState());
+
+// The resolved placement state (also applies the stack's BLOCK_STATE
+// component, if present).
+BlockState placement = StructureInteraction.placementState(
+        player, player.getMainHandItem(), hit);
 
 // Placeholder for right-click block logic. Returns the stored BlockState
 // (or null) without changing anything.
@@ -171,6 +210,8 @@ hit.voxelX();         // resolved structure-local voxel
 hit.voxelY();
 hit.voxelZ();
 hit.face();           // structure-local cardinal direction
+hit.worldFace();      // transformed world-space cardinal face
+hit.clickResult();    // synthetic vanilla BlockHitResult for placement state
 hit.adjacentX();      // voxel + face step (placement target)
 hit.adjacentY();
 hit.adjacentZ();
@@ -200,18 +241,32 @@ hit.distance();       // world-space distance
 
 1. Accepts `MutableVoxelVolume` and `RestoredStructureVolume`.
 2. Target is `voxel + face`, resolved from the ray normal in structure-local
-   space.
-3. If the target is inside the bounds it must be empty.
-4. If the target is outside (outer face), the bounds are expanded by one cell,
+   space. The same face is transformed to world space for the placement
+   context, so a rotated structure still places into the visually adjacent
+   cell.
+3. The server builds a `BlockPlaceContext` from the player's main hand, a
+   synthetic `BlockHitResult` at the structure hit (inside `false`) and the
+   player's current look vector. It calls
+   `Block#getStateForPlacement(context)` — the same hook
+   `BlockItem.getPlacementState` delegates to — and falls back to the default
+   state when the block returns `null`. Stairs use player yaw and click
+   fraction, slabs use clicked face + top/bottom fraction, pillars/logs use the
+   clicked world face axis, and fences/trapdoors use their normal placement
+   rules. `BlockItem.canPlace` is intentionally not consulted because structure
+   voxels are not in the real `Level`.
+4. The stack's `minecraft:block_state` component is applied to the resolved
+   state, matching vanilla's placement-component handling.
+5. If the target is inside the bounds it must be empty.
+6. If the target is outside (outer face), the bounds are expanded by one cell,
    all existing solids/mass/material/states are copied into a new
    `MutableVoxelVolume`, and the structure is reindexed. A restored volume
    therefore becomes editable and expandable after the first outside
    placement.
-5. Mass/material come from `MinecraftPhysics.blockPhysics().properties(state)`.
-6. Stores the state in the stateful volume or `StructureBlockStates`.
-7. Reindexes and refreshes the auxiliary block-ticking level.
-8. Applies a small reaction impulse (`400 * 0.3 * miningImpulseScale`).
-9. Plays the state's place sound and notifies listeners.
+7. Mass/material come from `MinecraftPhysics.blockPhysics().properties(state)`.
+8. Stores the state in the stateful volume or `StructureBlockStates`.
+9. Reindexes and refreshes the auxiliary block-ticking level.
+10. Applies a small reaction impulse (`400 * 0.3 * miningImpulseScale`).
+11. Plays the state's place sound and notifies listeners.
 
 `beginPlacement(player)` collapses duplicate right-click paths (vanilla
 `UseBlockCallback`/`UseItemCallback` plus the client `PLACE` payload) within two
@@ -241,11 +296,12 @@ server ticks. This is what prevents one physical click from placing two blocks.
 - `1` = `PLACE`
 - `2` = `SHOVEL_WATER`
 
-It carries no coordinates. The server re-runs the authoritative raycast from the
-player's server-side eye position and look vector, so a modified client cannot
-name an arbitrary structure/voxel. `PLACE` uses the server's current main-hand
-`BlockItem` state and the same footprint/occlusion checks as the block
-callbacks.
+It carries no coordinates and no block state. The server re-runs the
+authoritative raycast from the player's server-side eye position and look
+vector, so a modified client cannot name an arbitrary structure/voxel or force
+an orientation. `PLACE` recomputes the placement state from the server's
+current main-hand stack, server-side look direction and the server-resolved hit
+face, then applies the same footprint/occlusion checks as the block callbacks.
 
 Registration uses the 26.3 signatures:
 
@@ -326,10 +382,13 @@ so vanilla reach attributes and modifiers still apply.
 3. **No drops or statistics.** The state side table and `BlockChangeListener`
    are the hooks, but the default implementation does not spawn items, call
    `Block.getDrops`, award stats or damage tools.
-4. **No block-state fidelity on placement.** Placement uses
-   `BlockItem.getBlock().defaultBlockState()`. Orientation, waterlogged state,
-   block entities, `BlockPlaceContext` neighbours and `canSurvive` checks are
-   not applied. The item is shrunk by one in survival only.
+4. **Placement context neighbours are virtual-air.** Orientation and
+   click-based properties are correct, but `BlockPlaceContext` still reads the
+   real `Level` for neighbour-dependent state. Fences therefore do not visually
+   connect to adjacent structure voxels unless the world happens to contain the
+   same blocks, and waterlogged/support checks are not applied. Block entities
+   carried by the stack are not created inside the structure. The item is
+   shrunk by one in survival only.
 5. **Expansion copies the whole grid.** Building on an outer face creates a new
    expanded `MutableVoxelVolume` and copies every solid cell/state. This is fine
    for the current structure sizes but is O(volume) and changes the volume
@@ -339,25 +398,35 @@ so vanilla reach attributes and modifiers still apply.
    the structure API is out of scope.
 7. **No right-click interaction dispatch.** `interactBlock` only returns the
    stored state. Container/block-use logic is not forwarded.
-8. **Structure entity/terrain occlusion is approximate.** The server compares
-   physics ray distance with the client's reported vanilla hit (or a server-side
-   `ClipContext` for item use/PLACE) with a 0.35-block slack. Entities are not
-   considered by the server payload path.
+8. **Occlusion uses a small tolerance.** The client installs the synthetic hit
+   only when the structure is strictly closer than the real block/entity. The
+   server compares the physics ray with the client's reported hit (or a
+   server-side `ClipContext`) using a 0.02-block tolerance to absorb independent
+   ray quantisation. Entities are not considered by the server payload path.
 9. **Water recoil does not push a structure body.** It applies to the player
    only. A future version could apply the opposite impulse to a body if the
    water is inside/adjacent to a structure.
 10. **The client `PLACE` path is a tick poll, not a vanilla callback.** It uses
     an edge-detected `keyUse` poll because Fabric exposes no pre-use-client
-    callback. Real-block targets stay on the normal `useOn` path; only
-    virtual-air targets use `PLACE`.
+    callback. Because the real hit result is now synthetic, vanilla also sends
+    `useOn` for the virtual position; `beginPlacement` collapses the duplicate.
+11. **Arbitrarily rotated outlines are enclosing boxes.** The vanilla
+    `VoxelShape` used by `BlockOutlineRenderState` is axis-aligned. An
+    axis-aligned identity pose at `blockScale == 1` gets the exact block-state
+    shape; scaled or 90-degree-rotated structures get the transformed union of
+    the state shape's boxes, which is exact for grid-aligned rotations. For an
+    arbitrary rotation each transformed box is represented by its world AABB, so
+    the outline over-approximates the rendered voxel. The line style, colour and
+    width are always vanilla.
 
 ### Suggested next step for full client-authoritative mining
 
 1. Extend the network snapshot factory to read `StatefulVoxelVolume` and
    `StructureBlockStates`, so mutable/restored structures keep real block
    appearances in multiplayer.
-2. Add a client-side raycast in `GameRenderer.pick`/`MultiPlayerGameMode` that
-   returns a virtual hit (body id + voxel + face) and a break-progress record.
+2. Extend the real-hit path with a break-progress record attached to the
+   selected voxel (body id + voxel + face are already available on
+   `ClientStructureRay.Hit`).
 3. Send a validated `START/STOP/ABORT` payload with body id + voxel + sequence;
    the server re-checks reach, occupancy and ownership before editing.
 4. Run vanilla hardness/tool-speed logic against the synced state, then emit
@@ -370,8 +439,17 @@ so vanilla reach attributes and modifiers still apply.
 - `/crythstinteraction ray` isolates server-side raycast/volume problems from
   client input problems.
 - `/crythstinteraction mine|place|water` exercise the server API directly.
-- `StructureRayMathTest` unit-tests the pure slab ray/AABB math used by the
-  client raycast.
+- `StructureRayMathTest` unit-tests the pure slab ray/AABB math and entry
+  normals used by the client raycast.
+- `StructurePlacementMathTest` verifies world-space face transforms
+  (including a 90-degree yaw), the synthetic click staying inside the clicked
+  voxel, stair/slab click fractions, pillar axis source and the exact-grid
+  outline predicate.
+- `StructurePlacementVanillaRulesTest` calls the real
+  `StairBlock`/`SlabBlock`/`RotatedPillarBlock#getStateForPlacement` hooks with
+  the synthetic click and asserts stairs facing/half, slab type and log axis.
+- `StructureSelectionMathTest` verifies voxel selection and local face
+  resolution for positive, negative and rotated poses.
 - `RestoredStructureVolumeEditTest` verifies that a restored volume supports
   break and place edits (mass/material included).
 

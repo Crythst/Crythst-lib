@@ -110,7 +110,7 @@ public final class StructureInteractionCommand {
             return 0;
         }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                player, hit, blockItem.getBlock().defaultBlockState());
+                player, hit, stack);
         if (!result.success()) {
             source.sendFailure(Component.literal(
                     "Crythst: target voxel is occupied or read-only"

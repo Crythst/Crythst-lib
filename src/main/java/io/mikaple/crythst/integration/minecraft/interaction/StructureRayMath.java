@@ -13,6 +13,13 @@ public final class StructureRayMath {
     }
 
     /**
+     * A ray/box intersection with the outward surface normal at the entry
+     * point. The normal is zero when the ray starts inside the box.
+     */
+    public record BoxHit(double distance, double normalX, double normalY, double normalZ) {
+    }
+
+    /**
      * Intersects a ray with an axis-aligned box.
      *
      * @param origin      ray origin
@@ -31,15 +38,31 @@ public final class StructureRayMath {
                                 double minX, double minY, double minZ,
                                 double maxX, double maxY, double maxZ,
                                 double maxDistance) {
+        final BoxHit hit = rayBoxHit(origin, direction, minX, minY, minZ,
+                maxX, maxY, maxZ, maxDistance);
+        return hit == null ? -1.0 : hit.distance();
+    }
+
+    /**
+     * Intersects a ray with an axis-aligned box and reports the entry normal.
+     *
+     * @return the hit, or {@code null} on a miss
+     */
+    public static BoxHit rayBoxHit(Vector3dc origin, Vector3dc direction,
+                                   double minX, double minY, double minZ,
+                                   double maxX, double maxY, double maxZ,
+                                   double maxDistance) {
         if (maxDistance < 0.0) {
-            return -1.0;
+            return null;
         }
         double tMin = 0.0;
         double tMax = maxDistance;
+        int axis = -1;
+        int sign = 0;
 
         if (Math.abs(direction.x()) < EPSILON) {
             if (origin.x() < minX || origin.x() > maxX) {
-                return -1.0;
+                return null;
             }
         } else {
             double t1 = (minX - origin.x()) / direction.x();
@@ -49,16 +72,20 @@ public final class StructureRayMath {
                 t1 = t2;
                 t2 = swap;
             }
-            tMin = Math.max(tMin, t1);
+            if (t1 > tMin) {
+                tMin = t1;
+                axis = 0;
+                sign = direction.x() > 0.0 ? -1 : 1;
+            }
             tMax = Math.min(tMax, t2);
             if (tMin > tMax) {
-                return -1.0;
+                return null;
             }
         }
 
         if (Math.abs(direction.y()) < EPSILON) {
             if (origin.y() < minY || origin.y() > maxY) {
-                return -1.0;
+                return null;
             }
         } else {
             double t1 = (minY - origin.y()) / direction.y();
@@ -68,16 +95,20 @@ public final class StructureRayMath {
                 t1 = t2;
                 t2 = swap;
             }
-            tMin = Math.max(tMin, t1);
+            if (t1 > tMin) {
+                tMin = t1;
+                axis = 1;
+                sign = direction.y() > 0.0 ? -1 : 1;
+            }
             tMax = Math.min(tMax, t2);
             if (tMin > tMax) {
-                return -1.0;
+                return null;
             }
         }
 
         if (Math.abs(direction.z()) < EPSILON) {
             if (origin.z() < minZ || origin.z() > maxZ) {
-                return -1.0;
+                return null;
             }
         } else {
             double t1 = (minZ - origin.z()) / direction.z();
@@ -87,13 +118,20 @@ public final class StructureRayMath {
                 t1 = t2;
                 t2 = swap;
             }
-            tMin = Math.max(tMin, t1);
+            if (t1 > tMin) {
+                tMin = t1;
+                axis = 2;
+                sign = direction.z() > 0.0 ? -1 : 1;
+            }
             tMax = Math.min(tMax, t2);
             if (tMin > tMax) {
-                return -1.0;
+                return null;
             }
         }
 
-        return tMin;
+        final double nx = axis == 0 ? sign : 0.0;
+        final double ny = axis == 1 ? sign : 0.0;
+        final double nz = axis == 2 ? sign : 0.0;
+        return new BoxHit(tMin, nx, ny, nz);
     }
 }

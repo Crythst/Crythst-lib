@@ -18,16 +18,21 @@ import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.world.PhysicsWorld;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.BlockItemStateProperties;
 import net.minecraft.world.item.component.SwingAnimation;
+import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.BlockHitResult;
@@ -66,8 +71,13 @@ public final class StructureInteraction {
     public static final double WATER_RECOIL = 0.55;
     /** Extra "up" component of the water recoil. */
     public static final double WATER_LIFT = 0.18;
-    /** Distance slack used when deciding whether a structure is in front of a vanilla hit. */
-    public static final double FRONT_SLACK = 0.35;
+    /**
+     * Distance tolerance used when deciding whether a structure is in front of
+     * a vanilla hit. This is deliberately small: a real block must win when it
+     * is genuinely closer, while a few millimetres of ray quantisation between
+     * client and server must not hide a structure that is visibly in front.
+     */
+    public static final double FRONT_SLACK = 0.02;
 
     private static final List<BlockChangeListener> LISTENERS = new CopyOnWriteArrayList<>();
     /**
@@ -315,6 +325,62 @@ public final class StructureInteraction {
     }
 
     /**
+     * Resolves the block state a held block item would place for this hit.
+     *
+     * <p>The client never supplies a state. The server rebuilds a vanilla
+     * {@link BlockPlaceContext} from the player's current look direction, the
+     * clicked structure face and the stack, then asks
+     * {@link Block#getStateForPlacement(BlockPlaceContext)}. This is the same
+     * hook {@code BlockItem.getPlacementState} delegates to, so stairs, slabs,
+     * trapdoors, fences, logs and pillars honour player yaw/pitch, the clicked
+     * face and the placement rules. {@code BlockItem.getPlacementState} is
+     * protected; calling the public block hook avoids an accessor while keeping
+     * the exact state semantics. We intentionally skip
+     * {@code BlockItem.canPlace}: structure voxels are not part of the real
+     * {@code Level}, so vanilla's support/unobstructed checks would reject
+     * otherwise valid placements.</p>
+     *
+     * <p>The {@code minecraft:block_state} component carried by the stack (for
+     * example a debug-stick-styled item or a loot-table-defined item) is applied
+     * afterwards, exactly as vanilla does when it places a block.</p>
+     *
+     * @return the resolved state, or {@code null} when the stack is not a block
+     *         item or resolves to air
+     */
+    public static BlockState placementState(Player player, ItemStack stack, StructureHit hit) {
+        if (player == null || stack == null || hit == null
+                || !(stack.getItem() instanceof BlockItem blockItem)) {
+            return null;
+        }
+        final BlockState placed = blockItem.getBlock().getStateForPlacement(
+                new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack,
+                        hit.clickResult()));
+        final BlockState resolved = placed != null
+                ? placed
+                : blockItem.getBlock().defaultBlockState();
+        final BlockState withComponents;
+        try {
+            withComponents = stack.getOrDefault(DataComponents.BLOCK_STATE,
+                    BlockItemStateProperties.EMPTY).apply(resolved);
+        } catch (RuntimeException ignored) {
+            // An invalid component must not make placement impossible.
+            return resolved.isAir() ? null : resolved;
+        }
+        return withComponents.isAir() ? null : withComponents;
+    }
+
+    /**
+     * Server-authoritative placement of the held block item.
+     *
+     * @param stack the stack in the player's main hand; only its item and
+     *              components are read
+     */
+    public static PlaceResult placeBlock(ServerPlayer player, StructureHit hit, ItemStack stack) {
+        final BlockState state = placementState(player, stack, hit);
+        return state == null ? PlaceResult.FAILED : placeBlock(player, hit, state);
+    }
+
+    /**
      * Adds a block into the structure voxel adjacent to the hit face.
      *
      * <p>If the target is inside the current bounds it must be empty. If it is
@@ -511,8 +577,7 @@ public final class StructureInteraction {
                         || !beginPlacement(player)) {
                     yield false;
                 }
-                final PlaceResult result = placeBlock(player, hit,
-                        blockItem.getBlock().defaultBlockState());
+                final PlaceResult result = placeBlock(player, hit, stack);
                 if (result.success() && !player.isCreative()) {
                     stack.shrink(1);
                 }

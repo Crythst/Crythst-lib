@@ -111,7 +111,7 @@ public final class StructureInteractionEvents {
             return InteractionResult.SUCCESS_SERVER;
         }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                serverPlayer, hit, blockItem.getBlock().defaultBlockState());
+                serverPlayer, hit, stack);
         if (!result.success()) {
             return InteractionResult.FAIL;
         }
@@ -146,7 +146,7 @@ public final class StructureInteractionEvents {
             return InteractionResult.SUCCESS_SERVER;
         }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                serverPlayer, hit, blockItem.getBlock().defaultBlockState());
+                serverPlayer, hit, stack);
         if (!result.success()) {
             return InteractionResult.FAIL;
         }

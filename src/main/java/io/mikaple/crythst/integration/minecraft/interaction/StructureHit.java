@@ -3,6 +3,7 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 import io.mikaple.crythst.physics.query.RayHit;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import net.minecraft.core.Direction;
+import net.minecraft.world.phys.BlockHitResult;
 import org.joml.Vector3d;
 
 /**
@@ -47,5 +48,21 @@ public record StructureHit(
 
     public int adjacentZ() {
         return voxelZ + face.getStepZ();
+    }
+
+    /**
+     * World-space cardinal face corresponding to {@link #face()}. Placement
+     * uses this for both the synthetic click and the placement-state rules, so
+     * a rotated structure still behaves like the block face the player sees.
+     */
+    public Direction worldFace() {
+        return StructurePlacementMath.worldFace(structure.pose(), face);
+    }
+
+    /**
+     * Synthetic vanilla click for placement-state resolution.
+     */
+    public BlockHitResult clickResult() {
+        return StructurePlacementMath.blockHit(point(), worldFace());
     }
 }

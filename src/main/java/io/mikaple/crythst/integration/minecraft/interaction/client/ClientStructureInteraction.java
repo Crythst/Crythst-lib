@@ -36,10 +36,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * correctly.</p>
  */
 public final class ClientStructureInteraction {
-    /** Structure must be at least this much closer than a real block to win. */
-    private static final double OCCLUSION_SLACK = 0.05;
-    /** Bias so a structure directly behind water still wins a near-tie. */
-    private static final double STRUCTURE_PRIORITY = 0.05;
     /** Repeat interval for hold-to-mine; one voxel per interval. */
     private static final int MINE_REPEAT_TICKS = 5;
 
@@ -60,6 +56,10 @@ public final class ClientStructureInteraction {
         }
         ClientPreAttackCallback.EVENT.register(ClientStructureInteraction::onPreAttack);
         ClientTickEvents.END_CLIENT_TICK.register(ClientStructureInteraction::tickPlacement);
+        // Register the vanilla-outline override here because the client
+        // entrypoint already calls this method. It must run after vanilla has
+        // extracted its own block outline.
+        io.mikaple.crythst.client.render.structure.selection.StructureSelectionOutline.register();
     }
 
     private static boolean onPreAttack(Minecraft client, LocalPlayer player, int clickCount) {
@@ -70,29 +70,24 @@ public final class ClientStructureInteraction {
         }
         final double reach = player.blockInteractionRange();
         final Vec3 eye = player.getEyePosition();
-        final ClientStructureRay.Hit structureHit = ClientStructureRay.raycast(player, reach);
-        final BlockHitResult realBlock = blockHit(player, reach, ClipContext.Fluid.NONE);
-        final double realDistance = distance(eye, realBlock);
+        // This is exactly the hit Minecraft shows and uses for interactions.
+        // It is only non-null when the structure won the real-block comparison
+        // in ClientStructureTargeting.
+        final ClientStructureRay.Hit structureHit = ClientStructureTargeting.activeHit(client);
         final boolean holdingShovel = player.getMainHandItem().is(ItemTags.SHOVELS);
 
         BlockHitResult waterHit = null;
-        double waterDistance = Double.POSITIVE_INFINITY;
-        if (holdingShovel) {
+        if (structureHit == null && holdingShovel) {
             final BlockHitResult fluidHit = blockHit(player, reach, ClipContext.Fluid.ANY);
             if (fluidHit.getType() == HitResult.Type.BLOCK) {
                 final FluidState fluid = player.level().getFluidState(fluidHit.getBlockPos());
                 if (!fluid.isEmpty() && fluid.is(FluidTags.WATER)) {
                     waterHit = fluidHit;
-                    waterDistance = eye.distanceTo(fluidHit.getLocation());
                 }
             }
         }
 
-        final boolean structureTarget = structureHit != null
-                && structureHit.distance() <= realDistance + OCCLUSION_SLACK
-                && structureHit.distance() <= waterDistance + STRUCTURE_PRIORITY;
-        final boolean waterTarget = waterHit != null;
-        if (!structureTarget && !waterTarget) {
+        if (structureHit == null && waterHit == null) {
             return false;
         }
         if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
@@ -103,7 +98,7 @@ public final class ClientStructureInteraction {
         // fresh press has clickCount >= 1 and a held key has 0. The initial
         // click must use != 0; while held, a slow repeat keeps hold-to-mine
         // working without spending == 0 as the click signal.
-        if (structureTarget) {
+        if (structureHit != null) {
             final boolean initialClick = clickCount != 0;
             final boolean repeat = player.tickCount - lastMineTick >= MINE_REPEAT_TICKS;
             if (initialClick || repeat) {
@@ -135,15 +130,9 @@ public final class ClientStructureInteraction {
             // Let vanilla handle an entity interaction in front of the structure.
             return;
         }
-        final double reach = player.blockInteractionRange();
-        final ClientStructureRay.Hit structureHit = ClientStructureRay.raycast(player, reach);
-        if (structureHit == null) {
-            return;
-        }
-        final BlockHitResult realBlock = blockHit(player, reach, ClipContext.Fluid.NONE);
-        if (realBlock.getType() != HitResult.Type.MISS) {
-            // A real block is in reach. Vanilla will send useOn and the server
-            // UseBlockCallback decides whether the structure is in front.
+        // Use the same hit Minecraft picked this frame. A real block in front
+        // of the structure means this is null, so vanilla keeps the click.
+        if (ClientStructureTargeting.activeHit(client) == null) {
             return;
         }
         if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
@@ -165,11 +154,5 @@ public final class ClientStructureInteraction {
         final Vec3 end = eye.add(look.x * reach, look.y * reach, look.z * reach);
         return player.level().clip(new ClipContext(
                 eye, end, ClipContext.Block.COLLIDER, fluidMode, player));
-    }
-
-    private static double distance(Vec3 eye, HitResult hit) {
-        return hit == null || hit.getType() != HitResult.Type.BLOCK
-                ? Double.POSITIVE_INFINITY
-                : eye.distanceTo(hit.getLocation());
     }
 }

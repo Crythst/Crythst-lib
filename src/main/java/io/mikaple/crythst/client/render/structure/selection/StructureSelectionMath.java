@@ -1,6 +1,7 @@
 package io.mikaple.crythst.client.render.structure.selection;
 
 import io.mikaple.crythst.math.Transform3d;
+import net.minecraft.core.Direction;
 import org.joml.Vector3d;
 
 /**
@@ -130,5 +131,66 @@ public final class StructureSelectionMath {
         }
 
         return found ? new Cell(bestX, bestY, bestZ) : null;
+    }
+
+    /**
+     * Converts a world point to the voxel containing it without requiring the
+     * cell to be solid. Used as a last-resort fallback after a collider hit.
+     */
+    public static Cell cellAt(Transform3d structurePose, Vector3d worldPoint, double blockScale) {
+        if (structurePose == null || worldPoint == null) {
+            return null;
+        }
+        final double scale = blockScale > 1.0e-9 ? blockScale : 1.0;
+        final Vector3d local = structurePose.inverseTransformPoint(worldPoint);
+        local.div(scale);
+        return new Cell((int) Math.floor(local.x), (int) Math.floor(local.y),
+                (int) Math.floor(local.z));
+    }
+
+    /**
+     * Resolves the structure-local face of a hit voxel from the local hit
+     * point. The closest cell boundary wins, which is more accurate than using
+     * the dominant ray axis for oblique hits and works for merged collider
+     * boxes as well as individual cells.
+     */
+    public static Direction localFace(Transform3d structurePose, Vector3d worldHit,
+                                      double blockScale, Cell cell) {
+        if (structurePose == null || worldHit == null || cell == null) {
+            return Direction.UP;
+        }
+        final double scale = blockScale > 1.0e-9 ? blockScale : 1.0;
+        final Vector3d local = structurePose.inverseTransformPoint(worldHit);
+        local.div(scale);
+        final double fx = local.x - cell.x();
+        final double fy = local.y - cell.y();
+        final double fz = local.z - cell.z();
+
+        double best = Double.POSITIVE_INFINITY;
+        Direction face = Direction.UP;
+        if (fx < best) {
+            best = fx;
+            face = Direction.WEST;
+        }
+        if (1.0 - fx < best) {
+            best = 1.0 - fx;
+            face = Direction.EAST;
+        }
+        if (fy < best) {
+            best = fy;
+            face = Direction.DOWN;
+        }
+        if (1.0 - fy < best) {
+            best = 1.0 - fy;
+            face = Direction.UP;
+        }
+        if (fz < best) {
+            best = fz;
+            face = Direction.NORTH;
+        }
+        if (1.0 - fz < best) {
+            face = Direction.SOUTH;
+        }
+        return face;
     }
 }

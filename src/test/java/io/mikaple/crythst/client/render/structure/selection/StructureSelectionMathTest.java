@@ -1,6 +1,7 @@
 package io.mikaple.crythst.client.render.structure.selection;
 
 import io.mikaple.crythst.math.Transform3d;
+import net.minecraft.core.Direction;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.Test;
@@ -60,6 +61,41 @@ class StructureSelectionMathTest {
 
         assertNull(StructureSelectionMath.findCell(
                 POSE, worldHit, worldRay, SCALE, (x, y, z) -> false));
+    }
+
+    @Test
+    void hitPointResolvesTheVisibleLocalFace() {
+        assertLocalFace(Direction.EAST, 1.0, 0.5, 0.5);
+        assertLocalFace(Direction.WEST, 0.0, 0.5, 0.5);
+        assertLocalFace(Direction.UP, 0.5, 1.0, 0.5);
+        assertLocalFace(Direction.DOWN, 0.5, 0.0, 0.5);
+        assertLocalFace(Direction.SOUTH, 0.5, 0.5, 1.0);
+        assertLocalFace(Direction.NORTH, 0.5, 0.5, 0.0);
+    }
+
+    @Test
+    void cellAtFindsTheVoxelContainingTheWorldPoint() {
+        final Vector3d world = POSE.transformPoint(new Vector3d(
+                (CELL_X + 0.25) * SCALE,
+                (CELL_Y + 0.75) * SCALE,
+                (CELL_Z + 0.5) * SCALE));
+
+        final StructureSelectionMath.Cell cell = StructureSelectionMath.cellAt(POSE, world, SCALE);
+
+        assertEquals(CELL_X, cell.x());
+        assertEquals(CELL_Y, cell.y());
+        assertEquals(CELL_Z, cell.z());
+    }
+
+    private static void assertLocalFace(Direction expected, double fx, double fy, double fz) {
+        final Vector3d localHit = new Vector3d(
+                (CELL_X + fx) * SCALE,
+                (CELL_Y + fy) * SCALE,
+                (CELL_Z + fz) * SCALE);
+        final Vector3d worldHit = POSE.transformPoint(localHit);
+
+        assertEquals(expected, StructureSelectionMath.localFace(POSE, worldHit, SCALE,
+                new StructureSelectionMath.Cell(CELL_X, CELL_Y, CELL_Z)));
     }
 
     private static void assertFace(int hitNormalX, int hitNormalY, int hitNormalZ,
