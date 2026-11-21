@@ -182,7 +182,7 @@ contains pure tests that do not start a Minecraft server:
 
 * one full cube is one component;
 * two separated islands become two components in deterministic order;
-* diagonal contact does not connect;
+* diagonal and corner-only contact keeps blocks in one body;
 * a connected L shape is one component with multiple merged boxes;
 * air-only volumes produce no components;
 * empty and zero-mass volumes are reported massless.

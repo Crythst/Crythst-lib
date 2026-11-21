@@ -50,7 +50,7 @@ class StructureSplitterTest {
     }
 
     @Test
-    void diagonalContactIsNotConnected() {
+    void diagonalContactKeepsBlocksTogether() {
         final IntBounds3 bounds = new IntBounds3(0, 0, 0, 2, 1, 2);
         final MutableVoxelVolume volume = VoxelVolumes.empty(bounds);
         volume.setBlock(0, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
@@ -58,9 +58,21 @@ class StructureSplitterTest {
 
         final List<StructureSplitter.Component> components = StructureSplitter.findComponents(volume);
 
-        assertEquals(2, components.size());
-        assertEquals(1, components.get(0).cellCount());
-        assertEquals(1, components.get(1).cellCount());
+        assertEquals(1, components.size());
+        assertEquals(2, components.get(0).cellCount());
+    }
+
+    @Test
+    void cornerOnlyContactKeepsBlocksTogether() {
+        final IntBounds3 bounds = new IntBounds3(0, 0, 0, 2, 2, 2);
+        final MutableVoxelVolume volume = VoxelVolumes.empty(bounds);
+        volume.setBlock(0, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
+        volume.setBlock(1, 1, 1, true, BLOCK_MASS, PhysicsMaterial.STONE);
+
+        final List<StructureSplitter.Component> components = StructureSplitter.findComponents(volume);
+
+        assertEquals(1, components.size());
+        assertEquals(2, components.get(0).cellCount());
     }
 
     @Test

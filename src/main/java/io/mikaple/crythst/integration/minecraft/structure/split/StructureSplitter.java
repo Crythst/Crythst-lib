@@ -33,9 +33,9 @@ import java.util.Objects;
 /**
  * Splits one physics structure into its disconnected solid components.
  *
- * <p>A component is a maximal set of solid voxels connected through the six
- * axis-aligned neighbours. Diagonal or corner contact does not connect two
- * components. The scan is bounded by {@link #MAX_CELLS} so a malformed volume
+ * <p>A component is a maximal set of solid voxels connected through any of the
+ * 26 surrounding cells: face, edge and corner contact all keep two blocks in
+ * the same body. The scan is bounded by {@link #MAX_CELLS} so a malformed volume
  * cannot make the server walk an unbounded grid.</p>
  *
  * <p>The split keeps the original <em>bounds</em> for every new volume. Voxel
@@ -84,8 +84,8 @@ public final class StructureSplitter {
     }
 
     /**
-     * Finds all six-neighbour connected solid components in deterministic
-     * order.
+     * Finds all 26-neighbour connected solid components in deterministic
+     * order. Face, edge and diagonal (corner) contact all connect cells.
      *
      * <p>Air cells are ignored. Components are ordered by their first cell in
      * the same Y/Z/X scan order used by the collider builder, and cells inside a
@@ -140,29 +140,30 @@ public final class StructureSplitter {
                         final int worldY = bounds.minY() + localY;
                         final int worldZ = bounds.minZ() + localZ;
 
-                        if (localX > 0) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current - 1, worldX - 1, worldY, worldZ);
-                        }
-                        if (localX + 1 < sizeX) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current + 1, worldX + 1, worldY, worldZ);
-                        }
-                        if (localZ > 0) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current - sizeX, worldX, worldY, worldZ - 1);
-                        }
-                        if (localZ + 1 < sizeZ) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current + sizeX, worldX, worldY, worldZ + 1);
-                        }
-                        if (localY > 0) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current - layer, worldX, worldY - 1, worldZ);
-                        }
-                        if (localY + 1 < sizeY) {
-                            tail = enqueue(volume, visited, queue, tail,
-                                    current + layer, worldX, worldY + 1, worldZ);
+                        // 26-neighbour connectivity: a block keeps the body
+                        // together through faces, edges and corners.
+                        for (int dy = -1; dy <= 1; dy++) {
+                            final int neighbourY = worldY + dy;
+                            if (neighbourY < bounds.minY() || neighbourY >= bounds.maxY()) {
+                                continue;
+                            }
+                            for (int dz = -1; dz <= 1; dz++) {
+                                final int neighbourZ = worldZ + dz;
+                                if (neighbourZ < bounds.minZ() || neighbourZ >= bounds.maxZ()) {
+                                    continue;
+                                }
+                                for (int dx = -1; dx <= 1; dx++) {
+                                    final int neighbourX = worldX + dx;
+                                    if ((dx | dy | dz) == 0
+                                            || neighbourX < bounds.minX()
+                                            || neighbourX >= bounds.maxX()) {
+                                        continue;
+                                    }
+                                    tail = enqueue(volume, visited, queue, tail,
+                                            index(bounds, neighbourX, neighbourY, neighbourZ),
+                                            neighbourX, neighbourY, neighbourZ);
+                                }
+                            }
                         }
                     }
 
