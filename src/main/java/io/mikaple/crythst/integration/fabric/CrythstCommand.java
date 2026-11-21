@@ -9,12 +9,12 @@ import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.entity.EntityPhysicsCollisionManager;
 import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
-import io.mikaple.crythst.physics.body.BodyDef;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.physics.body.BodyHandle;
+import io.mikaple.crythst.physics.body.BodyType;
 import io.mikaple.crythst.physics.body.BodySnapshot;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
-import io.mikaple.crythst.physics.shape.Shapes;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureDef;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
@@ -27,6 +27,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.Blocks;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 
@@ -182,18 +183,24 @@ public final class CrythstCommand {
     private static int cube(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context) {
         final CommandSourceStack source = context.getSource();
         final LevelPhysics physics = MinecraftPhysics.get(source.getLevel());
-        // Spawn a one-metre stone cube a few blocks above the command source so
-        // it visibly falls and collides with nearby terrain.
+        // Spawn a real one-block physics structure, not a bare collision shape,
+        // so the batched renderer draws the stone block and interaction works.
         final net.minecraft.world.phys.Vec3 spawn = source.getPosition().add(0.0, 4.0, 0.0);
-        final BodyHandle cube = physics.world().createBody(BodyDef.dynamic(Shapes.cube(1.0))
-                .position(new Vector3d(spawn.x, spawn.y, spawn.z))
+        final MutableVoxelVolume volume = VoxelVolumes.filled(
+                new IntBounds3(0, 0, 0, 1, 1, 1),
+                MinecraftPhysics.config().defaultBlockMass, PhysicsMaterial.STONE);
+        final PhysicsStructure cube = physics.createStructure(StructureDef.builder(volume)
+                .type(BodyType.DYNAMIC)
+                .pose(Transform3d.of(new Vector3d(
+                        spawn.x - 0.5, spawn.y - 0.5, spawn.z - 0.5)))
                 .material(PhysicsMaterial.STONE)
                 .damping(0.02, 0.05)
                 .ccd(true)
                 .build());
+        StructureBlockStates.set(cube, 0, 0, 0, Blocks.STONE.defaultBlockState());
         physics.ensureTerrain();
-        source.sendSuccess(() -> Component.literal("Crythst spawned block body #" + cube.id()
-                + " at " + format(cube.transform().position())), true);
+        source.sendSuccess(() -> Component.literal("Crythst spawned block structure #"
+                + cube.body().id() + " at " + format(cube.body().transform().position())), true);
         return 1;
     }
 

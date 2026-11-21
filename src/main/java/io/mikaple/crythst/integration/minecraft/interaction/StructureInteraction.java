@@ -35,6 +35,7 @@ import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
@@ -131,7 +132,34 @@ public final class StructureInteraction {
                 return state;
             }
         }
-        return StructureBlockStates.get(structure, x, y, z);
+        final BlockState stored = StructureBlockStates.get(structure, x, y, z);
+        if (stored != null) {
+            return stored;
+        }
+        // Stateless volumes (for example /crythst demo's filled stone grid)
+        // have no block-state side table. Fall back to a representative
+        // vanilla block for feedback, drops, picking and placement previews
+        // instead of silently producing no particles/sound.
+        if (volume.bounds().contains(x, y, z) && volume.isSolid(x, y, z)) {
+            return fallbackState(volume.blockMaterial(x, y, z));
+        }
+        return null;
+    }
+
+    private static BlockState fallbackState(PhysicsMaterial material) {
+        if (PhysicsMaterial.ICE.equals(material)) {
+            return Blocks.ICE.defaultBlockState();
+        }
+        if (PhysicsMaterial.WOOD.equals(material)) {
+            return Blocks.OAK_PLANKS.defaultBlockState();
+        }
+        if (PhysicsMaterial.METAL.equals(material)) {
+            return Blocks.IRON_BLOCK.defaultBlockState();
+        }
+        if (PhysicsMaterial.DIRT.equals(material)) {
+            return Blocks.DIRT.defaultBlockState();
+        }
+        return Blocks.STONE.defaultBlockState();
     }
 
     /**

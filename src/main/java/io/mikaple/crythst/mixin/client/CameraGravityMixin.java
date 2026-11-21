@@ -1,5 +1,6 @@
 package io.mikaple.crythst.mixin.client;
 
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import net.minecraft.client.Camera;
@@ -54,6 +55,7 @@ public abstract class CameraGravityMixin {
         // Left-multiply in world space: the whole camera basis, including its
         // local up, is carried into the player's gravity frame.
         state.orientation.set(new Quaternionf(gravity).mul(state.orientation));
+        crythst$logGravityCamera(gravity, state);
 
         // Mirror Camera.getViewRotationMatrix(): rotation matrix of the
         // conjugate orientation.
@@ -72,6 +74,24 @@ public abstract class CameraGravityMixin {
                     state.cullFrustum.getCamZ());
             state.cullFrustum.set(frustum);
         }
+    }
+
+    @Unique
+    private static long crythst$lastGravityLogNanos;
+
+    @Unique
+    private static void crythst$logGravityCamera(Quaternionf gravity, CameraRenderState state) {
+        final long now = System.nanoTime();
+        if (now - crythst$lastGravityLogNanos < 1_000_000_000L) {
+            return;
+        }
+        crythst$lastGravityLogNanos = now;
+        final Vector3f up = state.orientation.transform(new Vector3f(0.0f, 1.0f, 0.0f));
+        Crythst.LOGGER.info("Crythst gravity camera: q=({}, {}, {}, {}) up=({}, {}, {})",
+                String.format("%.3f", gravity.x), String.format("%.3f", gravity.y),
+                String.format("%.3f", gravity.z), String.format("%.3f", gravity.w),
+                String.format("%.3f", up.x), String.format("%.3f", up.y),
+                String.format("%.3f", up.z));
     }
 
     /**
