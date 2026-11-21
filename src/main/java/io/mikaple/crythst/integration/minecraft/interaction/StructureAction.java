@@ -9,7 +9,17 @@ public enum StructureAction {
     /** Place the main-hand block item on the structure face under the crosshair. */
     PLACE,
     /** Apply shovel recoil when the crosshair is over water. */
-    SHOVEL_WATER;
+    SHOVEL_WATER,
+    /**
+     * Pick the structure block under the crosshair. The server resolves the
+     * stored state and runs vanilla pick-block handling.
+     */
+    PICK,
+    /**
+     * Pick the structure block and include block data where the player has
+     * infinite materials (vanilla Ctrl+middle-click).
+     */
+    PICK_WITH_DATA;
 
     private static final StructureAction[] VALUES = values();
 

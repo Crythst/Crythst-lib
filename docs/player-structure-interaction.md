@@ -19,6 +19,7 @@ structure raycast against `LevelPhysics`.
 | Left-click a structure block to break it (creative and survival) | `StructureInteraction.breakBlock(...)` via `AttackBlockCallback` and the client `MINE` payload |
 | Breaking applies a reaction impulse to the body | `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)` |
 | Right-click a structure block to place a block | `StructureInteraction.placeBlock(...)` via `UseBlockCallback`, `UseItemCallback`, and the `PLACE` payload for virtual-air targets |
+| Middle-click a structure block to pick it | `StructureInteraction.pickBlock(...)` via the client `PICK` / `PICK_WITH_DATA` payload and vanilla `tryPickItem` |
 | Player-facing orientation on placement | server-built `BlockPlaceContext` + `Block#getStateForPlacement`, so stairs/slabs/logs/pillars/fences/trapdoors use yaw, pitch, clicked face and click position |
 | Selection outline | vanilla outline state built from the same `StructureBlockHitResult`; no custom white box |
 | Real selection target | `ClientLevel.clip(ClipContext)` merges the nearest structure hit into the vanilla clip result; `Minecraft.hitResult` is authoritative without a post-pick override |
@@ -77,6 +78,10 @@ New client helper files:
   `ClientLevel`
 - `.../mixin/client/StructurePlacementMixin.java` — consumes structure
   right-clicks before client-side prediction in `MultiPlayerGameMode.useItemOn`
+- `.../mixin/client/StructurePickBlockMixin.java` — redirects middle-click
+  pick-block for structure hits
+- `.../mixin/ServerGamePacketListenerImplInvoker.java` — exposes vanilla
+  `tryPickItem` for server-side pick-block
 
 Edited support files:
 
@@ -86,9 +91,11 @@ Edited support files:
   now reads explicit states from `StatefulVoxelVolume` (restored structures), so
   edits do not fall back to stone on the next save.
 
-No core physics file, config file or `fabric.mod.json` was edited. The only
-mixin-config changes are `ClientLevelClipMixin` and `StructurePlacementMixin` in
-`crythst-client.mixins.json` (and removing the retired post-pick hit mixin).
+No core physics file, config file or `fabric.mod.json` was edited. The mixin
+config entries are `StructurePickBlockMixin` and `StructurePlacementMixin` in
+`crythst-client.mixins.json`, and `ServerGamePacketListenerImplInvoker` in
+`crythst.mixins.json` (plus the pre-existing `ClientLevelClipMixin`, with the
+retired post-pick hit mixin removed).
 
 ---
 
@@ -133,6 +140,11 @@ the hit is a `StructureBlockHitResult` the click is consumed, only the `PLACE`
 payload is sent, and vanilla never runs `BlockItem.place` on the client. This is
 what prevents the one-tick real-world ghost block and the duplicate local place
 sound. There is no end-of-tick placement poll anymore.
+
+Middle-click is intercepted by `StructurePickBlockMixin` at the head of
+`Minecraft.pickBlockOrEntity`. A structure hit sends `PICK` or
+`PICK_WITH_DATA` and cancels vanilla, so no
+`ServerboundPickItemFromBlockPacket` is sent for an air position.
 
 The old custom white-box renderer is disabled. The event registration is:
 
@@ -325,6 +337,30 @@ server ticks.
   client-authoritative.
 - Plays `SoundEvents.GENERIC_SPLASH`.
 
+### 4.4 Pick block
+
+1. `StructurePickBlockMixin` intercepts `Minecraft.pickBlockOrEntity` at
+   `HEAD`. When `Minecraft.hitResult` is a `StructureBlockHitResult`, it
+   cancels vanilla and sends `PICK` or `PICK_WITH_DATA` depending on
+   `Minecraft.hasControlDown()`. Vanilla never sends
+   `ServerboundPickItemFromBlockPacket` for the virtual position.
+2. The server re-raycasts authoritatively and applies the normal
+   structure-in-front-of-real-blocks check. A genuinely closer real block keeps
+   the vanilla pick path.
+3. `StructureInteraction.pickBlock(...)` reads the stored `BlockState` from the
+   structure hit (with the side-table fallback), calls
+   `BlockState#getCloneItemStack(level, pos, includeData &&
+   player.hasInfiniteMaterials())`, and hands the non-empty stack to vanilla's
+   private `ServerGamePacketListenerImpl#tryPickItem` through
+   `ServerGamePacketListenerImplInvoker`.
+4. Creative therefore adds/picks the item in the hotbar/inventory; survival
+   selects an existing matching stack and otherwise picks nothing, exactly like
+   vanilla.
+5. Ctrl+middle-click data is structure-safe: a real block entity is read only
+   when the real world genuinely contains the same block at the hit position;
+   otherwise the structure's captured block-entity NBT is loaded from
+   `StructureBlockEntityData` using structure-local voxel coordinates.
+
 ---
 
 ## 5. Network payload
@@ -334,6 +370,11 @@ server ticks.
 - `0` = `MINE`
 - `1` = `PLACE`
 - `2` = `SHOVEL_WATER`
+- `3` = `PICK`
+- `4` = `PICK_WITH_DATA`
+
+The three original ordinals are unchanged; pick actions append to the enum so
+the one-byte payload keeps working with existing action ids.
 
 It carries no coordinates and no block state. The server re-runs the
 authoritative raycast from the player's server-side eye position and look

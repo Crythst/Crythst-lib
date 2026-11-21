@@ -9,18 +9,23 @@ import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
+import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
+import io.mikaple.crythst.mixin.ServerGamePacketListenerImplInvoker;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.ProblemReporter;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.BlockItem;
@@ -30,8 +35,10 @@ import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.storage.TagValueOutput;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -455,6 +462,120 @@ public final class StructureInteraction {
         return new PlaceResult(true, x, y, z);
     }
 
+    /**
+     * Picks the structure block described by an authoritative hit.
+     *
+     * <p>The state comes from the structure volume, never from the client. The
+     * item is created with the same {@code BlockState#getCloneItemStack} hook
+     * vanilla uses, then handed to vanilla's private
+     * {@code ServerGamePacketListenerImpl#tryPickItem} through a mixin invoker,
+     * so creative hotbar insertion and survival "select matching stack"
+     * behaviour stay identical.</p>
+     *
+     * <p>{@code includeData} is only honoured for players with infinite
+     * materials, matching vanilla Ctrl+middle-click. Block data is taken from
+     * the structure's own side table; a real block entity is used only when the
+     * real world genuinely contains the same block at the hit position.</p>
+     *
+     * @return whether a non-empty pick stack was handled
+     */
+    public static boolean pickBlock(ServerPlayer player, StructureBlockHitResult hit,
+                                    boolean includeData) {
+        final CrythstConfig config = MinecraftPhysics.config();
+        if (config == null || !config.structureBlockInteractionEnabled
+                || player == null || hit == null || hit.structure() == null) {
+            return false;
+        }
+        final PhysicsStructure structure = hit.structure();
+        if (structure.closed()) {
+            return false;
+        }
+        final VoxelVolume volume = structure.volume();
+        final int x = hit.voxelX();
+        final int y = hit.voxelY();
+        final int z = hit.voxelZ();
+        if (!volume.bounds().contains(x, y, z) || !volume.isSolid(x, y, z)
+                || !(hit.distance() <= player.blockInteractionRange() + 1.0e-6)) {
+            return false;
+        }
+
+        BlockState state = hit.blockState();
+        if (state == null || state.isAir()) {
+            state = stateAt(volume, structure, x, y, z);
+        }
+        if (state == null || state.isAir()) {
+            return false;
+        }
+
+        final ServerLevel level = (ServerLevel) player.level();
+        final boolean withData = includeData && player.hasInfiniteMaterials();
+        final ItemStack stack = state.getCloneItemStack(level, hit.getBlockPos(), withData);
+        if (stack.isEmpty()) {
+            return false;
+        }
+        if (withData) {
+            applyStructureBlockData(level, hit, structure, state, stack);
+        }
+        // The mixin invoker is the common-side counterpart of vanilla's
+        // private tryPickItem. It sends the held-slot packet and refreshes the
+        // inventory menu exactly like a real block pick.
+        ((ServerGamePacketListenerImplInvoker) player.connection).crythst$tryPickItem(stack);
+        return true;
+    }
+
+    /**
+     * Applies include-data components without reading an unrelated real-world
+     * block entity. A real block entity is only used when the real block at the
+     * hit position is the same block as the structure voxel. Otherwise the
+     * structure's captured block-entity NBT (keyed by structure-local voxel
+     * coordinates) is loaded off-level.
+     */
+    private static void applyStructureBlockData(ServerLevel level, StructureBlockHitResult hit,
+                                                PhysicsStructure structure, BlockState state,
+                                                ItemStack stack) {
+        if (!state.hasBlockEntity()) {
+            return;
+        }
+        final BlockEntity blockEntity = findStructureBlockEntity(level, hit, structure, state);
+        if (blockEntity == null) {
+            return;
+        }
+        final TagValueOutput output = TagValueOutput.createWithContext(
+                ProblemReporter.DISCARDING, level.registryAccess());
+        blockEntity.saveCustomOnly(output);
+        blockEntity.removeComponentsFromTag(output);
+        BlockItem.setBlockEntityData(stack, blockEntity.getType(), output);
+        stack.applyComponents(blockEntity.collectComponents());
+    }
+
+    private static BlockEntity findStructureBlockEntity(ServerLevel level,
+                                                        StructureBlockHitResult hit,
+                                                        PhysicsStructure structure,
+                                                        BlockState state) {
+        final BlockPos pos = hit.getBlockPos();
+        if (level.getBlockState(pos).getBlock() == state.getBlock()) {
+            final BlockEntity real = level.getBlockEntity(pos);
+            if (real != null) {
+                return real;
+            }
+        }
+        final IntBounds3 bounds = structure.volume().bounds();
+        final BlockPos local = new BlockPos(
+                hit.voxelX() - bounds.minX(),
+                hit.voxelY() - bounds.minY(),
+                hit.voxelZ() - bounds.minZ());
+        final CompoundTag tag = StructureBlockEntityData.get(structure).get(local);
+        if (tag == null) {
+            return null;
+        }
+        try {
+            return BlockEntity.loadStatic(pos, state, tag, level.registryAccess());
+        } catch (RuntimeException ignored) {
+            // Invalid or outdated NBT must not break pick-block.
+            return null;
+        }
+    }
+
     private static void copyVolume(PhysicsStructure structure, VoxelVolume from,
                                    MutableVoxelVolume to) {
         final IntBounds3 bounds = from.bounds();
@@ -542,8 +663,12 @@ public final class StructureInteraction {
      * Handles a client request from {@link StructureActionPayload}.
      */
     public static boolean handleAction(ServerPlayer player, StructureAction action) {
-        if (action == null || !MinecraftPhysics.config().structureBlockInteractionEnabled
-                || player.isSpectator()) {
+        if (action == null || !MinecraftPhysics.config().structureBlockInteractionEnabled) {
+            return false;
+        }
+        final boolean picking = action == StructureAction.PICK
+                || action == StructureAction.PICK_WITH_DATA;
+        if (player.isSpectator() && !picking) {
             return false;
         }
         return switch (action) {
@@ -567,6 +692,12 @@ public final class StructureInteraction {
                     stack.shrink(1);
                 }
                 yield result.success();
+            }
+            case PICK, PICK_WITH_DATA -> {
+                final StructureBlockHitResult hit = raycast(player);
+                yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
+                        && pickBlock(player, hit,
+                                action == StructureAction.PICK_WITH_DATA);
             }
             case SHOVEL_WATER -> shovelWater(player);
         };

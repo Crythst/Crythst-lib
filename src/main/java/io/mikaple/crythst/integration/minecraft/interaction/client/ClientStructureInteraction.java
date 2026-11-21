@@ -151,9 +151,44 @@ public final class ClientStructureInteraction {
         return send(player, StructureAction.PLACE);
     }
 
+    /**
+     * Replaces vanilla middle-click pick-block for a structure hit.
+     *
+     * <p>Vanilla would send {@code ServerboundPickItemFromBlockPacket} with the
+     * real-world air position; the server would then resolve air and pick
+     * nothing. The mixin calls this at the head of
+     * {@code Minecraft.pickBlockOrEntity}, before that packet is sent. The
+     * server resolves the structure state from its own authoritative raycast
+     * and runs vanilla's creative/survival pick logic.</p>
+     *
+     * @return whether the click was consumed as a structure pick
+     */
+    public static boolean requestPickBlock(Minecraft client) {
+        if (client == null || client.player == null) {
+            return false;
+        }
+        final LocalPlayer player = client.player;
+        if (!(client.hitResult instanceof StructureBlockHitResult)
+                || !CrythstFabric.config().structureBlockInteractionEnabled
+                || !ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
+            return false;
+        }
+        final StructureAction action = client.hasControlDown()
+                ? StructureAction.PICK_WITH_DATA
+                : StructureAction.PICK;
+        // Pick-block does not swing the arm.
+        return send(player, action, false);
+    }
+
     private static boolean send(LocalPlayer player, StructureAction action) {
+        return send(player, action, true);
+    }
+
+    private static boolean send(LocalPlayer player, StructureAction action, boolean swing) {
         ClientPlayNetworking.send(new StructureActionPayload(action));
-        player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+        if (swing) {
+            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+        }
         return true;
     }
 

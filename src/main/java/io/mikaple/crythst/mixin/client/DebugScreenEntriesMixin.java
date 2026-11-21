@@ -3,23 +3,25 @@ package io.mikaple.crythst.mixin.client;
 import io.mikaple.crythst.integration.fabric.client.CrythstDebugEntries;
 import net.minecraft.client.gui.components.debug.DebugScreenEntries;
 import net.minecraft.client.gui.components.debug.DebugScreenEntry;
+import net.minecraft.client.gui.components.debug.DebugScreenEntryStatus;
 import net.minecraft.resources.Identifier;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.Map;
 
 /**
- * Registers Crythst's physics overlay in the vanilla debug-entry registry.
+ * Registers Crythst's debug entries in the vanilla debug-entry registry.
  *
  * <p>Running at the tail of the static initializer means all vanilla entries
- * exist first; the new entry has no profile assignment, so
- * {@code DebugScreenEntryList} treats it as {@code NEVER} until the player
- * enables it in F3 + F6.</p>
+ * and the profile maps exist first. Physics renderer entries are left out of
+ * the profiles (default {@code NEVER}); the structure-target text entry is
+ * added to every profile as {@code IN_OVERLAY}, so it appears in F3 unless the
+ * player disables it in F3 + F6.</p>
  */
 @Mixin(DebugScreenEntries.class)
 public abstract class DebugScreenEntriesMixin {
@@ -27,10 +29,16 @@ public abstract class DebugScreenEntriesMixin {
     @Final
     private static Map<Identifier, DebugScreenEntry> ENTRIES_BY_ID;
 
-    @Inject(method = "allEntries", at = @At("TAIL"))
-    private static void crythst$registerPhysicsEntry(CallbackInfoReturnable<Map<Identifier, DebugScreenEntry>> cir) {
-        for (Identifier id : CrythstDebugEntries.ALL) {
+    @Inject(method = "<clinit>", at = @At("TAIL"))
+    private static void crythst$registerDebugEntries(CallbackInfo ci) {
+        for (Identifier id : CrythstDebugEntries.ALL_RENDERERS) {
             ENTRIES_BY_ID.put(id, CrythstDebugEntries.ENTRY);
+        }
+        ENTRIES_BY_ID.put(CrythstDebugEntries.STRUCTURE_TARGET,
+                CrythstDebugEntries.STRUCTURE_TARGET_ENTRY);
+        for (Map<Identifier, DebugScreenEntryStatus> profile : DebugScreenEntries.PROFILES.values()) {
+            profile.putIfAbsent(CrythstDebugEntries.STRUCTURE_TARGET,
+                    DebugScreenEntryStatus.IN_OVERLAY);
         }
     }
 }
