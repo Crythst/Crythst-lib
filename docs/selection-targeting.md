@@ -65,7 +65,17 @@ work unchanged:
 The voxel DDA is shared by the client clip and the server interaction path
 (`StructureRaycaster`). It transforms the world ray into structure-local voxel
 space, so negative coordinates, rotation and non-unit `blockScale` need no
-special cases.
+special cases. The DDA is only a broad phase: each visited solid cell is tested
+against the boxes of that cell's own `BlockState#getShape`, resolved through a
+read-only structure-local `BlockGetter` (`StructureVoxelShapes`). A ray through
+the empty half of a slab, stair or fence therefore passes through instead of
+selecting the cell early, and the reported point/face lie on the visible shape.
+The cell whose shape was hit is the voxel handed to the outline.
+
+Distances are world-space. The local ray parameter is converted to a world hit
+point, and `StructureBlockHitResult.distance()` is recomputed from the ray
+origin to that point, so a structure with `blockScale != 1` is ordered against
+real blocks and other structures by the same metric.
 
 ## Outline hand-off
 
@@ -143,8 +153,10 @@ attribute is added.
   waterlogging/support checks are not applied. Block entities carried by the
   stack are not created inside the structure.
 - **Placement is main-hand only.** Off-hand placement keeps vanilla behaviour.
-- **No right-click block interaction dispatch.** `interactBlock` only returns
-  the stored state; containers and block-use logic are not forwarded.
+- **Right-click use is auxiliary-level.** `interactBlock` runs vanilla
+  `useItemOn`/`useWithoutItem` against the live auxiliary void block and opens
+  container menus from its block entity. Unloaded auxiliary chunks fail
+  without loading; interaction sounds/particles are projected to the host.
 - **Structure blocks are not in vanilla collision.** Selection and
   `Entity.move` collision see them because Crythst hooks those paths. Other
   vanilla systems (`Level.getBlockCollisions`, pathfinding, vanilla placement

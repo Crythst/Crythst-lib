@@ -46,6 +46,16 @@ transformed by the same rotation and scale as the rendered voxel. Only the line
 width itself stays in screen space and does not scale with `blockScale`, which
 matches vanilla's behaviour for a scaled block.
 
+## Selection agreement
+
+`StructureRaycaster` resolves the same block-local shape with
+`BlockState#getShape` through the same structure-local lookup semantics as
+`StructureOutlineShape`, then intersects the ray with its boxes. The voxel and
+world hit carried by `StructureBlockHitResult` are therefore the cell whose
+visible shape was hit, not merely the first full-cell DDA cell. Slabs, stairs
+and fences cannot be selected through their empty half, and the outline target
+built from the hit points at exactly that cell.
+
 ## Contract for the selection layer
 
 `StructureOutlineTarget` is the only thing the outline needs:
