@@ -2,6 +2,7 @@ package io.mikaple.crythst.client.render.block;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * Draws one block that has opted into special rendering.
@@ -35,4 +36,24 @@ public interface SpecialBlockRenderer {
      */
     void submit(SpecialBlockRenderContext context, PoseStack poseStack,
                 SubmitNodeCollector collector, int lightCoords, int overlayCoords);
+
+    /**
+     * Additive overload for blocks that live inside a rotating/translating
+     * physics structure.
+     *
+     * <p>{@link SpecialBlockRenderContext#pos()} is a representative world cell
+     * (chosen for light/level lookups), so {@link SpecialBlockRenderContext#blockCenter()}
+     * cannot describe an arbitrary rotated block centre. For structures this
+     * overload supplies the exact world-space block centre. The default keeps
+     * every existing renderer working by delegating to the world-block method;
+     * the pose is already correct either way.</p>
+     *
+     * @param context    same immutable data as the world-block path
+     * @param worldCenter exact world-space centre of the rotated block cell
+     */
+    default void submit(SpecialBlockRenderContext context, Vec3 worldCenter,
+                        PoseStack poseStack, SubmitNodeCollector collector,
+                        int lightCoords, int overlayCoords) {
+        submit(context, poseStack, collector, lightCoords, overlayCoords);
+    }
 }

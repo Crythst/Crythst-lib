@@ -2,18 +2,26 @@ package io.mikaple.crythst.client.render.structure.batch;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.client.network.ClientStructureCache;
+import io.mikaple.crythst.client.network.ClientStructureSnapshot;
+import io.mikaple.crythst.client.render.block.SpecialBlockLight;
+import io.mikaple.crythst.client.render.block.SpecialBlockRenderContext;
+import io.mikaple.crythst.client.render.block.SpecialBlockRenderer;
+import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
 import io.mikaple.crythst.client.render.structure.RealStructureBlockRenderer;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
 import io.mikaple.crythst.integration.fabric.client.StructureBlockRenderer;
 import io.mikaple.crythst.integration.minecraft.structure.StructureBlockSnapshots;
 import io.mikaple.crythst.math.Aabb;
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.fabricmc.fabric.api.resource.v1.ResourceLoader;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockModelRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
@@ -29,10 +37,13 @@ import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -95,6 +106,8 @@ public final class BatchedStructureRenderer {
     private static final int MAX_FALLBACK_BOXES = 4_096;
     /** Maximum snapshot-less structures considered per frame. */
     private static final int MAX_FALLBACK_BODIES = 64;
+    /** Maximum special block renderer calls per frame. */
+    private static final int MAX_SPECIAL_BLOCKS_PER_FRAME = 1_024;
     /** Default distance cut-off in blocks. */
     private static final double DEFAULT_RENDER_DISTANCE = 512.0;
 
@@ -105,7 +118,9 @@ public final class BatchedStructureRenderer {
     private static final List<StructureBatchCache.Section> OPAQUE = new ArrayList<>();
     private static final List<StructureBatchCache.Section> TRANSLUCENT = new ArrayList<>();
     private static final List<StructureBatchCache.Section> FALLBACK_SECTIONS = new ArrayList<>();
+    private static final List<StructureBatchCache.Section> SPECIAL_SECTIONS = new ArrayList<>();
     private static final List<StructureRenderState> FALLBACK_BODIES = new ArrayList<>();
+    private static final NetworkStructureSource NETWORK = new NetworkStructureSource();
     private static final Comparator<StructureBatchCache.Section> NEAR_FIRST =
             Comparator.comparingDouble(section -> section.frameDistanceSq);
     private static final Comparator<StructureBatchCache.Section> FAR_FIRST = NEAR_FIRST.reversed();
@@ -119,6 +134,7 @@ public final class BatchedStructureRenderer {
     private static int culledSections;
     private static int fallbackBlocks;
     private static int fallbackBodies;
+    private static int specialBlocks;
 
     private BatchedStructureRenderer() {
     }
@@ -146,6 +162,7 @@ public final class BatchedStructureRenderer {
                         // go. Clearing bodies first guarantees no mesh outlives
                         // the palette generation it was built from.
                         StructureBatchCache.clearAll();
+                        NETWORK.clear();
                         BlockGeometryCache.clear();
                     }
                 });
@@ -169,6 +186,7 @@ public final class BatchedStructureRenderer {
         enabled = value;
         if (!value) {
             StructureBatchCache.clearAll();
+            NETWORK.clear();
         }
     }
 
@@ -227,24 +245,31 @@ public final class BatchedStructureRenderer {
         final long frameStart = System.nanoTime();
         final float alpha = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
+        final Set<Long> serverBodyIds = new HashSet<>(Math.max(16, structures.size() * 2));
 
         StructureBatchCache.beginFrame(dimension);
+        NETWORK.beginFrame();
         OPAQUE.clear();
         TRANSLUCENT.clear();
         FALLBACK_SECTIONS.clear();
+        SPECIAL_SECTIONS.clear();
         FALLBACK_BODIES.clear();
         submittedBatches = 0;
         submittedVertices = 0L;
         culledSections = 0;
         fallbackBlocks = 0;
         fallbackBodies = 0;
+        specialBlocks = 0;
 
         final double maxDistanceSq = renderDistance * renderDistance;
         long buildBudget = MAX_BUILD_VERTICES_PER_FRAME;
         final long buildStart = System.nanoTime();
 
+        // Singleplayer/unintegrated path: live physics render states plus the
+        // server-thread block snapshots. These body ids win over network data.
         for (PhysicsStructure structure : structures) {
             final StructureRenderState state = structure.renderState(alpha);
+            serverBodyIds.add(state.bodyId());
             if (!isVisible(camera, state.aabb())) {
                 continue;
             }
@@ -252,15 +277,64 @@ public final class BatchedStructureRenderer {
             final StructureBlockSnapshots.Snapshot snapshot =
                     StructureBlockSnapshots.get(dimension, state.bodyId());
             if (snapshot == null || snapshot.nonAirBlocks() <= 0) {
+                // The singleplayer block-snapshot producer caps large or
+                // unsupported volumes. If network sync already delivered the
+                // same body, use that geometry instead of dropping to cuboids.
+                final ClientStructureSnapshot network = ClientStructureCache.get(state.bodyId());
+                if (network != null && network.nonAirBlocks() > 0) {
+                    final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
+                    final double blockScale = network.blockScale();
+                    final Vector3d centerOfMassOffset = network.centerOfMassOffset();
+                    final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
+                            dimension, geometry, state.pose(), blockScale, centerOfMassOffset);
+                    body.beginFrame(state.pose(), blockScale, camera);
+
+                    if (buildBudget > 0L) {
+                        buildBudget -= StructureBatchCache.buildPending(body, buildBudget);
+                    }
+                    collectSections(body, camera, maxDistanceSq);
+                    continue;
+                }
                 if (FALLBACK_BODIES.size() < MAX_FALLBACK_BODIES) {
                     FALLBACK_BODIES.add(state);
                 }
                 continue;
             }
 
-            final StructureBatchCache.Body body =
-                    StructureBatchCache.getOrCreate(dimension, snapshot, state);
-            body.beginFrame(state, camera);
+            final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
+                    dimension,
+                    StructureBatchSnapshots.fromServer(snapshot),
+                    state.pose(),
+                    state.blockScale(),
+                    state.centerOfMassOffset());
+            body.beginFrame(state.pose(), state.blockScale(), camera);
+
+            if (buildBudget > 0L) {
+                buildBudget -= StructureBatchCache.buildPending(body, buildBudget);
+            }
+            collectSections(body, camera, maxDistanceSq);
+        }
+
+        // Multiplayer path: snapshots received from the server. Structures that
+        // already came from ClientPhysicsView are skipped so a body is never
+        // drawn twice in singleplayer.
+        for (ClientStructureSnapshot network : ClientStructureCache.snapshots()) {
+            if (network.nonAirBlocks() <= 0 || serverBodyIds.contains(network.bodyId())) {
+                continue;
+            }
+
+            final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
+            final Transform3d pose = network.pose();
+            final double blockScale = network.blockScale();
+            final Vector3d centerOfMassOffset = network.centerOfMassOffset();
+            if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
+                    geometry, pose, blockScale, centerOfMassOffset))) {
+                continue;
+            }
+
+            final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
+                    dimension, geometry, pose, blockScale, centerOfMassOffset);
+            body.beginFrame(pose, blockScale, camera);
 
             if (buildBudget > 0L) {
                 buildBudget -= StructureBatchCache.buildPending(body, buildBudget);
@@ -300,6 +374,11 @@ public final class BatchedStructureRenderer {
             }
         }
 
+        if (!SPECIAL_SECTIONS.isEmpty()) {
+            SPECIAL_SECTIONS.sort(NEAR_FIRST);
+            specialBlocks += submitSpecialSections(client.level, camera, collector, alpha);
+        }
+
         if (!FALLBACK_BODIES.isEmpty()) {
             int remaining = MAX_FALLBACK_BOXES;
             for (StructureRenderState state : FALLBACK_BODIES) {
@@ -331,6 +410,8 @@ public final class BatchedStructureRenderer {
                 StructureBatchCache.overBudgetCount(),
                 fallbackBodies,
                 fallbackBlocks,
+                StructureBatchCache.specialCellCount(),
+                specialBlocks,
                 BlockGeometryCache.size(),
                 buildMillis,
                 Math.max(0.0, submitMillis));
@@ -339,23 +420,28 @@ public final class BatchedStructureRenderer {
     private static void collectSections(StructureBatchCache.Body body,
                                         CameraRenderState camera, double maxDistanceSq) {
         for (StructureBatchCache.Section section : body.sections) {
-            if (section.vertexCount > 0L) {
-                if (!section.prepareFrame(camera, maxDistanceSq)) {
-                    culledSections++;
-                    continue;
-                }
+            final boolean hasNormal = section.vertexCount > 0L;
+            final boolean hasSpecial = section.specialCellCount > 0;
+            final boolean pending = section.dirty || section.overBudget;
+            if (!hasNormal && !hasSpecial && !pending) {
+                continue;
+            }
+            if (!section.prepareFrame(camera, maxDistanceSq)) {
+                culledSections++;
+                continue;
+            }
+            if (hasSpecial) {
+                SPECIAL_SECTIONS.add(section);
+            }
+            if (hasNormal) {
                 if (section.hasOpaque()) {
                     OPAQUE.add(section);
                 }
                 if (section.hasTranslucent()) {
                     TRANSLUCENT.add(section);
                 }
-            } else if (section.dirty || section.overBudget) {
-                if (section.prepareFrame(camera, maxDistanceSq)) {
-                    FALLBACK_SECTIONS.add(section);
-                } else {
-                    culledSections++;
-                }
+            } else if (pending) {
+                FALLBACK_SECTIONS.add(section);
             }
         }
     }
@@ -397,20 +483,90 @@ public final class BatchedStructureRenderer {
     }
 
     /**
+     * Submits special-rendered blocks after the normal section batches.
+     *
+     * <p>The pose origin is the block's rotated minimum corner:
+     * {@code T(worldCenter - camera) * R * S * T(-0.5,-0.5,-0.5)}. A renderer
+     * that follows the {@link SpecialBlockRenderer} contract translates by
+     * {@code +0.5} inside that pose, which cancels the trailing shift and places
+     * its unit cube at the rotated block centre. The exact centre is also
+     * passed through the additive {@link SpecialBlockRenderer} overload for
+     * renderers that need it directly.</p>
+     */
+    private static int submitSpecialSections(ClientLevel level, CameraRenderState camera,
+                                             SubmitNodeCollector collector, float partialTick) {
+        int submitted = 0;
+        int remaining = MAX_SPECIAL_BLOCKS_PER_FRAME;
+
+        outer:
+        for (StructureBatchCache.Section section : SPECIAL_SECTIONS) {
+            final StructureBatchCache.Body body = section.body;
+            final double scale = body.blockScale;
+            for (int cellIndex = 0; cellIndex < section.specialCellCount; cellIndex++) {
+                if (remaining <= 0) {
+                    break outer;
+                }
+                final SpecialBlockCell cell = section.specialCells[cellIndex];
+                final SpecialBlockRenderer renderer =
+                        SpecialBlockRenderers.get(cell.state().getBlock());
+                if (renderer == null) {
+                    continue;
+                }
+
+                final double localX = (section.originX + cell.x() + 0.5) * scale - body.centerOfMassX;
+                final double localY = (section.originY + cell.y() + 0.5) * scale - body.centerOfMassY;
+                final double localZ = (section.originZ + cell.z() + 0.5) * scale - body.centerOfMassZ;
+                body.framePose.transformPoint(SCRATCH.set(localX, localY, localZ), SCRATCH);
+
+                final Vec3 worldCenter = new Vec3(SCRATCH.x, SCRATCH.y, SCRATCH.z);
+                final BlockPos representativePos =
+                        BlockPos.containing(SCRATCH.x, SCRATCH.y, SCRATCH.z);
+                final double distanceSqr = worldCenter.distanceToSqr(camera.pos);
+                final SpecialBlockRenderContext blockContext = new SpecialBlockRenderContext(
+                        representativePos, cell.state(), level, partialTick, camera.pos, distanceSqr);
+
+                final int light = specialLight(level, representativePos, cell.state(),
+                        SCRATCH.x, SCRATCH.y, SCRATCH.z);
+
+                FRAME_POSE.setIdentity();
+                FRAME_POSE.translate(
+                        (float) (SCRATCH.x - body.frameCameraX),
+                        (float) (SCRATCH.y - body.frameCameraY),
+                        (float) (SCRATCH.z - body.frameCameraZ));
+                FRAME_POSE.rotate(body.frameQuaternion);
+                FRAME_POSE.scale(body.frameScale, body.frameScale, body.frameScale);
+                FRAME_POSE.translate(-0.5f, -0.5f, -0.5f);
+
+                remaining--;
+                try {
+                    renderer.submit(blockContext, worldCenter, FRAME_POSE, collector,
+                            light, OverlayTexture.NO_OVERLAY);
+                    submitted++;
+                } catch (RuntimeException exception) {
+                    Crythst.LOGGER.debug(
+                            "Special block renderer failed for " + cell.state(), exception);
+                }
+            }
+        }
+        return submitted;
+    }
+
+    /**
      * Bounded per-block fallback for a section whose vertex cache is still
      * pending or cannot fit in the global budget.
      */
     private static int submitFallbackSection(StructureBatchCache.Section section,
                                              SubmitNodeCollector collector, int budget) {
         final StructureBatchCache.Body body = section.body;
-        final StructureRenderState state = body.frameState;
-        final double scale = state.blockScale();
+        final Transform3d pose = body.framePose;
+        final double scale = body.blockScale;
         final int light = lightAt(section.frameCenterX, section.frameCenterY, section.frameCenterZ);
         int submitted = 0;
 
         for (int index = 0; index < section.states.length && submitted < budget; index++) {
             final BlockState blockState = section.states[index];
-            if (blockState == null || blockState.isAir()) {
+            if (blockState == null || blockState.isAir()
+                    || SpecialBlockRenderers.isRegistered(blockState.getBlock())) {
                 continue;
             }
             final BlockGeometry geometry = BlockGeometryCache.get(blockState);
@@ -425,7 +581,7 @@ public final class BatchedStructureRenderer {
             final double localX = section.localMinX + x * scale;
             final double localY = section.localMinY + y * scale;
             final double localZ = section.localMinZ + z * scale;
-            state.pose().transformPoint(SCRATCH.set(localX, localY, localZ), SCRATCH);
+            pose.transformPoint(SCRATCH.set(localX, localY, localZ), SCRATCH);
 
             FRAME_POSE.setIdentity();
             FRAME_POSE.translate(
@@ -451,6 +607,15 @@ public final class BatchedStructureRenderer {
         return camera.cullFrustum.isVisible(new AABB(
                 bounds.min().x - 1.0, bounds.min().y - 1.0, bounds.min().z - 1.0,
                 bounds.max().x + 1.0, bounds.max().y + 1.0, bounds.max().z + 1.0));
+    }
+
+    private static int specialLight(ClientLevel level, BlockPos pos, BlockState state,
+                                    double worldX, double worldY, double worldZ) {
+        try {
+            return SpecialBlockLight.getLightCoords(level, pos, state);
+        } catch (RuntimeException ignored) {
+            return lightAt(worldX, worldY, worldZ);
+        }
     }
 
     private static int lightAt(double x, double y, double z) {

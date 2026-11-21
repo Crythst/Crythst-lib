@@ -9,6 +9,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Vector3d;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Immutable, client-thread-safe view of one synchronised structure.
@@ -19,6 +20,8 @@ import java.util.Objects;
  * internal pose updates share the (never mutated) volume arrays.</p>
  */
 public final class ClientStructureSnapshot {
+    private static final AtomicLong NEXT_GEOMETRY_REVISION = new AtomicLong();
+
     private final long bodyId;
     private final Transform3d pose;
     private final IntBounds3 bounds;
@@ -28,11 +31,14 @@ public final class ClientStructureSnapshot {
     private final double massScale;
     private final double colliderMass;
     private final Vector3d centerOfMass;
+    private final int nonAirBlocks;
+    private final long geometryRevision;
 
     private ClientStructureSnapshot(long bodyId, Transform3d pose, IntBounds3 bounds,
                                     BlockState[] palette, int[] cells,
                                     double blockScale, double massScale, double colliderMass,
-                                    Vector3d centerOfMass, boolean copyArrays) {
+                                    Vector3d centerOfMass, int nonAirBlocks, long geometryRevision,
+                                    boolean copyArrays) {
         if (bodyId < 0L) {
             throw new IllegalArgumentException("bodyId must be non-negative: " + bodyId);
         }
@@ -45,6 +51,8 @@ public final class ClientStructureSnapshot {
         this.massScale = massScale;
         this.colliderMass = colliderMass;
         this.centerOfMass = new Vector3d(centerOfMass);
+        this.nonAirBlocks = nonAirBlocks;
+        this.geometryRevision = geometryRevision;
         if (this.cells.length != this.bounds.volume()) {
             throw new IllegalArgumentException("Cell count " + this.cells.length
                     + " does not match bounds volume " + this.bounds.volume());
@@ -53,6 +61,7 @@ public final class ClientStructureSnapshot {
 
     static ClientStructureSnapshot fromWire(StructureSnapshot wire) {
         final int[] wirePalette = wire.palette();
+        final int[] wireCells = wire.cells();
         final BlockState[] states = new BlockState[wirePalette.length];
         final BlockState air = Blocks.AIR.defaultBlockState();
         for (int i = 0; i < wirePalette.length; i++) {
@@ -64,10 +73,17 @@ public final class ClientStructureSnapshot {
             }
             states[i] = state == null ? air : state;
         }
+        int nonAir = 0;
+        for (int cell : wireCells) {
+            if (cell != 0) {
+                nonAir++;
+            }
+        }
         // wire.palette()/cells() already returned fresh copies.
         return new ClientStructureSnapshot(
-                wire.bodyId(), wire.pose(), wire.bounds(), states, wire.cells(),
-                wire.blockScale(), wire.massScale(), wire.colliderMass(), wire.centerOfMass(), false);
+                wire.bodyId(), wire.pose(), wire.bounds(), states, wireCells,
+                wire.blockScale(), wire.massScale(), wire.colliderMass(), wire.centerOfMass(),
+                nonAir, NEXT_GEOMETRY_REVISION.incrementAndGet(), false);
     }
 
     public long bodyId() {
@@ -136,8 +152,22 @@ public final class ClientStructureSnapshot {
         return colliderMass * massScale;
     }
 
+    /** Number of non-empty cells in this snapshot. */
+    public int nonAirBlocks() {
+        return nonAirBlocks;
+    }
+
+    /**
+     * Changes only when the block geometry changes. Pose-only updates
+     * ({@link #withPose}) preserve it, letting renderers reuse cached meshes.
+     */
+    public long geometryRevision() {
+        return geometryRevision;
+    }
+
     public ClientStructureSnapshot withPose(Transform3d newPose) {
         return new ClientStructureSnapshot(bodyId, newPose, bounds, palette, cells,
-                blockScale, massScale, colliderMass, centerOfMass, false);
+                blockScale, massScale, colliderMass, centerOfMass,
+                nonAirBlocks, geometryRevision, false);
     }
 }

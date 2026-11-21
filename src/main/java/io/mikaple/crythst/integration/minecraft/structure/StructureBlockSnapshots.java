@@ -205,6 +205,45 @@ public final class StructureBlockSnapshots {
         SNAPSHOTS.clear();
     }
 
+    /**
+     * Creates an immutable snapshot without touching a server level.
+     *
+     * <p>This is the supported entry point for tests and for other producers
+     * that already have a block grid. The array is copied and null entries
+     * become air.</p>
+     *
+     * @param bodyId physics body id
+     * @param bounds voxel bounds (inclusive min, exclusive max)
+     * @param blocks one block state per voxel, in the same order used by
+     *               {@link Snapshot#stateAt(int, int, int)}
+     * @return an immutable snapshot with a fresh revision
+     */
+    public static Snapshot create(long bodyId, IntBounds3 bounds, BlockState[] blocks) {
+        if (bodyId < 0L) {
+            throw new IllegalArgumentException("bodyId must be non-negative: " + bodyId);
+        }
+        if (bounds == null) {
+            throw new IllegalArgumentException("bounds must not be null");
+        }
+        if (blocks == null || blocks.length != bounds.volume()) {
+            throw new IllegalArgumentException("Block count " + (blocks == null ? 0 : blocks.length)
+                    + " does not match bounds volume " + bounds.volume());
+        }
+
+        final BlockState[] copy = new BlockState[blocks.length];
+        int nonAir = 0;
+        for (int i = 0; i < blocks.length; i++) {
+            final BlockState state = blocks[i] == null ? AIR : blocks[i];
+            copy[i] = state;
+            if (!state.isAir()) {
+                nonAir++;
+            }
+        }
+        return new Snapshot(bodyId, bounds.minX(), bounds.minY(), bounds.minZ(),
+                bounds.sizeX(), bounds.sizeY(), bounds.sizeZ(),
+                copy, nonAir, NEXT_REVISION.incrementAndGet());
+    }
+
     private static Snapshot build(PhysicsStructure structure) {
         final VoxelVolume volume = structure.volume();
         final IntBounds3 bounds = volume.bounds();

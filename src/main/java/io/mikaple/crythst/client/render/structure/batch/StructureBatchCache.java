@@ -1,9 +1,8 @@
 package io.mikaple.crythst.client.render.structure.batch;
 
 import com.mojang.blaze3d.vertex.PoseStack;
-import io.mikaple.crythst.integration.minecraft.structure.StructureBlockSnapshots;
+import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
 import io.mikaple.crythst.math.Transform3d;
-import io.mikaple.crythst.physics.structure.StructureRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
@@ -12,9 +11,9 @@ import net.minecraft.world.phys.AABB;
 import org.joml.Quaterniondc;
 import org.joml.Quaternionf;
 import org.joml.Vector3d;
-import org.joml.Vector3dc;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -45,6 +44,9 @@ final class StructureBatchCache {
     private static final long BODY_EXPIRY_NANOS = 2_000_000_000L;
     /** Maximum vertices resident across all section caches. */
     private static final long DEFAULT_VERTEX_BUDGET = 1_000_000L;
+    /** Bound on special-rendered cells retained per section. */
+    static final int MAX_SPECIAL_CELLS_PER_SECTION = 512;
+    private static final SpecialBlockCell[] NO_SPECIAL_CELLS = new SpecialBlockCell[0];
 
     private static final Map<BodyKey, Body> BODIES = new ConcurrentHashMap<>();
     private static final AtomicLong CACHED_VERTICES = new AtomicLong();
@@ -53,6 +55,7 @@ final class StructureBatchCache {
 
     private static ResourceKey<Level> currentDimension;
     private static long paletteGeneration = -1L;
+    private static int specialRegistrySize = -1;
     private static long frame;
     private static long vertexBudget = DEFAULT_VERTEX_BUDGET;
 
@@ -69,6 +72,14 @@ final class StructureBatchCache {
         if (paletteGeneration != generation) {
             clearAll();
             paletteGeneration = generation;
+        }
+        // Registering a special renderer changes which blocks contribute normal
+        // quads. The registry has no unregister API, so a size change is the
+        // only normal <-> special transition that needs a geometry rebuild.
+        final int specialSize = SpecialBlockRenderers.size();
+        if (specialRegistrySize != specialSize) {
+            clearAll();
+            specialRegistrySize = specialSize;
         }
         if (!Objects.equals(currentDimension, dimension)) {
             clearAll();
@@ -93,19 +104,21 @@ final class StructureBatchCache {
      * Returns the cache for a body, creating or refreshing it as needed.
      */
     static Body getOrCreate(ResourceKey<Level> dimension,
-                            StructureBlockSnapshots.Snapshot snapshot,
-                            StructureRenderState state) {
+                            StructureBatchSnapshots.Snapshot snapshot,
+                            Transform3d pose,
+                            double blockScale,
+                            Vector3d centerOfMassOffset) {
         final BodyKey key = new BodyKey(dimension, snapshot.bodyId());
         final long generation = BlockGeometryCache.generation();
         Body body = BODIES.get(key);
 
-        if (body != null && !body.matches(snapshot, state, generation)) {
+        if (body != null && !body.matches(snapshot, blockScale, centerOfMassOffset, generation)) {
             remove(key, body);
             body = null;
         }
 
         if (body == null) {
-            body = Body.create(key, snapshot, state, generation);
+            body = Body.create(key, snapshot, pose, blockScale, centerOfMassOffset, generation);
             BODIES.put(key, body);
         } else {
             body.refresh(snapshot);
@@ -244,6 +257,16 @@ final class StructureBatchCache {
         return count;
     }
 
+    static int specialCellCount() {
+        int count = 0;
+        for (Body body : BODIES.values()) {
+            for (Section section : body.sections) {
+                count += section.specialCellCount;
+            }
+        }
+        return count;
+    }
+
     private static void prune(long now) {
         BODIES.entrySet().removeIf(entry -> {
             final Body body = entry.getValue();
@@ -287,45 +310,49 @@ final class StructureBatchCache {
         final long generation;
         final Section[] sections;
 
-        StructureBlockSnapshots.Snapshot snapshot;
+        StructureBatchSnapshots.Snapshot snapshot;
+        long contentRevision;
         long lastSeenNanos;
         long vertexCount;
 
         // Per-frame state, filled by the renderer before culling and submission.
-        StructureRenderState frameState;
+        Transform3d framePose;
         final Quaternionf frameQuaternion = new Quaternionf();
         float frameScale;
         double frameCameraX;
         double frameCameraY;
         double frameCameraZ;
 
-        private Body(BodyKey key, StructureBlockSnapshots.Snapshot snapshot,
-                     StructureRenderState state, long generation, Section[] sections) {
+        private Body(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
+                     Transform3d pose, double blockScale, Vector3d centerOfMassOffset,
+                     long generation, Section[] sections) {
             this.key = key;
             this.snapshot = snapshot;
+            this.contentRevision = snapshot.contentRevision();
             this.minX = snapshot.minX();
             this.minY = snapshot.minY();
             this.minZ = snapshot.minZ();
             this.sizeX = snapshot.sizeX();
             this.sizeY = snapshot.sizeY();
             this.sizeZ = snapshot.sizeZ();
-            this.blockScale = state.blockScale();
-            this.centerOfMassX = state.centerOfMassOffset().x;
-            this.centerOfMassY = state.centerOfMassOffset().y;
-            this.centerOfMassZ = state.centerOfMassOffset().z;
+            this.blockScale = blockScale;
+            this.centerOfMassX = centerOfMassOffset.x;
+            this.centerOfMassY = centerOfMassOffset.y;
+            this.centerOfMassZ = centerOfMassOffset.z;
             this.generation = generation;
             this.sections = sections;
+            this.framePose = pose;
+            this.frameScale = (float) blockScale;
         }
 
-        static Body create(BodyKey key, StructureBlockSnapshots.Snapshot snapshot,
-                           StructureRenderState state, long generation) {
+        static Body create(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
+                           Transform3d pose, double blockScale, Vector3d centerOfMassOffset,
+                           long generation) {
             final int sectionsX = (snapshot.sizeX() + SECTION_SIZE - 1) / SECTION_SIZE;
             final int sectionsY = (snapshot.sizeY() + SECTION_SIZE - 1) / SECTION_SIZE;
             final int sectionsZ = (snapshot.sizeZ() + SECTION_SIZE - 1) / SECTION_SIZE;
             final List<Section> sections = new ArrayList<>(
                     sectionsX * sectionsY * sectionsZ);
-            final double blockScale = state.blockScale();
-            final Vector3d centerOfMass = state.centerOfMassOffset();
 
             for (int sectionY = 0; sectionY < sectionsY; sectionY++) {
                 for (int sectionZ = 0; sectionZ < sectionsZ; sectionZ++) {
@@ -340,27 +367,26 @@ final class StructureBatchCache {
                         sections.add(Section.create(snapshot,
                                 originX, originY, originZ,
                                 sectionSizeX, sectionSizeY, sectionSizeZ,
-                                blockScale, centerOfMass));
+                                blockScale, centerOfMassOffset));
                     }
                 }
             }
 
-            final Body body = new Body(key, snapshot, state, generation,
-                    sections.toArray(Section[]::new));
+            final Body body = new Body(key, snapshot, pose, blockScale, centerOfMassOffset,
+                    generation, sections.toArray(Section[]::new));
             for (Section section : body.sections) {
                 section.body = body;
             }
             return body;
         }
 
-        boolean matches(StructureBlockSnapshots.Snapshot snapshot,
-                        StructureRenderState state, long generation) {
-            final Vector3d centerOfMass = state.centerOfMassOffset();
+        boolean matches(StructureBatchSnapshots.Snapshot snapshot,
+                        double blockScale, Vector3d centerOfMassOffset, long generation) {
             return this.generation == generation
-                    && this.blockScale == state.blockScale()
-                    && this.centerOfMassX == centerOfMass.x
-                    && this.centerOfMassY == centerOfMass.y
-                    && this.centerOfMassZ == centerOfMass.z
+                    && this.blockScale == blockScale
+                    && this.centerOfMassX == centerOfMassOffset.x
+                    && this.centerOfMassY == centerOfMassOffset.y
+                    && this.centerOfMassZ == centerOfMassOffset.z
                     && this.minX == snapshot.minX()
                     && this.minY == snapshot.minY()
                     && this.minZ == snapshot.minZ()
@@ -373,23 +399,31 @@ final class StructureBatchCache {
          * Called when a new snapshot object is published. Compares contents per
          * section and only invalidates sections whose blocks actually changed.
          */
-        void refresh(StructureBlockSnapshots.Snapshot snapshot) {
-            if (this.snapshot == snapshot) {
+        void refresh(StructureBatchSnapshots.Snapshot snapshot) {
+            if (this.contentRevision == snapshot.contentRevision()
+                    && this.snapshot.bodyId() == snapshot.bodyId()
+                    && this.minX == snapshot.minX()
+                    && this.minY == snapshot.minY()
+                    && this.minZ == snapshot.minZ()
+                    && this.sizeX == snapshot.sizeX()
+                    && this.sizeY == snapshot.sizeY()
+                    && this.sizeZ == snapshot.sizeZ()) {
                 return;
             }
             this.snapshot = snapshot;
+            this.contentRevision = snapshot.contentRevision();
             for (Section section : sections) {
                 section.refresh(snapshot);
             }
         }
 
-        void beginFrame(StructureRenderState state, CameraRenderState camera) {
-            this.frameState = state;
-            final Quaterniondc rotation = state.pose().rotation();
+        void beginFrame(Transform3d pose, double blockScale, CameraRenderState camera) {
+            this.framePose = pose;
+            final Quaterniondc rotation = pose.rotation();
             this.frameQuaternion.set(
                     (float) rotation.x(), (float) rotation.y(),
                     (float) rotation.z(), (float) rotation.w()).normalize();
-            this.frameScale = (float) state.blockScale();
+            this.frameScale = (float) blockScale;
             this.frameCameraX = camera.pos.x;
             this.frameCameraY = camera.pos.y;
             this.frameCameraZ = camera.pos.z;
@@ -416,6 +450,9 @@ final class StructureBatchCache {
         final double localMaxZ;
         final BlockState[] states;
         final SectionMesh[] meshes = new SectionMesh[3];
+
+        SpecialBlockCell[] specialCells = NO_SPECIAL_CELLS;
+        int specialCellCount;
 
         boolean dirty;
         boolean built;
@@ -449,10 +486,10 @@ final class StructureBatchCache {
             this.states = states;
         }
 
-        static Section create(StructureBlockSnapshots.Snapshot snapshot,
+        static Section create(StructureBatchSnapshots.Snapshot snapshot,
                               int originX, int originY, int originZ,
                               int sizeX, int sizeY, int sizeZ,
-                              double blockScale, Vector3dc centerOfMass) {
+                              double blockScale, Vector3d centerOfMass) {
             final double localMinX = originX * blockScale - centerOfMass.x();
             final double localMinY = originY * blockScale - centerOfMass.y();
             final double localMinZ = originZ * blockScale - centerOfMass.z();
@@ -471,7 +508,7 @@ final class StructureBatchCache {
             return section;
         }
 
-        void refresh(StructureBlockSnapshots.Snapshot snapshot) {
+        void refresh(StructureBatchSnapshots.Snapshot snapshot) {
             boolean changed = false;
             for (int index = 0; index < states.length; index++) {
                 final int x = index % sizeX;
@@ -492,6 +529,7 @@ final class StructureBatchCache {
                 final int y = index / (sizeX * sizeZ);
                 states[index] = snapshot.stateAt(originX + x, originY + y, originZ + z);
             }
+            collectSpecialCells();
             pendingVertices = -1L;
             invalidate();
             dirty = true;
@@ -499,10 +537,51 @@ final class StructureBatchCache {
             overBudget = false;
         }
 
+        /**
+         * Keeps the cells that need a {@code SpecialBlockRenderer}. They are
+         * collected even while the normal section mesh is pending or over
+         * budget, so a special block never disappears just because its
+         * neighbours are still being batched.
+         */
+        private void collectSpecialCells() {
+            if (SpecialBlockRenderers.isEmpty()) {
+                specialCells = NO_SPECIAL_CELLS;
+                specialCellCount = 0;
+                return;
+            }
+
+            SpecialBlockCell[] found = null;
+            int count = 0;
+            for (int index = 0; index < states.length; index++) {
+                final BlockState state = states[index];
+                if (state == null || state.isAir()
+                        || !SpecialBlockRenderers.isRegistered(state.getBlock())) {
+                    continue;
+                }
+                if (count == MAX_SPECIAL_CELLS_PER_SECTION) {
+                    break;
+                }
+                if (found == null) {
+                    found = new SpecialBlockCell[Math.min(16, MAX_SPECIAL_CELLS_PER_SECTION)];
+                } else if (count == found.length) {
+                    found = Arrays.copyOf(found,
+                            Math.min(MAX_SPECIAL_CELLS_PER_SECTION, count * 2));
+                }
+                final int x = index % sizeX;
+                final int z = (index / sizeX) % sizeZ;
+                final int y = index / (sizeX * sizeZ);
+                found[count++] = new SpecialBlockCell(x, y, z, state);
+            }
+
+            specialCells = count == 0 ? NO_SPECIAL_CELLS : found;
+            specialCellCount = count;
+        }
+
         long countVertices() {
             long count = 0L;
             for (BlockState state : states) {
-                if (state == null || state.isAir()) {
+                if (state == null || state.isAir()
+                        || SpecialBlockRenderers.isRegistered(state.getBlock())) {
                     continue;
                 }
                 final BlockGeometry geometry = BlockGeometryCache.get(state);
@@ -562,7 +641,7 @@ final class StructureBatchCache {
          * @return whether the section should be submitted this frame
          */
         boolean prepareFrame(CameraRenderState camera, double maxDistanceSq) {
-            final Transform3d pose = body.frameState.pose();
+            final Transform3d pose = body.framePose;
             final double centerX = (localMinX + localMaxX) * 0.5;
             final double centerY = (localMinY + localMaxY) * 0.5;
             final double centerZ = (localMinZ + localMaxZ) * 0.5;
@@ -614,7 +693,7 @@ final class StructureBatchCache {
          * translation to {@code pose}. The cached vertices are section-local.
          */
         void applyPose(PoseStack pose) {
-            final Transform3d transform = body.frameState.pose();
+            final Transform3d transform = body.framePose;
             transform.transformPoint(SCRATCH_A.set(localMinX, localMinY, localMinZ), SCRATCH_A);
             pose.setIdentity();
             pose.translate(

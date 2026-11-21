@@ -2,6 +2,7 @@ package io.mikaple.crythst.client.render.structure.batch;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.util.LightCoordsUtil;
@@ -68,7 +69,8 @@ final class SectionMesh {
         final int[] vertexCounts = new int[3];
         for (int index = 0; index < states.length; index++) {
             final BlockState state = states[index];
-            if (state == null || state.isAir()) {
+            if (state == null || state.isAir()
+                    || SpecialBlockRenderers.isRegistered(state.getBlock())) {
                 continue;
             }
             final BlockGeometry geometry = BlockGeometryCache.get(state);
