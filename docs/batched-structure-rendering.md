@@ -17,6 +17,7 @@ Fabric integration, mixins or config.
 | `src/main/java/io/mikaple/crythst/client/render/structure/batch/BatchedStructureRenderer.java` | Public entry point, registration, frame culling/sorting/submission, stats. |
 | `.../batch/StructureBatchCache.java` | Per-body 16³ section grid, snapshot content diffing, build budget, cache lifecycle. |
 | `.../batch/SectionMesh.java` | Flat section-local vertex soup for one render layer and its replay loop. |
+| `.../batch/SpecialBlockCell.java` | Section-local reference to a block drawn by a `SpecialBlockRenderer`. |
 | `.../batch/BlockGeometry.java` | Pose-independent quads for one block state, split into solid/cutout/translucent layers. |
 | `.../batch/BlockGeometryCache.java` | Palette cache: `BlockState` → baked quads with atlas UVs, tint and emission. |
 | `.../batch/FallbackCuboids.java` | Bounded coloured-cuboid fallback for bodies with no snapshot. |
@@ -117,6 +118,42 @@ The same `centerOfMassOffset` and `blockScale` are used by the collider and
 debug OBB, so the rendered blocks, collider and OBB stay aligned, including for
 rotated structures.
 
+### Special block renderers
+
+Blocks registered through `SpecialBlockRenderers.register(block, renderer)` are
+handled by the batch renderer too.
+
+* **Detection and caching:** while a section's state array is copied (creation
+  or snapshot refresh), every non-air state whose block is registered is added
+  to a bounded `SpecialBlockCell` list (max 512 per section). The normal
+  `BlockGeometry` is not added to the section mesh for those states, and the
+  per-block fallback skips them, so a special block is never drawn twice.
+  `SectionMesh.build` and `Section.countVertices` also skip registered blocks,
+  keeping vertex counts and the global budget correct.
+* **Registry invalidation:** `StructureBatchCache.beginFrame` compares
+  `SpecialBlockRenderers.size()` with the last frame. Registering a renderer for
+  a previously normal block changes the size, clears the body caches, and
+  rebuilds sections so the block's normal quads disappear. Replacing a renderer
+  for an already-special block needs no rebuild; the submit path reads the
+  current renderer. Block-state changes are already caught by the per-section
+  content compare.
+* **Submission:** after normal section batches and fallback blocks, visible
+  sections with special cells are sorted near-to-far and each cell is submitted
+  with `SpecialBlockRenderer.submit(...)`. The pose is
+  `T(worldCenter - camera) * R * S(blockScale) * T(-0.5,-0.5,-0.5)`, so a
+  renderer following the documented `+0.5` convention lands its unit cube at
+  the rotated block centre. At most 1,024 special renderer calls run per frame.
+* **Context:** `SpecialBlockRenderContext.pos()` is a representative world cell
+  (used for level/light lookups and `blockCenter()` compatibility), while the
+  exact rotated centre is passed through the additive
+  `SpecialBlockRenderer.submit(context, worldCenter, ...)` overload. Existing
+  renderers get the old method via the default implementation and still receive
+  the exact pose. Structure-aware renderers can override the overload.
+* **Lighting:** `SpecialBlockLight.getLightCoords(level, representativePos,
+  state)` samples the nearest world cell, including the six-neighbour maximum
+  for solid-render blocks. If sampling fails, the frame falls back to the
+  normal per-position light lookup.
+
 ### Why the old path looked wrong
 
 `RealStructureBlockRenderer` chooses one `RenderType` per `BlockState` from the
@@ -195,6 +232,7 @@ frame. A future custom GPU-buffer backend could remove that replay too.
 * `submittedBatches`, `submittedVertices` (last frame)
 * `culledSections`, `pendingSections`, `overBudgetSections`
 * `fallbackBodies`, `fallbackBlocks`
+* `cachedSpecialCells`, `submittedSpecialBlocks`
 * `modelCacheEntries`
 * `buildMillisLastFrame`, `submitMillisLastFrame`
 
@@ -236,6 +274,16 @@ the per-block renderer.
 * **Random model variants use a fixed seed.** Models that pick a variant from
   `RandomSource` are baked once per state with seed 0, so every instance of that
   state looks the same. The per-block renderer did the same.
+* **Special blocks are capped.** A section retains at most 512 special cells and
+  the renderer invokes at most 1,024 special renderers per frame. Very dense
+  special-block structures (for example a wall of item-model blocks) will draw
+  only the nearest cells first. Special renderers are also invoked once per
+  visible cell per frame, so they should keep their own per-frame work small.
+* **`SpecialBlockRenderContext.blockCenter()` is representative for structures.**
+  It is the nearest world cell used for light/level lookups. The exact rotated
+  centre is supplied by the additive
+  `SpecialBlockRenderer.submit(context, worldCenter, ...)` overload; existing
+  renderers that rely only on the pose are already exact.
 * **No neighbour-face culling.** The cache reuses the baked block model quads, so
   hidden faces between two solid blocks are still submitted, exactly as in the
   per-block path. The win is node/model work, not triangle count. A future

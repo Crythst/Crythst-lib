@@ -76,5 +76,7 @@ void main() {
     vec4 outColor = vec4(color, 1.0) * vertexColor;
     outColor *= ColorModulator;
     outColor.a = 1.0;
-    fragColor = outColor;
+    fragColor = apply_fog(outColor, sphericalVertexDistance, cylindricalVertexDistance,
+            FogEnvironmentalStart, FogEnvironmentalEnd,
+            FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
 }

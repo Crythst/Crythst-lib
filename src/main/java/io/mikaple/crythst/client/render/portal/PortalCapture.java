@@ -78,12 +78,12 @@ import java.util.UUID;
  * renderer falls back to the procedural surface.</p>
  */
 public final class PortalCapture {
-    /** 20 captures per second; the portal view intentionally updates slower than the display. */
-    private static final long CAPTURE_INTERVAL_NANOS = 50_000_000L;
+    /** 10 captures per second; the portal view intentionally updates slower than the display. */
+    private static final long CAPTURE_INTERVAL_NANOS = 100_000_000L;
     /** Nearest visible portals captured per round. */
     private static final int MAX_PORTALS_PER_CAPTURE = 2;
     /** Do not pay for a second scene render for distant portals. */
-    private static final double MAX_CAPTURE_DISTANCE = 192.0;
+    private static final double MAX_CAPTURE_DISTANCE = 160.0;
     private static final double MAX_CAPTURE_DISTANCE_SQUARED =
             MAX_CAPTURE_DISTANCE * MAX_CAPTURE_DISTANCE;
 
@@ -126,6 +126,18 @@ public final class PortalCapture {
     }
 
     private static void onEndExtraction(LevelExtractionContext context) {
+        try {
+            captureDestinationViews(context);
+        } catch (Throwable error) {
+            if (!failureLogged) {
+                failureLogged = true;
+                Crythst.LOGGER.warn("Crythst portal capture aborted; "
+                        + "falling back to procedural surfaces", error);
+            }
+        }
+    }
+
+    private static void captureDestinationViews(LevelExtractionContext context) {
         if (capturing) {
             return;
         }
@@ -198,6 +210,20 @@ public final class PortalCapture {
         final GpuBufferSlice fogSlice = fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
         final Vector4f fogColor = new Vector4f(fogData.color);
 
+        // LevelRenderer.submitFeatures consumes these render-state lists so the
+        // main pass does not draw them twice. Capture them and put them back
+        // before the normal frame continues.
+        final List<net.minecraft.client.renderer.entity.state.EntityRenderState> savedEntities =
+                List.copyOf(levelState.entityRenderStates);
+        final List<net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState> savedBlockEntities =
+                List.copyOf(levelState.blockEntityRenderStates);
+        final List<net.minecraft.client.renderer.state.level.BlockBreakingRenderState> savedBreaking =
+                List.copyOf(levelState.blockBreakingRenderStates);
+        final boolean savedMultiDraw = levelState.shouldUseMultiDrawIndirectForTerrain;
+        levelState.shouldUseMultiDrawIndirectForTerrain = false;
+        final Runnable savedCompiledSectionCallback = levelState.playerCompiledSectionCallback;
+        levelState.playerCompiledSectionCallback = null;
+
         capturing = true;
         final Set<UUID> captured = new HashSet<>();
         try {
@@ -217,6 +243,10 @@ public final class PortalCapture {
                 if (target == null) {
                     continue;
                 }
+
+                // Each capture consumes the lists; restore them so the next
+                // capture and the main pass still have the entities.
+                restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
 
                 final CameraRenderState previous = levelState.cameraRenderState;
                 boolean rendered = false;
@@ -242,12 +272,28 @@ public final class PortalCapture {
                 count++;
             }
         } finally {
+            restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
+            levelState.shouldUseMultiDrawIndirectForTerrain = savedMultiDraw;
+            levelState.playerCompiledSectionCallback = savedCompiledSectionCallback;
             capturing = false;
             READY.clear();
             READY.addAll(captured);
             fogRenderer.endFrame();
             resourcePool.endFrame();
         }
+    }
+
+    private static void restoreRenderStateLists(
+            LevelRenderState levelState,
+            List<net.minecraft.client.renderer.entity.state.EntityRenderState> entities,
+            List<net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState> blockEntities,
+            List<net.minecraft.client.renderer.state.level.BlockBreakingRenderState> breaking) {
+        levelState.entityRenderStates.clear();
+        levelState.entityRenderStates.addAll(entities);
+        levelState.blockEntityRenderStates.clear();
+        levelState.blockEntityRenderStates.addAll(blockEntities);
+        levelState.blockBreakingRenderStates.clear();
+        levelState.blockBreakingRenderStates.addAll(breaking);
     }
 
     private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {
@@ -291,7 +337,10 @@ public final class PortalCapture {
         camera.entityRenderState = main.entityRenderState;
 
         final Quaternionf rotation = new Quaternionf(transform.rotation());
-        final Quaternionf orientation = new Quaternionf(main.orientation).premul(rotation);
+        final Quaternionf baseOrientation = main.orientation == null
+                ? new Quaternionf()
+                : new Quaternionf(main.orientation);
+        final Quaternionf orientation = baseOrientation.premul(rotation);
         camera.orientation = orientation;
         camera.viewRotationMatrix = new Matrix4f().rotation(new Quaternionf(orientation).conjugate());
 
@@ -321,33 +370,35 @@ public final class PortalCapture {
         if (existing == null) {
             final Identifier textureId = Identifier.fromNamespaceAndPath(
                     Crythst.MOD_ID, "portal_view/" + portal.id());
+            final TextureTarget target = createTarget(portal, mainTarget);
             final PortalViewTexture texture = new PortalViewTexture(
-                    "crythst_portal_view_" + portal.id(), mainTarget,
+                    "crythst_portal_view_" + portal.id(), target,
                     RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
             Minecraft.getInstance().getTextureManager().register(textureId, texture);
-            existing = new ViewTarget(portal.id(), textureId, texture);
+            existing = new ViewTarget(portal.id(), textureId, texture, target);
             TARGETS.put(portal.id(), existing);
+            return existing;
         }
 
-        if (existing.target == null
-                || existing.target.width != mainTarget.width
+        if (existing.target.width != mainTarget.width
                 || existing.target.height != mainTarget.height) {
-            final GpuFormat colorFormat = mainTarget.getColorTexture().getFormat();
-            final GpuFormat depthFormat = mainTarget.getDepthTexture() == null
-                    ? GpuFormat.D32_FLOAT
-                    : mainTarget.getDepthTexture().getFormat();
-            final TextureTarget target = new TextureTarget(
-                    "crythst_portal_view_" + portal.id(),
-                    mainTarget.width, mainTarget.height,
-                    colorFormat, depthFormat);
-            if (existing.target != null) {
-                existing.target.destroyBuffers();
-            }
+            final TextureTarget target = createTarget(portal, mainTarget);
+            existing.target.destroyBuffers();
             existing.target = target;
             existing.texture.setTarget(target,
                     RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
         }
         return existing;
+    }
+
+    private static TextureTarget createTarget(PortalSnapshot portal, RenderTarget mainTarget) {
+        final GpuFormat colorFormat = mainTarget.getColorTexture().getFormat();
+        // Only the colour attachment is sampled; the destination view has
+        // already been depth-composited in the main target before the copy.
+        return new TextureTarget(
+                "crythst_portal_view_" + portal.id(),
+                mainTarget.width, mainTarget.height,
+                colorFormat, null);
     }
 
     private static FogData copyFog(FogData source) {
@@ -368,7 +419,8 @@ public final class PortalCapture {
         copy.renderDistanceEnd = source.renderDistanceEnd;
         copy.skyEnd = source.skyEnd;
         copy.cloudEnd = source.cloudEnd;
-        copy.color = new Vector4f(source.color);
+        copy.color = source.color == null ? new Vector4f(0.0f, 0.0f, 0.0f, 1.0f)
+                : new Vector4f(source.color);
         return copy;
     }
 
@@ -408,10 +460,12 @@ public final class PortalCapture {
         private final PortalViewTexture texture;
         private TextureTarget target;
 
-        private ViewTarget(UUID portalId, Identifier textureId, PortalViewTexture texture) {
+        private ViewTarget(UUID portalId, Identifier textureId,
+                           PortalViewTexture texture, TextureTarget target) {
             this.portalId = portalId;
             this.textureId = textureId;
             this.texture = texture;
+            this.target = target;
         }
 
         private void close() {
