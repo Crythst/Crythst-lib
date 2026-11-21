@@ -1,21 +1,37 @@
 # Crythst
 
-**Crythst** 是一个独立的、MIT 许可的 Fabric 物理与仿真库，面向 **Minecraft / Fabric 26.3**。
-它不是一个内容模组，而是给其他模组提供刚体、体素结构、角色控制器、空间查询和调试能力的底层库。
+**Crythst** 是一个独立的、MIT 许可的 **大型模块化 Fabric 库**，面向 **Minecraft / Fabric 26.3**。
+它不是内容模组，也不是单一的物理引擎：物理、体素结构、世界碰撞、玩家 6DoF、实体交互、真实方块渲染、特殊模型/着色器、纹理生成、持久化、多人同步和传送门都以可组合的子系统提供。
 
 - 模组 ID：`crythst`
 - Java 包名：`io.mikaple.crythst`
 - 当前版本：`0.1.0`
 - 物理后端：**libbulletjme 23.2.0**（JNI / Bullet Physics）
 - 运行环境：Java 25、Fabric Loader 0.19.5+、Fabric API 0.161.0+26.3
+- 平台：Windows / macOS / Linux（x86_64、arm64）+ Android（FCL、PojavLauncher 等）
 
-> 本仓库只包含库本身。功能模组可以把 Crythst 作为依赖，在其上实现“会移动/会倒塌的方块结构”、载具、机械、角色物理等玩法。
+> 功能模组可以把 Crythst 作为底层依赖，只取需要的模块；也可以同时使用物理结构、渲染、交互和同步，构建“会移动/会倒塌/可交互的方块世界”。
 
----
+## 模块
+
+| 模块 | 职责 | 主要入口 |
+| --- | --- | --- |
+| `physics` | 刚体、约束、查询、角色、固定步长、可重定位原点 | `CrythstApi`, `PhysicsWorld`, `BodyHandle` |
+| `physics.voxel` / `structure` | 体素贪心碰撞、质量/惯性、移动方块结构 | `VoxelColliderBuilder`, `PhysicsStructure` |
+| `integration.minecraft` | 每维度物理世界、真实空 Level 方块逻辑、地形碰撞、玩家重力 | `MinecraftPhysics`, `LevelPhysics`, `PlayerGravity` |
+| `integration.minecraft.entity` | 实体与结构碰撞、实体停留在结构上、Create 实体软兼容 | `EntityPhysicsCollisionManager`, `EntityStructureRidingManager` |
+| `integration.minecraft.interaction` | 挖掘/放置结构方块、反作用冲量、铲水反作用 | `StructureInteraction` |
+| `integration.minecraft.storage` | 结构快照、方块实体 NBT、持久化、稳定 UUID | `StructurePersistence`, `StructureSavedData` |
+| `network.structure` | 多人结构快照/姿态/移除同步 | `StructureSync`, `ClientStructureCache` |
+| `client.render.structure` | 真实方块模型渲染、分 section 批量缓存、OBB 调试 | `BatchedStructureRenderer`, `PhysicsGizmoRenderer` |
+| `client.render.item/block` | 物品 special model、star 着色器、无 BER submit 的方块特殊渲染 | `StarItemModelRenderer`, `SpecialBlockRenderManager` |
+| `client.texture` | 灰度图着色、外轮廓、运行时实体纹理（无资源重载） | `GrayscaleColorizer`, `GrayscaleFormula`, `RuntimeTextureCache` |
+| `integration.portal` | 传送门平面、传送变换、沉浸式表面 | `PortalManager`, `PortalRenderer` |
+| `integration.create` | Create-Fly 软兼容（compileOnly） | `CreateCompat`, `CreateStructureBridge` |
 
 ## 目录
 
-- [特性](#特性)
+- [核心能力](#核心能力)
 - [平台支持](#平台支持)
 - [快速开始](#快速开始)
 - [包布局](#包布局)
@@ -27,30 +43,56 @@
 
 ---
 
-## 特性
+## 核心能力
+
+### 物理与结构
 
 | 能力 | 说明 | 主要入口 |
 | --- | --- | --- |
 | 刚体物理 | 静态 / 运动学 / 动态刚体，质量、阻尼、CCD、碰撞过滤、休眠控制 | `BodyDef`, `BodyHandle` |
 | 体素结构 | 把方块网格变成可旋转、可翻倒的复合刚体 | `VoxelVolume`, `StructureDef`, `PhysicsStructure` |
-| 贪心合并碰撞盒 | 将相邻同材质方块合并为尽量少的长方体，保持轴对齐碰撞表面 | `VoxelColliderBuilder` |
-| 完整 3×3 惯性张量 | 计算质心、转动惯量、惯性积和平行轴项，非对称结构也能正确翻滚 | `VoxelColliderData#inertia()` |
-| 任意方向重力 | 重力是普通三维向量，不假设“下 = -Y”；支持每刚体覆盖，默认仍为向下 `(0,-9.81,0)` | `WorldSettings#gravity()`, `BodyDef#gravityOverride()` |
-| 玩家重力方向 | 通过 Mixin 替换玩家空中重力的方向；支持固定方向和“看向哪里就向哪里下落” | `PlayerGravity`, `/crythst playergravity` |
-| OBB 与 15 轴 SAT | 每个刚体都有带旋转的包围盒，用分离轴测试判断倾斜盒相交 | `BodyHandle#obb()`, `OrientedBox` |
-| 射线与扫掠 | 世界空间射线检测、凸形状扫掠检测，支持过滤器 | `RayQuery`, `SweepQuery` |
-| 约束 | 固定、铰链、滑轨、点对点约束；可锚定到世界 | `FixedConstraintDef`, `HingeConstraintDef`, `SliderConstraintDef`, `PointConstraintDef` |
-| 角色控制器 | 基于世界 `up()` 的运动学胶囊角色，支持任意重力方向 | `CharacterDef`, `CharacterController` |
-| 固定步长 + 插值 | 物理固定步长运行，渲染使用剩余时间做位置/旋转插值 | `FixedStepClock`, `InterpolatedPose` |
-| 可重定位双精度原点 | 对外使用世界空间 `double`，内部 Bullet 使用可移动的局部原点 | `PhysicsWorld#rebaseOrigin()` |
-| 世界地形碰撞 | 在动力学刚体周围按 16³ 区块段生成静态合并碰撞体；默认开启 | `TerrainCollision`, `TerrainBody` |
-| 真实空 Level 方块逻辑 | 每个物理世界懒创建一个真实空 `ServerLevel`，复制结构方块，只 tick 含方块的 chunk | `EmptyPhysicsLevel`, `LevelPhysics` |
-| 物品特殊渲染 | 灰度/纯黑掩码 + 自定义着色器（star）的特殊模型烘焙与 RenderType | `StarItemModelRenderer`, `CrythstItemSpecialRenderers` |
-| 方块特殊渲染 | 不走 `BlockEntityRenderer#submit`，在 level 渲染事件里按方块位置提交模型 | `SpecialBlockRenderManager`, `ItemModelBlockRenderer` |
-| 灰度图着色 | 公式化灰度 → 单色/双色（外轮廓）PNG 像素着色工具 | `GrayscaleColorizer` |
-| 调试快照 | 不可变的刚体/OBB/AABB/统计/接触点快照，可安全交给调试渲染或命令 | `PhysicsDebugSnapshot`, `BodyDebugInfo` |
-| 每维度一个物理世界 | 服务端为每个 `ServerLevel` 维护独立的 `PhysicsWorld` | `MinecraftPhysics`, `LevelPhysics` |
-| `/crythst` 命令 | 查看状态、暂停/继续、手动步进、修改重力、生成演示结构 | `CrythstCommand` |
+| 贪心合并碰撞盒 | 相邻同材质方块合并为尽量少的长方体 | `VoxelColliderBuilder` |
+| 完整 3×3 惯性张量 | 质心、转动惯量、惯性积和平行轴项 | `VoxelColliderData#inertia()` |
+| 数据驱动方块质量 | 方块/tag 的 mass/friction/restitution/buoyancy，服务端数据包热重载 | `BlockPhysicsRegistry` |
+| 任意方向重力 | 重力是三维向量；默认向下，支持世界/每刚体覆盖 | `WorldSettings#gravity()`, `BodyDef#gravityOverride()` |
+| OBB 与 15 轴 SAT | 倾斜包围盒相交与穿透向量 | `BodyHandle#obb()`, `OrientedBox` |
+| 射线 / 扫掠 / 约束 | 世界空间查询；固定、铰链、滑轨、点约束 | `RayQuery`, `SweepQuery`, `*ConstraintDef` |
+| 固定步长 + 插值 | 物理定步运行，渲染插值 | `FixedStepClock`, `InterpolatedPose` |
+| 可重定位双精度原点 | 外部世界 `double`，内部 Bullet 局部原点 | `PhysicsWorld#rebaseOrigin()` |
+
+### 世界与玩法
+
+| 能力 | 说明 | 主要入口 |
+| --- | --- | --- |
+| 每维度物理世界 | 每个 `ServerLevel` 自动维护独立世界 | `MinecraftPhysics`, `LevelPhysics` |
+| 地形碰撞 | 16³ section 静态合并体、缓存、方块编辑失效、碰撞组 | `TerrainCollision` |
+| 真实空 Level 方块逻辑 | 懒创建真实空 `ServerLevel`，复制结构方块，只 tick 含方块 chunk | `EmptyPhysicsLevel` |
+| 玩家重力方向 | 修改空中重力、相机朝向、OBB 碰撞和交互视线 | `PlayerGravity`, `PlayerObbCollision` |
+| 实体碰撞/搭乘 | 实体被结构推出但不推动结构；站在结构上的实体随结构移动 | `EntityPhysicsCollisionManager`, `EntityStructureRidingManager` |
+| 结构方块交互 | 射线挖掘/放置、挖掘反作用冲量、铲水反作用 | `StructureInteraction` |
+| 浮力 | 水/流体排水浮力，任意重力方向；末地石低密度浮起 | `BuoyancyManager` |
+| Create 兼容 | 软检测 + compileOnly，contraption 实体可停留在结构上 | `CreateCompat`, `CreateStructureBridge` |
+
+### 渲染与纹理
+
+| 能力 | 说明 | 主要入口 |
+| --- | --- | --- |
+| 真实结构渲染 | 26.3 方块模型 + 按 16³ section/渲染层批量缓存 | `BatchedStructureRenderer` |
+| 调试渲染 | OBB/AABB/接触点/重力 gizmo、F9 切换 | `PhysicsGizmoRenderer` |
+| 方块特殊渲染 | 不走 `BlockEntityRenderer#submit`，在 level 渲染事件提交 | `SpecialBlockRenderManager` |
+| 物品 special model | star 着色器、专用 RenderType、灰度/纯黑掩码 | `StarItemModelRenderer` |
+| 灰度图公式 | 原始公式、平滑 ramp、vanilla 3–8 色带、线性光/伽马 | `GrayscaleFormula`, `SmoothGrayscaleColorizer` |
+| 运行时实体纹理 | `DynamicTexture` 直接注册，不触发资源重载 | `RuntimeTextureCache`, `EntityGrayscaleTextures` |
+| 沉浸式传送门 | 传送平面、实体/玩家/物理体穿越、表面渲染 | `PortalManager`, `PortalRenderer` |
+
+### 数据与多人
+
+| 能力 | 说明 | 主要入口 |
+| --- | --- | --- |
+| 结构持久化 | 稳定 UUID、姿态、体素/方块状态、方块实体 NBT | `StructurePersistence`, `StructureSavedData` |
+| 多人同步 | 结构快照/姿态/移除，客户端只读缓存 | `StructureSync`, `ClientStructureCache` |
+| 调试快照 | 不可变刚体/OBB/AABB/统计，安全跨线程 | `PhysicsDebugSnapshot` |
+| `/crythst` 命令 | 状态、暂停、步进、重力、玩家重力、demo/cube、unstuck | `CrythstCommand` |
 
 ### 关于“完整惯性张量”
 
@@ -356,7 +398,20 @@ PhysicsStructure structure = physics.createStructure(
 | `io.mikaple.crythst.integration.fabric` | Fabric 入口、命令、客户端调试 | `CrythstFabric`, `CrythstCommand`, `CrythstClient`, `PhysicsGizmoRenderer` |
 | `io.mikaple.crythst.client.render.item` | 物品 special model / star 着色器 | `StarItemModelRenderer`, `CrythstItemSpecialRenderers` |
 | `io.mikaple.crythst.client.render.block` | 无 BER submit 的方块特殊渲染 | `SpecialBlockRenderManager`, `ItemModelBlockRenderer` |
-| `io.mikaple.crythst.client.texture` | 灰度图单/双色着色与外轮廓 | `GrayscaleColorizer` |
+| `io.mikaple.crythst.integration.minecraft.mass` | 数据驱动方块质量/摩擦/浮力 | `BlockPhysicsRegistry`, `BlockMassReload` |
+| `io.mikaple.crythst.integration.minecraft.player` | 玩家 OBB 碰撞与重力姿态 | `PlayerObbCollision`, `PlayerObb` |
+| `io.mikaple.crythst.integration.minecraft.entity` | 实体碰撞与结构搭乘 | `EntityPhysicsCollisionManager`, `EntityStructureRidingManager` |
+| `io.mikaple.crythst.integration.minecraft.interaction` | 结构方块交互/反作用力 | `StructureInteraction`, `StructureActionPayload` |
+| `io.mikaple.crythst.integration.minecraft.buoyancy` | 流体浮力 | `BuoyancyManager`, `BuoyancyMath` |
+| `io.mikaple.crythst.integration.minecraft.storage` | 结构/方块实体持久化 | `StructurePersistence`, `StructureSavedData` |
+| `io.mikaple.crythst.integration.portal` | 传送门与传送变换 | `PortalManager`, `PortalTeleporter` |
+| `io.mikaple.crythst.integration.create` | Create-Fly 软兼容 | `CreateCompat`, `CreateStructureBridge` |
+| `io.mikaple.crythst.network.structure` | 多人结构同步协议 | `StructureSyncProtocol`, `StructureSnapshotPayload` |
+| `io.mikaple.crythst.client.network` | 客户端结构快照缓存 | `ClientStructureCache` |
+| `io.mikaple.crythst.client.render.structure` | 真实/批量结构渲染 | `BatchedStructureRenderer`, `RealStructureBlockRenderer` |
+| `io.mikaple.crythst.client.render.portal` | 传送门表面渲染 | `PortalRenderer` |
+| `io.mikaple.crythst.client.texture` | 灰度图单/双色着色与外轮廓 | `GrayscaleColorizer`, `GrayscaleFormula` |
+| `io.mikaple.crythst.client.texture.runtime` | 运行时实体纹理（无资源重载） | `RuntimeTextureCache`, `EntityGrayscaleTextures` |
 | `io.mikaple.crythst.util` | 参数校验与计时代码 | `Validate`, `StepProfiler` |
 
 更详细的模块依赖方向、线程模型、固定步长、原点重定位、贪心合并、SAT、结构生命周期和调试渲染路径见 [docs/architecture.md](docs/architecture.md)。
@@ -416,9 +471,12 @@ PhysicsStructure structure = physics.createStructure(
 | `/crythst playergravity look` | 玩家重力方向改为视线方向（看向哪里就向哪里下落） |
 | `/crythst playergravity <x> <y> <z>` | 玩家重力固定为指定方向 |
 | `/crythst playergravity reset` | 恢复原版向下重力 |
+| `/crythst unstuck` | 立即尝试把卡在方块里的物理体/玩家推出来 |
 | `/crythst debug` | 切换调试叠层开关（运行时修改 `config.debug`，不写回配置文件） |
+| `/crythstmine` / `/crythstplace` | 对物理结构体素做服务端挖掘/放置诊断 |
+| `/crythst portal create/link/remove/list` | 创建、连接、删除和列出传送门 |
 
-调试叠层只在单人集成服务器中可用；多人环境下客户端没有本地物理世界可供读取。
+单人集成服务器下渲染器直接读取服务端快照；多人环境已经提供结构快照同步与客户端 `ClientStructureCache`，渲染器接入仍在持续完善。
 
 ---
 
@@ -447,20 +505,27 @@ Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本�
 
 当前 `0.1.0` 已经具备：
 
-- 刚体、体素结构、合并碰撞盒、完整惯性张量；
-- 任意方向重力与每刚体覆盖；
-- OBB/15 轴 SAT、射线、扫掠、约束、角色控制器；
-- 固定步长 + 插值、可重定位原点、调试快照；
-- 每维度物理世界、`/crythst` 命令；
-- 单人集成服务器下的客户端 gizmo 调试渲染。
+- 刚体、体素结构、贪心碰撞盒、完整 3×3 惯性张量；
+- 数据驱动方块质量、摩擦、弹性、浮力和末地石低密度；
+- 任意方向重力、玩家相机姿态、玩家 OBB 后置碰撞校正；
+- 每维度物理世界、真实空 `ServerLevel` 方块逻辑、地形 section 碰撞；
+- 实体单向碰撞、实体停留在移动结构上、Create-Fly 软兼容；
+- 结构方块挖掘/放置、挖掘反作用力、铲水反作用力；
+- 真实方块模型渲染 + 分 section/渲染层批量缓存；
+- 物品 star special model、无 BER submit 的方块特殊渲染；
+- 灰度图多公式、外轮廓、原版钻石素材、运行时实体纹理（无资源重载）；
+- 结构持久化（含方块实体 NBT）、多人结构同步；
+- 沉浸式传送门 v1（传送、玩家/实体/物理体、动画表面）。
 
-下一步重点：
+下一步：
 
-1. **客户端方块模型渲染**：用真实的 Minecraft 方块模型/区块渲染移动结构，而不只是调试线框；
-2. **多人同步**：把结构姿态、方块变更和物理事件同步到客户端/其他玩家；
-3. 更完整的结构编辑、持久化和性能优化。
+- 传送门“看到另一侧”的实时视口、递归/模板缓冲；
+- 移动传送门、跨维度传送、传送门持久化与同步；
+- 结构方块实体客户端渲染与更完整的 BE tick；
+- 真正的 swept OBB 玩家移动求解（当前为移动后校正）；
+- 更多 Create 渲染/交互兼容和性能剖析。
 
----
+完整拆解与验收标准见 [TODO.md](TODO.md)。
 
 ## 文档索引
 
