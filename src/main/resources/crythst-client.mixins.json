@@ -9,6 +9,8 @@
     "DebugRendererMixin",
     "DebugScreenEntriesMixin",
     "DebugScreenEntryListMixin",
+    "FrustumOffsetBoundedMixin",
+    "LevelExtractorFrustumMixin",
     "LevelRendererOutlineInvoker",
     "PortalCameraAccessor",
     "PortalCaptureMixin",
