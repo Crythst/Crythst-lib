@@ -4,6 +4,8 @@ import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.api.CrythstApi;
 import io.mikaple.crythst.api.CrythstEvents;
 import io.mikaple.crythst.api.event.StructureContainerReadyEvent;
+import io.mikaple.crythst.api.sublevel.ServerStructureContainer;
+import io.mikaple.crythst.api.sublevel.StructureContainerEvents;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.physics.PhysicsEngine;
 import io.mikaple.crythst.physics.PhysicsException;
@@ -80,6 +82,7 @@ public final class MinecraftPhysics {
         LEVELS.put(level.dimension(), physics);
         CrythstEvents.fireStructureContainerReady(
                 new StructureContainerReadyEvent(level, physics.apiPipeline()));
+        StructureContainerEvents.fireContainerReady(ServerStructureContainer.of(physics));
         return physics;
     }
 
@@ -97,12 +100,14 @@ public final class MinecraftPhysics {
                 physics.tick();
             }
         }
+        StructureContainerEvents.tick();
     }
 
     public static void unload(ServerLevel level) {
         final LevelPhysics physics = LEVELS.remove(level.dimension());
         if (physics != null) {
             physics.close();
+            ServerStructureContainer.closeFor(physics);
         }
     }
 
@@ -111,6 +116,7 @@ public final class MinecraftPhysics {
             physics.close();
         }
         LEVELS.clear();
+        ServerStructureContainer.closeAll();
         PlayerGravity.clearAll();
     }
 

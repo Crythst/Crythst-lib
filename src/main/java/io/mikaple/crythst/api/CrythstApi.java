@@ -3,6 +3,8 @@ package io.mikaple.crythst.api;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
 import io.mikaple.crythst.api.physics.RigidBodyHandle;
+import io.mikaple.crythst.api.sublevel.ServerStructureContainer;
+import io.mikaple.crythst.api.sublevel.StructureContainer;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.Aabb;
@@ -104,6 +106,29 @@ public final class CrythstApi {
         }
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(serverLevel);
         return physics == null ? List.of() : physics.structures();
+    }
+
+    /**
+     * Returns the structure container for a level, or {@code null} when the
+     * level has no physics world yet.
+     *
+     * <p>Server containers are authoritative. Client containers are read-only
+     * views over the integrated-server render snapshots (singleplayer) and the
+     * synced structure cache (multiplayer).</p>
+     */
+    public static @Nullable StructureContainer container(Level level) {
+        return StructureContainer.getContainer(level);
+    }
+
+    /**
+     * Returns the server structure container for a level, or {@code null} when
+     * the level's physics world has not been created yet.
+     *
+     * <p>Use {@link #physics(ServerLevel)} first when a world should be created
+     * on demand.</p>
+     */
+    public static @Nullable ServerStructureContainer container(ServerLevel level) {
+        return StructureContainer.getContainer(level);
     }
 
     /**
