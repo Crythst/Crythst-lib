@@ -242,6 +242,123 @@ public final class PlayerGravity {
         return viewRotation(player).transform(result);
     }
 
+    /**
+     * Orthonormal basis used to map vanilla WASD input into the gravity frame.
+     *
+     * <p>{@code forward} lies in the plane perpendicular to {@code up}.
+     * {@code right} is {@code forward x up}, so it is the camera's right-hand
+     * side. Vanilla's {@code xxa} input is <em>positive when strafing left</em>
+     * (A is {@code +1}, D is {@code -1}); movement therefore uses
+     * {@code -right} for the {@code input.x} component. Keeping that sign is
+     * what stops A/D from being inverted relative to the rotated camera.</p>
+     */
+    public record MovementFrame(Vector3d forward, Vector3d right, Vector3d up) {
+    }
+
+    /**
+     * Builds the movement frame from the gravity-frame look direction.
+     *
+     * <p>{@code look} is projected onto the plane perpendicular to {@code up}.
+     * When that projection is degenerate (looking straight along up or down),
+     * {@code fallbackForward} is projected instead. If the fallback is also
+     * degenerate, a deterministic perpendicular of {@code up} is used, so the
+     * returned frame is always orthonormal and never contains NaN or a zero
+     * forward vector.</p>
+     *
+     * @param look            desired forward, normally
+     *                        {@link #lookDirection(Player)}; may be any
+     *                        non-zero length
+     * @param up              gravity up, normally {@link #up(Player)}
+     * @param fallbackForward a fallback forward already expressed in the
+     *                        gravity frame (for example the vanilla yaw forward
+     *                        rotated by {@link #viewRotation(Player)}) or a
+     *                        previously valid forward
+     */
+    public static MovementFrame movementFrame(Vector3dc look, Vector3dc up,
+                                              Vector3dc fallbackForward) {
+        final Vector3d normalizedUp = up == null || up.lengthSquared() < 1.0e-20
+                ? new Vector3d(0.0, 1.0, 0.0)
+                : new Vector3d(up).normalize();
+
+        Vector3d forward = projectOntoPlane(look, normalizedUp);
+        if (forward == null) {
+            forward = projectOntoPlane(fallbackForward, normalizedUp);
+        }
+        if (forward == null) {
+            forward = stablePerpendicular(normalizedUp);
+        }
+
+        final Vector3d right = new Vector3d(forward).cross(normalizedUp).normalize();
+        return new MovementFrame(forward, right, normalizedUp);
+    }
+
+    /**
+     * Applies vanilla {@code Entity.getInputVector} semantics in a movement
+     * frame: normalize input longer than one, scale by {@code speed}, and map
+     * {@code input.z} onto {@code forward} and {@code input.x} onto the
+     * camera's left. The input Y component is kept on world Y, exactly like
+     * vanilla.
+     *
+     * <p>This mirrors the early-out and normalization thresholds of
+     * {@code Entity.getInputVector}, so replacing vanilla's world-yaw rotation
+     * with this method does not change speed for diagonal or longer input.</p>
+     */
+    public static Vector3d movementInGravityFrame(Vector3dc input, double speed,
+                                                  MovementFrame frame) {
+        if (input == null || frame == null) {
+            return new Vector3d();
+        }
+        final double lengthSquared = input.lengthSquared();
+        if (lengthSquared < 1.0e-7) {
+            return new Vector3d();
+        }
+
+        final Vector3d scaled = new Vector3d(input);
+        if (lengthSquared > 1.0) {
+            scaled.normalize();
+        }
+        scaled.mul(speed);
+
+        // +input.x is vanilla "strafe left", so add -right * input.x.
+        final Vector3d world = new Vector3d(frame.forward).mul(scaled.z);
+        world.fma(-scaled.x, frame.right);
+        // getInputVector leaves the Y component untouched.
+        world.y += scaled.y;
+        return world;
+    }
+
+    private static Vector3d projectOntoPlane(Vector3dc direction, Vector3dc unitUp) {
+        if (direction == null || direction.lengthSquared() < 1.0e-20) {
+            return null;
+        }
+        final Vector3d projected = new Vector3d(direction);
+        projected.fma(-projected.dot(unitUp), unitUp);
+        if (projected.lengthSquared() < 1.0e-12) {
+            return null;
+        }
+        return projected.normalize();
+    }
+
+    /**
+     * Deterministic unit vector perpendicular to {@code unitUp}, used only when
+     * both the look and fallback directions are parallel to gravity up/down.
+     */
+    private static Vector3d stablePerpendicular(Vector3dc unitUp) {
+        final double ax = Math.abs(unitUp.x());
+        final double ay = Math.abs(unitUp.y());
+        final double az = Math.abs(unitUp.z());
+        final Vector3d axis;
+        if (ax <= ay && ax <= az) {
+            axis = new Vector3d(1.0, 0.0, 0.0);
+        } else if (ay <= az) {
+            axis = new Vector3d(0.0, 1.0, 0.0);
+        } else {
+            axis = new Vector3d(0.0, 0.0, 1.0);
+        }
+        final Vector3d forward = axis.fma(-axis.dot(unitUp), unitUp);
+        return forward.normalize();
+    }
+
     public static String describe(Player player) {
         final Entry entry = ENTRIES.get(player.getUUID());
         if (entry == null) {

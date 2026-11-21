@@ -8,6 +8,7 @@
     "entity.EntityStructureCollisionMixin",
     "LivingEntityTravelMixin",
     "LevelChunkTerrainMixin",
+    "PlayerGravityMovementMixin",
     "MinecraftServerAccessor",
     "ServerGamePacketListenerImplInvoker"
   ],

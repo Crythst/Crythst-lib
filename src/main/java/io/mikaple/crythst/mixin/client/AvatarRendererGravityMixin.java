@@ -52,12 +52,16 @@ public abstract class AvatarRendererGravityMixin {
         if (rotation == null) {
             return;
         }
-        // Right-multiply: the matrix already sits at the entity's feet, and the
-        // resulting transform rotates the yawed model around that pivot in
-        // world space (Q is applied after the vanilla local rotations).
+        // The player OBB is centred on the vanilla AABB centre, so rotate the
+        // avatar around the same centre, not around its feet. Otherwise the
+        // rendered model and the F3+B/collision box visibly diverge when up is
+        // tilted. setupRotations starts at the feet.
+        final float halfHeight = Math.max(0.0f, avatar.boundingBoxHeight * 0.5f);
+        pose.translate(0.0f, halfHeight, 0.0f);
         pose.mulPose(new Matrix4f().rotation(new Quaternionf(
                 (float) rotation.x, (float) rotation.y,
                 (float) rotation.z, (float) rotation.w)));
+        pose.translate(0.0f, -halfHeight, 0.0f);
     }
 
     /**
