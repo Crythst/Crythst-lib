@@ -5,6 +5,7 @@ import io.mikaple.crythst.api.CrythstEvents;
 import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.api.event.PhysicsTickEvent;
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
+import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
@@ -37,6 +38,7 @@ public final class LevelPhysics implements AutoCloseable {
     private final List<PhysicsStructure> structures = new ArrayList<>();
     private final PhysicsTimingMonitor timing = new PhysicsTimingMonitor();
     private final PhysicsPipeline apiPipeline;
+    private final StructurePhysicsRuntime structureActors;
     private long physicsTickIndex;
 
     /**
@@ -67,11 +69,18 @@ public final class LevelPhysics implements AutoCloseable {
         this.terrain = new TerrainCollision(level, world, config);
         this.unstuck = new UnstuckResolver(level, world, config);
         this.apiPipeline = new PhysicsPipeline(this);
+        this.structureActors = new StructurePhysicsRuntime(level);
         this.world.addStepListener(new StepListener() {
             @Override
             public void beforeStep(PhysicsWorld steppedWorld, double fixedTimeStep) {
                 CrythstEvents.firePrePhysicsTick(new PhysicsTickEvent(
                         level, apiPipeline, fixedTimeStep, physicsTickIndex));
+                // Run block-entity actors after the public pre-step event so
+                // existing listener ordering is unchanged. Both paths run
+                // before integration and see the same substep length.
+                for (int i = 0; i < structures.size(); i++) {
+                    structureActors.runSubstep(structures.get(i), fixedTimeStep);
+                }
             }
 
             @Override
@@ -131,6 +140,7 @@ public final class LevelPhysics implements AutoCloseable {
         if (sub != null) {
             try {
                 sub.addStructure(structure, definition.volume());
+                refreshStructureActors(structure);
             } catch (Throwable t) {
                 Crythst.LOGGER.warn("Could not copy structure body #{} into the auxiliary void level; "
                         + "its blocks will not tick", structure.body().id(), t);
@@ -146,6 +156,8 @@ public final class LevelPhysics implements AutoCloseable {
     }
 
     public void removeStructure(PhysicsStructure structure) {
+        structure.invalidateBlockEntityActors();
+        structureActors.forget(structure);
         // The void region is keyed by the body id, so remove it before the
         // physics body is closed.
         if (subLevel != null) {
@@ -192,12 +204,38 @@ public final class LevelPhysics implements AutoCloseable {
             try {
                 subLevel.removeStructure(structure);
                 subLevel.addStructure(structure, volume);
+                refreshStructureActors(structure);
             } catch (Throwable t) {
                 Crythst.LOGGER.warn("Could not refresh structure body #{} in the auxiliary void level",
                         structure.body().id(), t);
+                structure.invalidateBlockEntityActors();
+                structureActors.forget(structure);
             }
+        } else {
+            structure.invalidateBlockEntityActors();
+            structureActors.forget(structure);
         }
         return StructureSplitter.splitIfNeeded(this, structure, volume);
+    }
+
+    /**
+     * Re-discovers block-entity physics actors for a structure after its block
+     * copy changed. The runtime state is dropped first so cached failure or
+     * force-group state from the old actor set cannot leak into the new one.
+     */
+    private void refreshStructureActors(PhysicsStructure structure) {
+        structureActors.forget(structure);
+        if (subLevel == null) {
+            structure.invalidateBlockEntityActors();
+            return;
+        }
+        try {
+            structure.setBlockEntityActors(subLevel.blockEntityActors(structure));
+        } catch (Throwable t) {
+            structure.invalidateBlockEntityActors();
+            Crythst.LOGGER.warn("Could not discover block-entity actors for structure body #{}",
+                    structure.body().id(), t);
+        }
     }
 
     /**
@@ -386,9 +424,11 @@ public final class LevelPhysics implements AutoCloseable {
         // (and therefore their body ids) are closed.
         clearSubLevel();
         for (PhysicsStructure structure : structures) {
+            structure.invalidateBlockEntityActors();
             structure.close();
         }
         structures.clear();
+        structureActors.clear();
         refreshRenderStructures();
         terrain.invalidateAll();
         for (io.mikaple.crythst.physics.body.BodyHandle body
@@ -444,6 +484,9 @@ public final class LevelPhysics implements AutoCloseable {
                                    java.util.Map<net.minecraft.core.BlockPos, net.minecraft.nbt.CompoundTag> data) {
         if (subLevel != null) {
             subLevel.applyBlockEntities(structure, data);
+            // Restored NBT can turn a plain copied block into an actor; refresh
+            // the cached list so the next substep sees it.
+            refreshStructureActors(structure);
         }
     }
 
@@ -467,6 +510,51 @@ public final class LevelPhysics implements AutoCloseable {
      */
     public int subLevelRegionCount() {
         return subLevel == null ? 0 : subLevel.regionCount();
+    }
+
+    /**
+     * Number of block-entity physics actors across all structures.
+     *
+     * <p>Cheap diagnostic: reads the cached per-structure actor lists without
+     * touching the auxiliary level or loading chunks. Zero when the auxiliary
+     * level is disabled or no block entity implements
+     * {@link io.mikaple.crythst.api.block.BlockEntityStructureActor}.</p>
+     *
+     * @return total cached actor count
+     */
+    public int structureActorCount() {
+        int count = 0;
+        for (PhysicsStructure structure : structures) {
+            count += structure.blockEntityActors().size();
+        }
+        return count;
+    }
+
+    /**
+     * Number of structures that currently have at least one cached physics
+     * actor. Diagnostic only.
+     *
+     * @return structures with actors
+     */
+    public int structuresWithActors() {
+        int count = 0;
+        for (PhysicsStructure structure : structures) {
+            if (!structure.blockEntityActors().isEmpty()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * One-line actor cache summary for commands and logs.
+     *
+     * @return a human-readable count summary
+     */
+    public String structureActorStatus() {
+        return structureActorCount() + " actor(s) on " + structuresWithActors()
+                + " structure(s); runtime states=" + structureActors.cachedStructureCount()
+                + ", force groups=" + structureActors.cachedForceGroupCount();
     }
 
     /**
@@ -509,9 +597,11 @@ public final class LevelPhysics implements AutoCloseable {
             subLevel = null;
         }
         for (PhysicsStructure structure : structures) {
+            structure.invalidateBlockEntityActors();
             structure.close();
         }
         structures.clear();
+        structureActors.clear();
         refreshRenderStructures();
         renderDebugSnapshot = null;
         terrain.close();

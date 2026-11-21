@@ -1,5 +1,6 @@
 package io.mikaple.crythst.physics.structure;
 
+import io.mikaple.crythst.api.block.BlockEntityStructureActor;
 import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.api.block.StructureBlockStateSnapshot;
 import io.mikaple.crythst.math.Aabb;
@@ -18,6 +19,8 @@ import io.mikaple.crythst.physics.world.PhysicsWorld;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
+
+import java.util.List;
 
 /**
  * One rigid moving block structure.
@@ -49,6 +52,12 @@ public final class PhysicsStructure implements AutoCloseable {
     private volatile Vector3d centerOfMassOffset;
     /** Only allocated when a block-change listener exists for this volume. */
     private volatile StructureBlockStateSnapshot blockStateSnapshot;
+    /**
+     * Cached block-entity actors discovered in the auxiliary ticking level.
+     * Empty until {@code LevelPhysics} attaches the structure. Rebuilt on
+     * refresh and cleared by {@link #reindex(VoxelVolume)} and {@link #close()}.
+     */
+    private volatile List<BlockEntityStructureActor> blockEntityActors = List.of();
     private boolean closed;
 
     public PhysicsStructure(PhysicsWorld world, StructureDef definition) {
@@ -103,6 +112,45 @@ public final class PhysicsStructure implements AutoCloseable {
 
     public VoxelVolume volume() {
         return volume;
+    }
+
+    /**
+     * Immutable snapshot of the block-entity physics actors currently attached
+     * to this structure.
+     *
+     * <p>The list is discovered by {@code LevelPhysics} from the auxiliary
+     * ticking level and cached here. Reading it is cheap and safe from the
+     * server thread; the returned list is immutable. Client/render code should
+     * not invoke actors.</p>
+     *
+     * @return actors in discovery order, or an empty list
+     */
+    public List<BlockEntityStructureActor> blockEntityActors() {
+        return blockEntityActors;
+    }
+
+    /**
+     * Replaces the cached actor list.
+     *
+     * <p>Internal plumbing used by {@code LevelPhysics} after copying blocks
+     * into the auxiliary level. Mods should not call this directly; the next
+     * refresh or reindex rebuilds it.</p>
+     *
+     * @param actors actor snapshot, or {@code null} to clear
+     */
+    public void setBlockEntityActors(List<BlockEntityStructureActor> actors) {
+        blockEntityActors = actors == null || actors.isEmpty() ? List.of() : List.copyOf(actors);
+    }
+
+    /**
+     * Clears the cached actor list without rebuilding it.
+     *
+     * <p>Called by {@link #reindex(VoxelVolume)} and {@link #close()} so a
+     * stale actor from the previous block set is never invoked. A subsequent
+     * {@code LevelPhysics#refreshStructure} rediscovers the actors.</p>
+     */
+    public void invalidateBlockEntityActors() {
+        blockEntityActors = List.of();
     }
 
     public double blockScale() {
@@ -281,6 +329,9 @@ public final class PhysicsStructure implements AutoCloseable {
      * preserved even when the centre of mass shifts.
      */
     public void reindex(VoxelVolume newVolume) {
+        // Actors are tied to the old block set; do not invoke them again until
+        // LevelPhysics refreshes the auxiliary level and rediscovers them.
+        invalidateBlockEntityActors();
         final Transform3d oldBodyPose = body.transform();
         final Vector3d structurePosition = new Vector3d(oldBodyPose.position())
                 .sub(new Vector3d(centerOfMassOffset).rotate(oldBodyPose.rotation()));
@@ -334,6 +385,7 @@ public final class PhysicsStructure implements AutoCloseable {
             return;
         }
         closed = true;
+        invalidateBlockEntityActors();
         world.removeBody(body);
     }
 

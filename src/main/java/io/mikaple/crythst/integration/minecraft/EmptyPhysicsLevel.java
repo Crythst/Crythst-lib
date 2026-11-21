@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.api.block.BlockEntityStructureActor;
 import io.mikaple.crythst.mixin.MinecraftServerAccessor;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -24,6 +25,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
@@ -36,6 +38,7 @@ import net.minecraft.world.level.levelgen.structure.StructureSet;
 import net.minecraft.world.level.storage.DerivedLevelData;
 import net.minecraft.world.level.storage.ServerLevelData;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -168,6 +171,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     if (!level.setBlock(pos, state, 2)) {
                         continue;
                     }
+                    if (state.hasBlockEntity()) {
+                        region.blockEntityPositions.add(pos.asLong());
+                    }
                     final long chunkKey = ChunkPos.pack(pos.getX() >> 4, pos.getZ() >> 4);
                     if (region.chunks.add(chunkKey)) {
                         activeChunks.merge(chunkKey, 1, Integer::sum);
@@ -225,11 +231,54 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                 pos, state, entry.getValue(), level.registryAccess());
                 if (blockEntity != null) {
                     level.setBlockEntity(blockEntity);
+                    region.blockEntityPositions.add(pos.asLong());
                 }
             } catch (Throwable t) {
                 Crythst.LOGGER.warn("Could not restore block entity at {} in auxiliary level", pos, t);
             }
         }
+    }
+
+    /**
+     * Discovers the physics actors among a structure's copied block entities.
+     *
+     * <p>Only positions recorded while copying blocks (or while restoring
+     * block-entity NBT) are probed, and only chunks that are already loaded are
+     * read. This never loads a chunk and never walks every block position, so it
+     * is cheap enough to call after a refresh rather than every substep. The
+     * resulting list is cached by {@code PhysicsStructure}.</p>
+     *
+     * @param structure structure whose region should be scanned; must not be
+     *                  {@code null}
+     * @return immutable actors in recorded order, or an empty list
+     */
+    public List<BlockEntityStructureActor> blockEntityActors(PhysicsStructure structure) {
+        if (closed || structure == null) {
+            return List.of();
+        }
+        final Region region = regions.get(structure.body().id());
+        if (region == null || region.blockEntityPositions.isEmpty()) {
+            return List.of();
+        }
+        List<BlockEntityStructureActor> actors = null;
+        for (long packed : region.blockEntityPositions) {
+            final BlockPos pos = BlockPos.of(packed);
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            if (chunk == null) {
+                // The region's chunks are loaded while it is active; if one is
+                // missing, skip it instead of forcing a synchronous load.
+                continue;
+            }
+            final BlockEntity blockEntity = chunk.getBlockEntity(pos);
+            if (blockEntity instanceof BlockEntityStructureActor actor) {
+                if (actors == null) {
+                    actors = new ArrayList<>();
+                }
+                actors.add(actor);
+            }
+        }
+        return actors == null ? List.of() : List.copyOf(actors);
     }
 
     private void ensureChunk(BlockPos pos) {
@@ -358,6 +407,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         private final int sizeY;
         private final int sizeZ;
         private final Set<Long> chunks = new HashSet<>();
+        /**
+         * Absolute positions whose copied block state declares a block entity.
+         * Recording them during the copy avoids probing every voxel later.
+         */
+        private final Set<Long> blockEntityPositions = new HashSet<>();
 
         private Region(long structureId, int baseX, int baseY, int baseZ,
                        int sizeX, int sizeY, int sizeZ) {
