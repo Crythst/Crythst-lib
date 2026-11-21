@@ -24,6 +24,11 @@ import org.joml.Vector3dc;
  * {@link ServerLevel#playSound} broadcasts a positional sound packet. Nothing
  * is played through a client-local code path.</p>
  *
+ * <p>Breaking keeps the full vanilla destroy-block effect. Placement emits the
+ * block's place sound once but deliberately emits no particles: structure
+ * placement already has an authoritative impulse and outline, and the small
+ * puff made the edit look noisy or like a failed break.</p>
+ *
  * <p>Particle counts and spreads are pure functions of the structure's
  * {@code blockScale} so they can be unit tested without a live level.</p>
  */
@@ -39,13 +44,9 @@ public final class StructureFeedback {
     public static final float PLACE_VOLUME = 0.9f;
     /** Outward velocity for the fallback break debris. */
     public static final double BREAK_PARTICLE_SPEED = 0.12;
-    /** Outward velocity for the small placement puff. */
-    public static final double PLACE_PARTICLE_SPEED = 0.02;
 
     private static final int BREAK_BASE_PARTICLES = 8;
     private static final int BREAK_PARTICLES_PER_SCALE = 4;
-    private static final int PLACE_BASE_PARTICLES = 3;
-    private static final int PLACE_PARTICLES_PER_SCALE = 2;
     private static final double MIN_SCALE = 0.5;
     private static final double MAX_SCALE = 3.0;
     private static final double MIN_SPREAD = 0.15;
@@ -63,16 +64,6 @@ public final class StructureFeedback {
         final double scale = clampScale(blockScale);
         return BREAK_BASE_PARTICLES
                 + (int) Math.round(scale * BREAK_PARTICLES_PER_SCALE);
-    }
-
-    /**
-     * Number of particles for placing into a structure. Deliberately smaller
-     * than a break so placement does not look like destruction.
-     */
-    public static int placeParticleCount(double blockScale) {
-        final double scale = clampScale(blockScale);
-        return PLACE_BASE_PARTICLES
-                + (int) Math.round(scale * PLACE_PARTICLES_PER_SCALE);
     }
 
     /**
@@ -124,19 +115,17 @@ public final class StructureFeedback {
     }
 
     /**
-     * Emits a small puff and the block's place sound at the new voxel centre.
+     * Emits the block's place sound once at the new voxel centre.
+     *
+     * <p>No particles are emitted. A placement puff made structure building
+     * visually noisy and could be mistaken for a break effect; the sound is
+     * enough feedback and matches vanilla's single place sound.</p>
      */
     public static void placeBlock(ServerLevel level, Vector3dc center, BlockState state,
                                   double blockScale, RandomSource random) {
         if (level == null || center == null || state == null || state.isAir()) {
             return;
         }
-        final double spread = particleSpread(blockScale) * 0.5;
-        level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state),
-                center.x(), center.y(), center.z(),
-                placeParticleCount(blockScale),
-                spread, spread * 0.5, spread,
-                PLACE_PARTICLE_SPEED);
         play(level, center, state, false, PLACE_VOLUME, random);
     }
 

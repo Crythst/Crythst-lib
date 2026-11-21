@@ -6,6 +6,8 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
+import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
@@ -707,7 +709,7 @@ public final class StructureInteraction {
             }
             case PLACE -> {
                 final ItemStack stack = player.getMainHandItem();
-                if (!(stack.getItem() instanceof BlockItem blockItem)) {
+                if (!StructureItemUse.shouldHandleStructureUse(stack)) {
                     yield false;
                 }
                 final StructureBlockHitResult hit = raycast(player);
@@ -715,9 +717,18 @@ public final class StructureInteraction {
                         || !beginPlacement(player)) {
                     yield false;
                 }
-                final PlaceResult result = placeBlock(player, hit, stack);
-                if (result.success() && !player.isCreative()) {
-                    stack.shrink(1);
+                if (stack.getItem() instanceof BlockItem) {
+                    final PlaceResult result = placeBlock(player, hit, stack);
+                    if (result.success()) {
+                        stack.consume(1, player);
+                    }
+                    yield result.success();
+                }
+                final StructureEntityPlacementHandler.Result result =
+                        StructureEntityPlacement.place(player, stack, hit,
+                                InteractionHand.MAIN_HAND);
+                if (result.success()) {
+                    stack.consume(1, player);
                 }
                 yield result.success();
             }

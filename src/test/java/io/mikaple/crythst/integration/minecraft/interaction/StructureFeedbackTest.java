@@ -2,7 +2,10 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StructureFeedbackTest {
@@ -16,11 +19,13 @@ class StructureFeedbackTest {
     }
 
     @Test
-    void placeCountIsSmallerThanBreakCount() {
-        for (double scale = 0.5; scale <= 3.0; scale += 0.5) {
-            assertTrue(StructureFeedback.placeParticleCount(scale)
-                    < StructureFeedback.breakParticleCount(scale));
-        }
+    void placementHasNoParticleBurst() {
+        // Placement only emits the place sound. The former place-particle
+        // count API must stay gone so a future edit cannot silently bring the
+        // puff back without updating this contract.
+        assertFalse(Arrays.stream(StructureFeedback.class.getMethods())
+                        .anyMatch(method -> method.getName().equals("placeParticleCount")),
+                "placement must not expose or emit a particle burst");
     }
 
     @Test

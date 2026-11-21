@@ -24,8 +24,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  *
  * <p>For a {@code StructureBlockHitResult} this injector consumes the click at
  * the head of {@code useItemOn}, before prediction starts, and sends only the
- * authoritative {@code crythst:structure_action} payload. Vanilla never sends
- * a use-on-block packet and never runs {@code BlockItem.place} for this click.
+ * authoritative {@code crythst:structure_action} payload. This covers block
+ * items, spawn eggs, item frames and registered entity items. Vanilla never
+ * sends a use-on-block packet and never runs {@code BlockItem.place},
+ * {@code SpawnEggItem.useOn} or a hanging-entity placement for this click.
  * Returning {@code CONSUME} rather than {@code SUCCESS} avoids a second arm
  * swing because {@link ClientStructureInteraction} already swings.</p>
  */

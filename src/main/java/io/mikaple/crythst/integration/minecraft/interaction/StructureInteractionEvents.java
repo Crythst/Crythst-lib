@@ -1,6 +1,8 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
+import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
@@ -85,8 +87,9 @@ public final class StructureInteractionEvents {
 
     /**
      * Server half of right-clicking a block. A held block item is placed into
-     * the adjacent structure voxel when the structure is in front of the
-     * vanilla hit.
+     * the adjacent structure voxel, while spawn eggs, item frames and
+     * registered entity items are placed at the structure surface when the
+     * structure is in front of the vanilla hit.
      */
     private static InteractionResult onUseBlock(Player player, Level level,
                                                 InteractionHand hand, BlockHitResult hitResult) {
@@ -97,7 +100,7 @@ public final class StructureInteractionEvents {
             return InteractionResult.PASS;
         }
         final ItemStack stack = serverPlayer.getMainHandItem();
-        if (!(stack.getItem() instanceof BlockItem blockItem)) {
+        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
             return InteractionResult.PASS;
         }
         final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
@@ -108,21 +111,29 @@ public final class StructureInteractionEvents {
         if (!StructureInteraction.beginPlacement(serverPlayer)) {
             return InteractionResult.SUCCESS_SERVER;
         }
-        final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                serverPlayer, hit, stack);
+        if (stack.getItem() instanceof BlockItem) {
+            final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
+                    serverPlayer, hit, stack);
+            if (!result.success()) {
+                return InteractionResult.FAIL;
+            }
+            stack.consume(1, serverPlayer);
+            return InteractionResult.SUCCESS_SERVER;
+        }
+        final StructureEntityPlacementHandler.Result result = StructureEntityPlacement.place(
+                serverPlayer, stack, hit, InteractionHand.MAIN_HAND);
         if (!result.success()) {
             return InteractionResult.FAIL;
         }
-        if (!serverPlayer.isCreative()) {
-            stack.shrink(1);
-        }
+        stack.consume(1, serverPlayer);
         return InteractionResult.SUCCESS_SERVER;
     }
 
     /**
-     * Fallback for right-clicking air with a block item. Vanilla still sends a
-     * use-item packet in this case on most clients; without this hook placement
-     * would only work when a real block happened to be behind the structure.
+     * Fallback for right-clicking air. Vanilla still sends a use-item packet
+     * in this case on most clients; without this hook placement would only
+     * work when a real block happened to be behind the structure. Block items
+     * and handled entity items both use the same authoritative structure hit.
      */
     private static InteractionResult onUseItem(Player player, Level level, InteractionHand hand) {
         if (!(player instanceof net.minecraft.server.level.ServerPlayer serverPlayer)
@@ -132,7 +143,7 @@ public final class StructureInteractionEvents {
             return InteractionResult.PASS;
         }
         final ItemStack stack = serverPlayer.getMainHandItem();
-        if (!(stack.getItem() instanceof BlockItem blockItem)) {
+        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
             return InteractionResult.PASS;
         }
         final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
@@ -143,14 +154,21 @@ public final class StructureInteractionEvents {
         if (!StructureInteraction.beginPlacement(serverPlayer)) {
             return InteractionResult.SUCCESS_SERVER;
         }
-        final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                serverPlayer, hit, stack);
+        if (stack.getItem() instanceof BlockItem) {
+            final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
+                    serverPlayer, hit, stack);
+            if (!result.success()) {
+                return InteractionResult.FAIL;
+            }
+            stack.consume(1, serverPlayer);
+            return InteractionResult.SUCCESS_SERVER;
+        }
+        final StructureEntityPlacementHandler.Result result = StructureEntityPlacement.place(
+                serverPlayer, stack, hit, InteractionHand.MAIN_HAND);
         if (!result.success()) {
             return InteractionResult.FAIL;
         }
-        if (!serverPlayer.isCreative()) {
-            stack.shrink(1);
-        }
+        stack.consume(1, serverPlayer);
         return InteractionResult.SUCCESS_SERVER;
     }
 }

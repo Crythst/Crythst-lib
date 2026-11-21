@@ -20,6 +20,7 @@ hand-off are described in [selection-targeting.md](selection-targeting.md).
 | Left-click a structure block to break it (creative and survival) | `StructureInteraction.breakBlock(...)` via `AttackBlockCallback` and the client `MINE` payload |
 | Breaking applies a reaction impulse to the body | `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)` |
 | Right-click a structure block to place a block | `StructureInteraction.placeBlock(...)` via `UseBlockCallback`, `UseItemCallback`, and the `PLACE` payload for virtual-air targets |
+| Right-click with a spawn egg / item frame / registered entity item | `StructureEntityPlacement.place(...)`: server re-raycast, surface-point math, vanilla entity spawn, no real support block required |
 | Middle-click a structure block to pick it | `StructureInteraction.pickBlock(...)` via the client `PICK` / `PICK_WITH_DATA` payload and vanilla `tryPickItem` |
 | Player-facing orientation on placement | server-built `BlockPlaceContext` + `Block#getStateForPlacement`, so stairs/slabs/logs/pillars/fences/trapdoors use yaw, pitch, clicked face and click position |
 | Selection outline | vanilla outline state built from the same `StructureBlockHitResult`; no custom white box |
@@ -62,11 +63,20 @@ New server/integration files:
 - `.../interaction/StructureActionPayload.java`
 - `.../interaction/StructureInteractionEvents.java`
 - `.../interaction/StructureInteractionCommand.java`
-- `.../interaction/StructureFeedback.java` — shared server-side break/place
-  particles and positional sound
+- `.../interaction/StructureFeedback.java` — shared server-side break particles
+  and positional break/place sound (placement is sound-only)
 - `.../interaction/StructureRayMath.java`
 - `.../interaction/StructurePlacementMath.java` — pure world-face / block-click
   geometry shared by placement diagnostics
+- `.../interaction/StructureItemUse.java` — shared client/server decision for
+  block items, spawn eggs, item frames and registered entity items
+- `.../entity/placement/StructureEntityPlacement.java` — entity placement
+  registry plus built-in spawn-egg and item-frame handlers
+- `.../entity/placement/StructureEntityPlacementHandler.java` — public handler
+  interface for Create seats and other modded entity items
+- `.../entity/placement/StructureEntityPlacementContext.java` — handler context
+- `.../entity/placement/StructureEntityPlacementMath.java` — pure surface
+  point, normal and item-frame geometry for all six faces, rotated/scaled poses
 
 New client helper files:
 
@@ -208,6 +218,21 @@ StructureInteraction.BreakResult br = StructureInteraction.breakBlock(player, hi
 StructureInteraction.PlaceResult pr = StructureInteraction.placeBlock(
         player, hit, player.getMainHandItem());
 
+// Entity items (spawn egg, item frame, registered modded item). The result is
+// success once the handler added an entity; consume one stack only on success.
+StructureEntityPlacementHandler.Result er = StructureEntityPlacement.place(
+        player, player.getMainHandItem(), hit, InteractionHand.MAIN_HAND);
+if (er.success()) {
+    player.getMainHandItem().consume(1, player);
+}
+
+// Register a modded entity item from common initialization. Handlers add the
+// entity themselves and must not consume the stack.
+StructureEntityPlacement.register(MyItems.SEAT, context -> {
+    // context.spawnPoint(), context.face(), context.spawnBlockPos() ...
+    return StructureEntityPlacementHandler.Result.placed(seat);
+});
+
 // Lower-level overload when a state is already known.
 StructureInteraction.PlaceResult pr = StructureInteraction.placeBlock(
         player, hit, Blocks.STONE.defaultBlockState());
@@ -309,18 +334,23 @@ and immutable for the lifetime of the hit.
 8. Stores the state in the stateful volume or `StructureBlockStates`.
 9. Reindexes and refreshes the auxiliary block-ticking level.
 10. Applies a small reaction impulse (`400 * 0.3 * miningImpulseScale`).
-11. Emits the state's place sound once and a small particle puff at the new
-    voxel centre, then notifies listeners.
+11. Emits the state's place sound exactly once at the new voxel centre. No
+    placement particles are emitted; only breaking uses the vanilla destroy
+    burst.
+12. Notifies listeners and consumes one item (`ItemStack.consume`, so creative
+    mode is unaffected).
 
 `StructurePlacementMixin` consumes structure right-clicks at the head of
 `MultiPlayerGameMode.useItemOn`, so the client performs no predictive
-`BlockItem.place` and sends no `ServerboundUseItemOnPacket`. On the server,
+`BlockItem.place` and sends no `ServerboundUseItemOnPacket`. The same mixin also
+consumes spawn eggs, item frames and registered entity items through
+`StructureItemUse.shouldHandleStructureUse(...)`; the server re-raycasts and
+chooses the block or entity path from the authoritative main-hand stack.
 Fabric's `UseBlockCallback`/`UseItemCallback` run at the head of
-`ServerPlayerGameMode.useItemOn`/`useItem`, before vanilla's `BlockItem.place`,
-so every entry path (vanilla use packet, right-click air, or `PLACE` payload)
-either cancels vanilla placement or goes straight through
-`StructureInteraction.placeBlock`. Only one real placement and one place sound
-are produced.
+`ServerPlayerGameMode.useItemOn`/`useItem` as a fallback, before vanilla's
+`BlockItem.place` or `SpawnEggItem.useOn`, so every entry path either cancels
+vanilla use or goes straight through the structure path. Only one placement and
+one place sound are produced.
 
 `beginPlacement(player)` still collapses duplicate right-click paths (vanilla
 `UseBlockCallback`/`UseItemCallback` plus the client `PLACE` payload) within two
@@ -364,14 +394,68 @@ server ticks.
    otherwise the structure's captured block-entity NBT is loaded from
    `StructureBlockEntityData` using structure-local voxel coordinates.
 
----
+### 4.5 Entity placement on structures
 
-## 5. Network payload
+Vanilla spawn eggs and hanging entities use the real world `BlockPos` and block
+state. A structure voxel is air in that grid, so vanilla either spawns the
+entity inside the pointed block or drops the frame for lack of support. The
+entity path fixes this without trusting client coordinates:
+
+1. Client: `StructureItemUse.shouldHandleStructureUse(...)` accepts block items,
+   every `SpawnEggItem`, `Items.ITEM_FRAME`, `Items.GLOW_ITEM_FRAME` and any item
+   with a registered handler. `StructurePlacementMixin` consumes the click and
+   sends the existing `PLACE` payload; no vanilla use packet and no local
+   prediction run.
+2. Server: `StructureInteraction.handleAction(..., PLACE)` re-raycasts, applies
+   the same real-block occlusion and duplicate-click checks, then dispatches to
+   `StructureInteraction.placeBlock` or `StructureEntityPlacement.place`.
+3. `StructureEntityPlacementMath.surfacePoint(hit)` computes:
+   - `faceCenter`: clicked structure-voxel face centre transformed by the
+     structure pose and `blockScale`;
+   - `normal`: true outward world normal (non-cardinal for rotated bodies);
+   - `facePoint` / `hitPoint`: the same point moved 0.05–0.2 blocks outward
+     (`DEFAULT_SURFACE_EPSILON = 0.05`), so it is outside the voxel;
+   - `spawnBlockPos`: the real-world air cell just outside the face.
+4. Built-in spawn eggs call `EntityType.spawn(..., SPAWN_ITEM_USE, ...)`, which
+   preserves `minecraft:entity_data` (baby/variant/custom name), random yaw and
+   `finalizeSpawn`, then move the entity to `facePoint`.
+5. Built-in frames create the correct `ITEM_FRAME`/`GLOW_ITEM_FRAME` entity via
+   the entity type factory, set the vanilla `Fixed` flag through the normal NBT
+   load path, place the frame 1/32 block outside the surface and set the
+   orientation-aware bounding box. This bypasses `survives()` because the real
+   support block is air and prevents the periodic support check from dropping
+   the frame.
+6. After success the caller consumes one item with `ItemStack.consume(1,
+   player)`; creative players are unaffected. Handlers must add their entity
+   themselves and must not consume the stack.
+
+Modded entity items register a handler in common/server initialisation:
+
+```java
+StructureEntityPlacement.register(MyItems.SEAT, context -> {
+    SeatEntity seat = new SeatEntity(context.level());
+    seat.moveTo(context.spawnPoint().x, context.spawnPoint().y, context.spawnPoint().z);
+    context.level().addFreshEntity(seat);
+    return StructureEntityPlacementHandler.Result.placed(seat);
+});
+```
+
+The handler context exposes `player()`, `level()`, `stack()`, `hit()`,
+`surface()`, `hand()`, `hitPoint()`, `spawnPoint()`, `face()` and
+`spawnBlockPos()`. Paintings are intentionally left to vanilla for now:
+`Painting.create` chooses a variant by scanning real wall blocks and has no
+structure-aware equivalent.
+
+The existing `PLACE` payload ordinal is unchanged; the server chooses block vs.
+entity from the current authoritative stack. No coordinates are sent, so a
+modified client cannot choose the entity position.
+
+
 
 `crythst:structure_action` is a C2S `CustomPacketPayload` with one byte:
 
 - `0` = `MINE`
-- `1` = `PLACE`
+- `1` = `PLACE` (block item, spawn egg, item frame or registered entity item)
 - `2` = `SHOVEL_WATER`
 - `3` = `PICK`
 - `4` = `PICK_WITH_DATA`
@@ -494,8 +578,21 @@ so vanilla reach attributes and modifiers still apply.
 10. **Placement is main-hand only.** `StructurePlacementMixin` consumes the
     main-hand `MultiPlayerGameMode.useItemOn` call before client prediction and
     sends only the `PLACE` payload. Off-hand placement keeps vanilla behaviour
-    and therefore does not edit a structure. Only block items are handled.
-11. **The outline pose is exact, but it is still a selection overlay.** The
+    and therefore does not edit a structure. Block items, spawn eggs, item/glow
+    frames and registered entity items are handled; other items keep vanilla
+    real-block behaviour.
+11. **Placed entities are not attached to moving structures.** Spawn eggs and
+    item frames are spawned stably at the surface, but carry/passenger motion
+    and structure-local anchoring are out of scope. Item frames use the vanilla
+    `Fixed` flag because the structure voxel is air in the real level; if the
+    structure moves or disappears, the frame stays where it was placed. A future
+    attachment layer can use `StructureAttachment`/the riding manager.
+12. **Paintings are not structure-aware.** `Painting.create` searches real wall
+    blocks for a fitting variant. Item frame and glow frame are supported; a
+    painting falls back to vanilla behaviour. Custom entity items need a
+    registered `StructureEntityPlacementHandler`; handlers must not trust client
+    coordinates and must not consume the held stack themselves.
+13. **The outline pose is exact, but it is still a selection overlay.** The
     block-local `VoxelShape` is transformed by the structure pose and
     `blockScale`, so arbitrary rotations and scales are not converted to an
     enclosing AABB. The line style, colour and screen-space width are vanilla.
@@ -537,6 +634,12 @@ so vanilla reach attributes and modifiers still apply.
 - `StructurePlacementVanillaRulesTest` calls the real
   `StairBlock`/`SlabBlock`/`RotatedPillarBlock#getStateForPlacement` hooks with
   the synthetic click and asserts stairs facing/half, slab type and log axis.
+- `StructureEntityPlacementMathTest` covers the six-face surface point and
+  outward normal, rotated/scaled structures, spawn points staying outside the
+  clicked voxel, the item-frame facing/offset/bounding box and the shared
+  client/server item-handling decision (including a registered custom item).
+- `StructureFeedbackTest` locks in the sound-only placement contract and the
+  vanilla destroy-block break effect.
 - `StructureSelectionMathTest` verifies voxel selection and local face
   resolution for positive, negative and rotated poses.
 - `RestoredStructureVolumeEditTest` verifies that a restored volume supports

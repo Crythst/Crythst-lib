@@ -4,6 +4,7 @@ import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureAction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureActionPayload;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureItemUse;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.client.player.ClientPreAttackCallback;
@@ -12,7 +13,6 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.material.FluidState;
@@ -131,6 +131,11 @@ public final class ClientStructureInteraction {
      * server-authoritative and always resolves the main-hand stack. Other
      * hands keep vanilla behaviour.</p>
      *
+     * <p>Block items, spawn eggs, item frames and items with a registered
+     * {@link io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler}
+     * are consumed. The server re-raycasts and recomputes the surface point;
+     * no client position is sent. Unsupported items keep vanilla behaviour.</p>
+     *
      * @return whether the click was consumed as a structure placement
      */
     public static boolean requestStructurePlacement(LocalPlayer player, InteractionHand hand,
@@ -140,7 +145,7 @@ public final class ClientStructureInteraction {
                 || !(hitResult instanceof StructureBlockHitResult)
                 || player.isSpectator()
                 || !CrythstFabric.config().structureBlockInteractionEnabled
-                || !(player.getMainHandItem().getItem() instanceof BlockItem)
+                || !StructureItemUse.shouldHandleStructureUse(player.getMainHandItem())
                 || !player.level().getWorldBorder().isWithinBounds(hitResult.getBlockPos())
                 || !ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
             return false;

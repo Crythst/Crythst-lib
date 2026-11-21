@@ -433,7 +433,8 @@ PhysicsStructure structure = physics.createStructure(
 | `io.mikaple.crythst.integration.minecraft.player` | 玩家 OBB 碰撞与重力姿态 | `PlayerObbCollision`, `PlayerObb` |
 | `io.mikaple.crythst.integration.minecraft.entity` | 实体碰撞与结构搭乘 | `EntityStructureCollision`, `EntityStructureRidingManager` |
 | `io.mikaple.crythst.integration.minecraft.selection` | 结构选择、射线与命中结果 | `StructureSelection`, `StructureRaycaster`, `StructureBlockHitResult` |
-| `io.mikaple.crythst.integration.minecraft.interaction` | 结构方块交互/反作用力/拾取 | `StructureInteraction`, `StructureActionPayload`, `StructureFeedback` |
+| `io.mikaple.crythst.integration.minecraft.interaction` | 结构方块交互/反作用力/拾取 | `StructureInteraction`, `StructureActionPayload`, `StructureFeedback`, `StructureItemUse` |
+| `io.mikaple.crythst.integration.minecraft.entity.placement` | 结构表面实体放置（刷怪蛋/展示框/模组实体物品） | `StructureEntityPlacement`, `StructureEntityPlacementHandler`, `StructureEntityPlacementMath` |
 | `io.mikaple.crythst.integration.minecraft.buoyancy` | 流体浮力 | `BuoyancyManager`, `BuoyancyMath` |
 | `io.mikaple.crythst.integration.minecraft.storage` | 结构/方块实体持久化 | `StructurePersistence`, `StructureSavedData` |
 | `io.mikaple.crythst.integration.portal` | 传送门与传送变换 | `PortalManager`, `PortalTeleporter` |
