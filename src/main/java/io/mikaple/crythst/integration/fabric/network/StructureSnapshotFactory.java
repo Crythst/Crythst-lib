@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.fabric.network;
 
 import io.mikaple.crythst.integration.minecraft.BlockVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
+import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSyncLimits;
 import io.mikaple.crythst.network.structure.StructureTooLargeException;
@@ -43,9 +44,6 @@ public final class StructureSnapshotFactory {
         final int[] cells = new int[(int) volumeCells];
         final List<Integer> palette = new ArrayList<>();
         final Map<Integer, Integer> paletteIndex = new HashMap<>();
-        final BlockVoxelVolume blockVolume = volume instanceof BlockVoxelVolume candidate ? candidate : null;
-        final boolean hasSideTableStates = volume instanceof MutableVoxelVolume
-                && StructureBlockStates.size(structure) > 0;
         final int fallbackStateId = Block.getId(Blocks.STONE.defaultBlockState());
 
         final int sizeX = bounds.sizeX();
@@ -57,11 +55,12 @@ public final class StructureSnapshotFactory {
                     if (!volume.isSolid(x, y, z)) {
                         continue;
                     }
-                    final BlockState state = blockVolume != null
-                            ? blockVolume.blockState(x, y, z)
-                            : hasSideTableStates
-                                    ? StructureBlockStates.get(structure, x, y, z)
-                                    : null;
+                    BlockState state = volume instanceof StatefulVoxelVolume stateful
+                            ? stateful.blockState(x, y, z)
+                            : null;
+                    if (state == null || state.isAir()) {
+                        state = StructureBlockStates.get(structure, x, y, z);
+                    }
                     final int stateId = state == null || state.isAir()
                             ? fallbackStateId
                             : Block.getId(state);

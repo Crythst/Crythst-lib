@@ -4,6 +4,7 @@ import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.minecraft.BlockVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
@@ -257,9 +258,6 @@ public final class StructureBlockSnapshots {
         final BlockState[] blocks = new BlockState[(int) cells];
         Arrays.fill(blocks, AIR);
 
-        final boolean isBlockVolume = volume instanceof BlockVoxelVolume;
-        final boolean isMutable = volume instanceof MutableVoxelVolume;
-        final boolean hasSideTableStates = isMutable && StructureBlockStates.size(structure) > 0;
         int nonAir = 0;
 
         for (int y = bounds.minY(); y < bounds.maxY(); y++) {
@@ -269,10 +267,12 @@ public final class StructureBlockSnapshots {
                         continue;
                     }
 
-                    BlockState state = null;
-                    if (isBlockVolume) {
-                        state = ((BlockVoxelVolume) volume).blockState(x, y, z);
-                    } else if (hasSideTableStates) {
+                    BlockState state = volume instanceof StatefulVoxelVolume stateful
+                            ? stateful.blockState(x, y, z)
+                            : null;
+                    if (state == null || state.isAir()) {
+                        // Mutable/restored/custom volumes keep authored states in
+                        // the side table; consult it for every volume type.
                         state = StructureBlockStates.get(structure, x, y, z);
                     }
                     if (state == null || state.isAir()) {
