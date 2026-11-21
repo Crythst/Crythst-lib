@@ -104,19 +104,27 @@ No lambda is allocated per batch per frame.
 For a section, the PoseStack is:
 
 ```text
-T(position + R * (sectionOriginVoxel * blockScale - COM) - camera)
+T(position + R * (sectionOriginVoxel * blockScale) - camera)
 * R
 * S(blockScale)
 ```
 
 and the cached vertices are `(blockVoxel - sectionOriginVoxel) + quadLocal`,
-i.e. within roughly `[0,16]`. This is exactly the transform the old per-block
-path applied (`T(worldBlock - camera) * R * S`), but it is evaluated once per
-section instead of once per block. Because only the camera-relative section
-origin goes through `float`, precision stays good far from the world origin.
-The same `centerOfMassOffset` and `blockScale` are used by the collider and
-debug OBB, so the rendered blocks, collider and OBB stay aligned, including for
-rotated structures.
+i.e. within roughly `[0,16]`. This is the same world-space point the collision
+shape produces. `position` is the structure pose (body pose minus `R*COM`), so
+no centre-of-mass term belongs in the local coordinates. Mixing the structure
+pose with COM-subtracted local coordinates shifts rendering by `-R*COM`
+relative to collision. The old per-block path effectively used
+`T(worldBlock - camera) * R * S` per block; this renderer evaluates the same
+convention once per section. Because only the camera-relative section origin
+goes through `float`, precision stays good far from the world origin. The
+`blockScale` matches the collider and debug OBB, so rendered blocks, collision
+and bounds stay aligned, including for rotated structures.
+
+`/crythst align` prints this relationship for the active structures: body pose,
+structure pose, COM, `R*COM`, and a sample voxel centre transformed by both the
+collision convention and the render convention. `conventionErr` and `offset`
+should both be zero.
 
 ### Special block renderers
 
@@ -175,7 +183,7 @@ baked quad, so no faces are dropped and no black/default quads are introduced.
 | --- | --- |
 | New snapshot object every few server ticks | Per-section content comparison; only changed sections are invalidated. An unchanged snapshot object does not rebuild anything. |
 | Block edited in a structure | The changed section(s) fail the content compare and are rebuilt on the next build budget slot. |
-| Block scale or centre-of-mass offset changed | The whole body cache is recreated (section origins depend on both). |
+| Block scale changed | The whole body cache is recreated. Centre-of-mass changes only move the per-frame structure pose; section geometry is unshifted and does not need a rebuild. |
 | Snapshot bounds changed | The whole body cache is recreated. |
 | Client resource reload (textures/models) | Reload listener clears all body meshes first, then the palette; a palette generation counter also forces a clear if a body is touched before the listener runs. |
 | Level/dimension change | All body caches are cleared when the dimension key changes. |
