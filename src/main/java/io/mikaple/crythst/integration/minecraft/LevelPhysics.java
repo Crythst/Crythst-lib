@@ -187,7 +187,7 @@ public final class LevelPhysics implements AutoCloseable {
      * Re-copies a structure's blocks after a volume change and then repairs its
      * topology.
      *
-     * <p>Blocks that no longer form one six-connected component become
+     * <p>Blocks that no longer form one 26-connected component become
      * independent bodies, and a body whose remaining mass is zero is removed.
      * The caller must not keep using {@code structure} after this call: it is
      * returned unchanged only when no split was needed.</p>
