@@ -1,5 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.interaction.client;
 
+import io.mikaple.crythst.client.network.ClientStructureCache;
+import io.mikaple.crythst.client.network.ClientStructureSnapshot;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.math.Transform3d;
@@ -30,7 +32,7 @@ public final class ClientStructureRay {
      * @param structure structure that was hit
      * @param distance  world-space distance from the eye to the hit
      */
-    public record Hit(PhysicsStructure structure, double distance) {
+    public record Hit(long bodyId, double distance) {
     }
 
     /**
@@ -50,7 +52,7 @@ public final class ClientStructureRay {
 
         final double alpha = Minecraft.getInstance().getDeltaTracker()
                 .getGameTimeDeltaPartialTick(false);
-        PhysicsStructure bestStructure = null;
+        long bestBodyId = -1L;
         double bestDistance = reach;
         for (PhysicsStructure structure : ClientPhysicsView.structures()) {
             if (structure.closed()) {
@@ -60,10 +62,63 @@ public final class ClientStructureRay {
             final double distance = raycast(state, origin, direction, bestDistance);
             if (distance >= 0.0 && distance < bestDistance) {
                 bestDistance = distance;
-                bestStructure = structure;
+                bestBodyId = state.bodyId();
             }
         }
-        return bestStructure == null ? null : new Hit(bestStructure, bestDistance);
+        if (bestBodyId < 0L) {
+            // Multiplayer: the integrated server is absent, so use the synced
+            // block-state snapshots instead of ClientPhysicsView.
+            for (ClientStructureSnapshot snapshot : ClientStructureCache.snapshots()) {
+                final double distance = raycast(snapshot, origin, direction, bestDistance);
+                if (distance >= 0.0 && distance < bestDistance) {
+                    bestDistance = distance;
+                    bestBodyId = snapshot.bodyId();
+                }
+            }
+        }
+        return bestBodyId < 0L ? null : new Hit(bestBodyId, bestDistance);
+    }
+
+    /**
+     * Raycast a synchronized structure in structure-local voxel space. The
+     * snapshot has block cells rather than merged collider boxes, so the cells
+     * are tested directly (bounded by the volume size).
+     */
+    private static double raycast(ClientStructureSnapshot snapshot, Vector3d origin,
+                                  Vector3d direction, double maxDistance) {
+        final Transform3d pose = snapshot.pose();
+        final double scale = snapshot.blockScale();
+        final Vector3d localOrigin = pose.inverseTransformPoint(origin);
+        final Vector3d localDirection = pose.inverseTransformDirection(direction);
+        final var bounds = snapshot.bounds();
+        final long cells = bounds.volume();
+        if (cells <= 0L || cells > 262_144L) {
+            return -1.0;
+        }
+
+        double best = maxDistance;
+        boolean hit = false;
+        // Iterate all solid cells; synchronized structures are bounded and the
+        // camera reach is short, so this is cheaper than building a collider on
+        // the client thread.
+        for (int y = bounds.minY(); y < bounds.maxY(); y++) {
+            for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
+                for (int x = bounds.minX(); x < bounds.maxX(); x++) {
+                    if (!snapshot.isSolid(x, y, z)) {
+                        continue;
+                    }
+                    final double distance = rayBox(localOrigin, localDirection,
+                            x * scale, y * scale, z * scale,
+                            (x + 1) * scale, (y + 1) * scale, (z + 1) * scale,
+                            best);
+                    if (distance >= 0.0 && distance < best) {
+                        best = distance;
+                        hit = true;
+                    }
+                }
+            }
+        }
+        return hit ? best : -1.0;
     }
 
     /**
