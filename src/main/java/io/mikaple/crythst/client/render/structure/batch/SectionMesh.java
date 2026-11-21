@@ -12,6 +12,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Matrix3f;
 import org.joml.Matrix4f;
@@ -247,9 +248,16 @@ final class SectionMesh {
     }
 
     /**
-     * Removes a quad whose face is fully covered by the adjacent structure cell.
-     * Vanilla's {@code Block.shouldRenderFace} handles slabs, glass and modded
-     * shape occlusion; only cells inside this body are considered.
+     * Removes a quad whose outward face is fully covered by the adjacent
+     * structure cell.
+     *
+     * <p>The stored face is the quad's own outward facing (never the direction
+     * bucket it came from), and {@code -1} means the model declared the quad
+     * unculled. {@link Block#shouldRenderFace} is used exactly like vanilla's
+     * chunk mesher: it compares the two states' face occlusion shapes, so a
+     * partial neighbour (slab, stair, fence, glass) only hides a face when it
+     * actually covers it. Only cells inside this body are considered; outside
+     * the snapshot reads as air and never culls.</p>
      */
     static boolean isCulled(StructureVoxelView view, BlockState state,
                             BlockGeometry.Quads quads, int quad,
@@ -266,7 +274,13 @@ final class SectionMesh {
                 worldX + direction.getStepX(),
                 worldY + direction.getStepY(),
                 worldZ + direction.getStepZ());
-        return VoxelLighting.hidesFace(state, neighbour, direction);
+        if (neighbour == null || neighbour.isAir()) {
+            return false;
+        }
+        // Vanilla's exact rule: compare this state's outward face occlusion
+        // shape with the neighbour's opposite face occlusion shape. This is
+        // what makes slabs, stairs, fences and glass partial occlusion work.
+        return !Block.shouldRenderFace(state, neighbour, direction);
     }
 
     BlockGeometry.Layer layer() {

@@ -68,7 +68,9 @@ final class BlockGeometry {
      *   <li>{@code colors}: 1 ARGB value, shared by the four vertices</li>
      *   <li>{@code lightEmission}: 1 value in {@code [0,15]}</li>
      *   <li>{@code faces}: 1 {@code Direction} ordinal, or {@code -1} when the
-     *       quad has no cull direction (cross/flat model)</li>
+     *       quad has no neighbour cull direction (vanilla's unculled
+     *       {@code getQuads(null)} bucket, cross/flat models, or a diagonal
+     *       quad whose facing cannot be reduced to one cardinal axis)</li>
      * </ul>
      */
     static final class Quads {

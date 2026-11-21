@@ -71,7 +71,11 @@ own `register()` does not re-enable it.
    `BakedQuad`s into three layer arrays. The arrays contain block-local
    positions in `[0,1]`, atlas UVs from `UVPair.unpackU/unpackV`, normals from
    `BakedQuad.direction()` (with a winding fallback for null directions), tint
-   colour and light emission. Nothing is resolved per block per frame.
+   colour and light emission. A quad's stored cull face is its own facing, but
+   only when the model returned it from a direction bucket: vanilla's
+   `getQuads(null)` bucket is uncullable (inset slab/stair faces stay visible).
+   Duplicate quads returned by several buckets are collapsed by exact
+   geometry/material signature. Nothing is resolved per block per frame.
 2. **Body/sections** (`StructureBatchCache`): one `Body` per physics body id,
    split into 16×16×16 sections aligned to the snapshot minimum. Each section
    owns a clipped `BlockState[]` (only the part of the cube that intersects the
@@ -153,14 +157,26 @@ distance, frustum and occlusion plus the number of enclosed blocks skipped.
 
 Structures are meshed like small voxel chunks, not like independent blocks:
 
-* **Face culling.** While building a section, every quad with a cull direction
-  tests the adjacent voxel in the same body (`Block.shouldRenderFace`). The
-  lookup crosses section borders, so a wall spanning two sections loses the
-  hidden seam faces. Cells outside the snapshot are air, so the outer shell is
-  never culled. `Block.shouldRenderFace` handles full cubes, slabs, glass and
-  modded shape occlusion instead of only checking `isSolid()`. A whole block
-  whose six neighbours are full cubes is skipped before any of its quads are
-  considered (see section culling above).
+* **Face culling.** While building a section, a quad is neighbour-culled only
+  when the model returned it from a direction bucket
+  (`BlockStateModelPart.getQuads(direction)`), i.e. the model declared a
+  `cullface`. The quad's own facing (`BakedQuad.direction()`, or a cardinal
+  direction derived from the winding when a custom part leaves it null) selects
+  the adjacent voxel to test; the bucket itself is never used as the cull
+  direction. Quads from `getQuads(null)` are vanilla's unculled bucket and are
+  always emitted: this is what keeps the inset top face of a slab/stair, the
+  inner faces of stairs and the sides of fence posts visible when the adjacent
+  cell is a full cube. Quads without a derivable cardinal facing (cross/plant
+  models) store `-1` and are never neighbour-culled. The lookup crosses section
+  borders, so a wall spanning two sections loses the hidden seam faces. Cells
+  outside the snapshot are air, so the outer shell is never culled.
+  `Block.shouldRenderFace` uses the neighbours' occlusion shapes, so slabs,
+  stairs, fences, glass and modded shape occlusion are handled exactly like
+  vanilla instead of only testing `isSolid()`. The same quad can be returned by
+  multiple buckets; the palette keeps one copy, chosen at bake time. A whole
+  full-cube block (`isSolidRender()`) whose six neighbours are also full cubes
+  is skipped before any of its quads are considered (see section culling above);
+  partial blocks are never skipped this way.
 * **Vertex AO.** For full-cube states (`isSolidRender()`), each quad vertex asks
   the occupancy mask about the two edge neighbours and the diagonal corner
   around the adjacent air cell. The classic rule gives AO levels 0–3; the
