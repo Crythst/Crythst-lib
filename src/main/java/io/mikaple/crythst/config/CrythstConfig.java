@@ -71,6 +71,15 @@ public final class CrythstConfig {
     public double shovelWaterReaction = 1.0;
 
     /**
+     * When {@code true}, block break/use/placement on a structure can be routed
+     * through the auxiliary void level using vanilla
+     * {@code ServerPlayerGameMode} semantics. The existing custom interaction
+     * path remains the fallback until this flag is enabled. See
+     * {@code StructureOperationRedirector}.
+     */
+    public boolean useVoidLevelOperations = false;
+
+    /**
      * Whether each physics world creates a real void {@code ServerLevel} for
      * ticking the block logic of its structures.
      */

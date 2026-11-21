@@ -4,6 +4,7 @@ import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.Aabb;
 import net.minecraft.world.entity.Display;
+import net.minecraft.world.entity.decoration.HangingEntity;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.entity.player.Player;
@@ -130,7 +131,8 @@ public final class EntityStructureCollision {
     public static boolean eligible(Entity entity) {
         if (entity == null || entity.isRemoved() || !entity.isAlive()
                 || entity.isSpectator() || entity.isPassenger() || entity.noPhysics
-                || entity instanceof Display || entity instanceof EnderDragonPart) {
+                || entity instanceof Display || entity instanceof HangingEntity
+                || entity instanceof EnderDragonPart) {
             return false;
         }
         if (!StructureCollisionSettings.allows(entity)) {

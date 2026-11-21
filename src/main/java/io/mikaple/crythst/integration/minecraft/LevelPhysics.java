@@ -7,6 +7,7 @@ import io.mikaple.crythst.api.event.PhysicsTickEvent;
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
 import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
 import io.mikaple.crythst.config.CrythstConfig;
+import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -23,7 +24,10 @@ import net.minecraft.world.TickRateManager;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 /**
  * A physics world attached to one Minecraft dimension.
@@ -48,7 +52,19 @@ public final class LevelPhysics implements AutoCloseable {
      */
     private EmptyPhysicsLevel subLevel;
     private boolean subLevelCreationFailed;
-    private boolean subLevelTickFailureLogged;
+    private EmptyPhysicsLevel.TickResult lastVoidTick = EmptyPhysicsLevel.TickResult.EMPTY;
+
+    /**
+     * Last auxiliary-entity projection pass. Entities spawned by dispensers and
+     * other block logic in the void level are moved to this level after each
+     * sub-level tick.
+     */
+    private StructureEntityProjection.Batch lastEntityProjection =
+            StructureEntityProjection.Batch.EMPTY;
+    private long projectedEntityCount;
+    /** Failed projections are retried after a short cooldown, not every tick. */
+    private final Map<UUID, Long> entityProjectionRetryAfter = new HashMap<>();
+    private boolean entityProjectionFailureLogged;
 
     private volatile List<PhysicsStructure> renderStructures = List.of();
     private volatile io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot renderDebugSnapshot;
@@ -158,6 +174,9 @@ public final class LevelPhysics implements AutoCloseable {
     public void removeStructure(PhysicsStructure structure) {
         structure.invalidateBlockEntityActors();
         structureActors.forget(structure);
+        // Flush entities that the region spawned before its blocks and pose
+        // disappear.
+        projectSubLevelEntities();
         // The void region is keyed by the body id, so remove it before the
         // physics body is closed.
         if (subLevel != null) {
@@ -200,10 +219,21 @@ public final class LevelPhysics implements AutoCloseable {
         if (closed) {
             return structure.closed() ? List.of() : List.of(structure);
         }
+        // Project before replacing the region: the old region/chunks and the
+        // current structure pose are still valid.
+        projectSubLevelEntities();
         if (subLevel != null) {
+            // Replacing the region destroys its block entities. Preserve their
+            // live NBT so a door/button state change does not empty a chest or
+            // reset a furnace in the same structure.
+            final Map<net.minecraft.core.BlockPos, net.minecraft.nbt.CompoundTag> preserved =
+                    subLevel.captureBlockEntities(structure);
             try {
                 subLevel.removeStructure(structure);
                 subLevel.addStructure(structure, volume);
+                if (!preserved.isEmpty()) {
+                    subLevel.applyBlockEntities(structure, preserved);
+                }
                 refreshStructureActors(structure);
             } catch (Throwable t) {
                 Crythst.LOGGER.warn("Could not refresh structure body #{} in the auxiliary void level",
@@ -264,6 +294,94 @@ public final class LevelPhysics implements AutoCloseable {
     }
 
     /**
+     * Reads the live auxiliary block for a structure voxel without loading a
+     * chunk. Returns {@code null} when the auxiliary level is disabled, the
+     * structure has no copied region, or the chunk is currently unloaded.
+     */
+    public EmptyPhysicsLevel.@org.jetbrains.annotations.Nullable LiveBlock liveBlock(
+            PhysicsStructure structure, int x, int y, int z) {
+        return subLevel == null ? null : subLevel.liveBlock(structure, x, y, z);
+    }
+
+    /**
+     * The auxiliary void level, or {@code null} when it is disabled or failed
+     * to start.
+     *
+     * <p>Read-only access for views and diagnostics. Callers must use
+     * structure-local coordinates and the per-structure
+     * {@link EmptyPhysicsLevel#regionView(PhysicsStructure)} mapping; the
+     * auxiliary coordinates are an implementation detail.</p>
+     */
+    public @org.jetbrains.annotations.Nullable EmptyPhysicsLevel auxiliaryLevel() {
+        return subLevel;
+    }
+
+    /**
+     * Starts projecting the auxiliary level's interaction sounds/particles to
+     * the host world. See {@link EmptyPhysicsLevel#beginAudioProjection}.
+     */
+    public boolean beginAuxiliaryAudioProjection(PhysicsStructure structure) {
+        return subLevel != null && subLevel.beginAudioProjection(structure);
+    }
+
+    /** Ends the projection started by {@link #beginAuxiliaryAudioProjection}. */
+    public void endAuxiliaryAudioProjection() {
+        if (subLevel != null) {
+            subLevel.endAudioProjection();
+        }
+    }
+
+    /**
+     * Mirrors auxiliary block-state changes (button press, door open, ...) back
+     * to the structure volume/side table. Non-loading and cheap when nothing
+     * changed.
+     */
+    public void flushAuxiliaryBlockStates() {
+        if (subLevel != null) {
+            applyAuxiliaryEdits(subLevel.flushBlockStateChanges());
+            // A use/break can spawn drops, XP orbs or TNT in the void.
+            projectSubLevelEntities();
+        }
+    }
+
+    /**
+     * Rebuilds colliders after vanilla block logic changed a structure volume.
+     * Runs once per changed structure per tick, not once per block.
+     *
+     * <p>Edits originate in the auxiliary copy, so the copy is already correct;
+     * re-indexing in place is enough and deliberately avoids re-copying the
+     * whole region (which would allocate a new region base on every piston or
+     * door tick). Volume-bound changes made by the placement/expansion path
+     * still use {@link #refreshStructure(PhysicsStructure, VoxelVolume)}.</p>
+     */
+    private void applyAuxiliaryEdits(List<PhysicsStructure> changed) {
+        if (changed == null || changed.isEmpty()) {
+            return;
+        }
+        for (PhysicsStructure structure : List.copyOf(changed)) {
+            if (structure.closed() || !structures.contains(structure)) {
+                continue;
+            }
+            try {
+                final VoxelVolume volume = structure.volume();
+                if (StructureSplitter.isMassless(volume)) {
+                    StructureSplitter.removeIfMassless(this, structure, volume);
+                    continue;
+                }
+                structure.reindex(volume);
+                refreshStructureActors(structure);
+                // Reconnect/split editing must still run; this may close the
+                // original and create new bodies, each with its own region.
+                StructureSplitter.splitIfNeeded(this, structure, volume);
+            } catch (Throwable t) {
+                if (subLevel != null) {
+                    subLevel.reportTickFailure("block edit reindex", t);
+                }
+            }
+        }
+    }
+
+    /**
      * Ticks block logic once per call. Empty chunks and inactive structures are
      * never touched.
      */
@@ -272,14 +390,81 @@ public final class LevelPhysics implements AutoCloseable {
             return;
         }
         try {
-            subLevel.tick(config.subLevelRandomTickSpeed);
+            final EmptyPhysicsLevel.TickResult result =
+                    subLevel.tick(config.subLevelRandomTickSpeed);
+            lastVoidTick = result;
+            applyAuxiliaryEdits(result.changedStructures());
         } catch (Throwable t) {
-            if (!subLevelTickFailureLogged) {
-                subLevelTickFailureLogged = true;
-                Crythst.LOGGER.warn("Error ticking the auxiliary void level for {}; "
-                        + "block logic may be incomplete", level.dimension().identifier(), t);
+            subLevel.reportTickFailure("tick", t);
+        }
+    }
+
+    /**
+     * Projects entities that vanilla block logic spawned in the auxiliary void
+     * level into this host level.
+     *
+     * <p>Runs after the auxiliary level has ticked block entities (dispensers,
+     * droppers, TNT ignition, ...). The region/chunk list of the auxiliary
+     * level is the scan boundary, so this never loads a chunk. Failed
+     * projections stay in the void level and are retried after a short
+     * cooldown; they are also dropped when their structure region is removed.</p>
+     */
+    /**
+     * Immediately projects entities sitting in active auxiliary regions. Used
+     * by the void-operation redirector after vanilla break/use drops or spawns
+     * an entity outside the normal tick boundary.
+     */
+    public void projectAuxiliaryEntities() {
+        projectSubLevelEntities();
+    }
+
+    private void projectSubLevelEntities() {
+        if (subLevel == null || closed) {
+            return;
+        }
+        final Map<Long, PhysicsStructure> byId = new HashMap<>();
+        for (PhysicsStructure structure : structures) {
+            if (!structure.closed()) {
+                byId.put(structure.body().id(), structure);
             }
         }
+        if (byId.isEmpty()) {
+            lastEntityProjection = StructureEntityProjection.Batch.EMPTY;
+            return;
+        }
+
+        final long now = level.getGameTime();
+        final StructureEntityProjection.Batch[] batch = {StructureEntityProjection.Batch.EMPTY};
+        subLevel.collectRegionEntities((region, entity) -> {
+            final PhysicsStructure structure = byId.get(region.structureId());
+            if (structure == null || structure.closed()) {
+                return;
+            }
+            final UUID uuid = entity.getUUID();
+            final Long retryAfter = entityProjectionRetryAfter.get(uuid);
+            if (retryAfter != null && retryAfter > now) {
+                return;
+            }
+            final StructureEntityProjection.RegionAnchor anchor =
+                    new StructureEntityProjection.RegionAnchor(
+                            region.localOriginX(), region.localOriginY(), region.localOriginZ());
+            final StructureEntityProjection.Result result =
+                    StructureEntityProjection.project(level, structure, anchor, entity);
+            batch[0] = batch[0].plus(result);
+            if (result == StructureEntityProjection.Result.FAILED) {
+                entityProjectionRetryAfter.put(uuid, now + 20L);
+                if (!entityProjectionFailureLogged) {
+                    entityProjectionFailureLogged = true;
+                    Crythst.LOGGER.warn("Could not project entity {} from the auxiliary void level "
+                                    + "for {}; it stays in the void region and will be retried",
+                            entity.getType(), level.dimension().identifier());
+                }
+            } else {
+                entityProjectionRetryAfter.remove(uuid);
+            }
+        });
+        lastEntityProjection = batch[0];
+        projectedEntityCount += batch[0].projected();
     }
 
     public void tick() {
@@ -338,6 +523,10 @@ public final class LevelPhysics implements AutoCloseable {
             // Block logic advances with the simulated world. Ticking here means
             // one random-tick pass per server tick, not one per Bullet sub-step.
             tickSubLevel();
+            // Dispensers/droppers spawn item, TNT and projectile entities inside
+            // the auxiliary level. Move them into this host level immediately
+            // after the block pass so they are visible and interactable.
+            projectSubLevelEntities();
         }
         timing.record(wallDelta, simulationDelta, steps, world.interpolationAlpha(),
                 maxPoseDelta, maxPoseAngle, config.serverTickTiming, frozen);
@@ -420,6 +609,9 @@ public final class LevelPhysics implements AutoCloseable {
      * test commands; gameplay mods should remove their own bodies individually.
      */
     public void clearAllBodies() {
+        // Move any entities the regions spawned into this level before the
+        // auxiliary regions disappear.
+        projectSubLevelEntities();
         // Clear the auxiliary regions exactly once, before their structures
         // (and therefore their body ids) are closed.
         clearSubLevel();
@@ -510,6 +702,62 @@ public final class LevelPhysics implements AutoCloseable {
      */
     public int subLevelRegionCount() {
         return subLevel == null ? 0 : subLevel.regionCount();
+    }
+
+    /**
+     * Entities spawned by block logic in the auxiliary level during the most
+     * recent projection pass, plus skip/failure counts.
+     */
+    public StructureEntityProjection.Batch lastEntityProjection() {
+        return lastEntityProjection;
+    }
+
+    /**
+     * Total entities projected from the auxiliary level into this host level
+     * since this physics world was created.
+     */
+    public long projectedEntityCount() {
+        return projectedEntityCount;
+    }
+
+    /**
+     * Entities currently waiting in auxiliary structure regions. This should
+     * normally be zero; a non-zero value means a projection is failing or a
+     * block-attached/plot-only entity was deliberately left behind.
+     */
+    public int subLevelEntityCount() {
+        return subLevel == null ? 0 : subLevel.regionEntityCount();
+    }
+
+    /** One-line projection diagnostic for commands and logs. */
+    public String entityProjectionStatus() {
+        return lastEntityProjection.summary()
+                + " totalProjected=" + projectedEntityCount
+                + " pendingInVoid=" + subLevelEntityCount();
+    }
+
+    /**
+     * Result of the most recent auxiliary block-logic tick: scheduled block and
+     * fluid ticks, block events, random ticks and mirrored edits.
+     */
+    public EmptyPhysicsLevel.TickResult lastVoidTick() {
+        return lastVoidTick;
+    }
+
+    /** One-line world-logic diagnostic for commands and logs. */
+    public String voidTickStatus() {
+        if (subLevel == null) {
+            return "voidLevel=disabled";
+        }
+        return "blockTicks=" + subLevel.totalBlockTicks()
+                + " fluidTicks=" + subLevel.totalFluidTicks()
+                + " blockEvents=" + subLevel.totalBlockEvents()
+                + " randomTicks=" + subLevel.totalRandomTicks()
+                + " mirroredBlocks=" + subLevel.totalMirroredBlocks()
+                + " skippedBlocks=" + subLevel.totalSkippedBlocks()
+                + " neighbors=" + subLevel.totalNeighborUpdates()
+                + " droppedWork=" + subLevel.totalDroppedWork()
+                + " last=" + lastVoidTick.summary();
     }
 
     /**
