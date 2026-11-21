@@ -6,6 +6,8 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 public enum StructureAction {
     /** Mine the structure voxel under the crosshair. */
     MINE,
+    /** Place the main-hand block item on the structure face under the crosshair. */
+    PLACE,
     /** Apply shovel recoil when the crosshair is over water. */
     SHOVEL_WATER;
 

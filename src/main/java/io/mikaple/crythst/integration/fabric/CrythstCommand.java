@@ -15,8 +15,10 @@ import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.shape.Shapes;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureDef;
+import io.mikaple.crythst.physics.structure.StructureRenderState;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
+import io.mikaple.crythst.physics.voxel.VoxelBox;
 import io.mikaple.crythst.physics.voxel.VoxelVolumes;
 import io.mikaple.crythst.physics.world.StepStats;
 import net.minecraft.commands.CommandSourceStack;
@@ -44,6 +46,7 @@ public final class CrythstCommand {
                 .then(Commands.literal("resume").executes(context -> setPaused(context, false)))
                 .then(Commands.literal("demo").executes(CrythstCommand::demo))
                 .then(Commands.literal("cube").executes(CrythstCommand::cube))
+                .then(Commands.literal("align").executes(CrythstCommand::align))
                 .then(Commands.literal("unstuck").executes(CrythstCommand::unstuck))
                 .then(Commands.literal("clear").executes(CrythstCommand::clear))
                 .then(Commands.literal("debug").executes(CrythstCommand::toggleDebug))
@@ -159,6 +162,71 @@ public final class CrythstCommand {
         physics.ensureTerrain();
         source.sendSuccess(() -> Component.literal("Crythst spawned block body #" + cube.id()
                 + " at " + format(cube.transform().position())), true);
+        return 1;
+    }
+
+    /**
+     * Prints the body-pose / structure-pose / COM relationship and compares a
+     * sample voxel transformed by the collision convention with the same voxel
+     * transformed by the render convention.
+     */
+    private static int align(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context) {
+        final CommandSourceStack source = context.getSource();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(source.getLevel());
+        if (physics == null) {
+            source.sendSuccess(() -> Component.literal("Crythst: no physics world"), false);
+            return 0;
+        }
+        final var structures = physics.structures();
+        if (structures.isEmpty()) {
+            source.sendSuccess(() -> Component.literal("Crythst align: no structures"), false);
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal(
+                "Crythst align: body = structure + R*COM; collision = body * (voxel - COM); "
+                        + "render = structure * voxel"), false);
+        int shown = 0;
+        for (PhysicsStructure structure : structures) {
+            if (shown++ >= 8) {
+                source.sendSuccess(() -> Component.literal("... align output truncated"), false);
+                break;
+            }
+            final Transform3d body = structure.body().transform();
+            final Transform3d structurePose = structure.pose();
+            final StructureRenderState state = structure.renderState(0.0);
+            final Vector3d com = state.centerOfMassOffset();
+            final double scale = state.blockScale();
+            final Vector3d rotatedCom = new Vector3d(com).rotate(body.rotation());
+            final Vector3d expectedStructurePosition = new Vector3d(body.position()).sub(rotatedCom);
+            final double conventionError = expectedStructurePosition.distance(structurePose.position());
+
+            if (structure.collider().boxes().isEmpty()) {
+                continue;
+            }
+            final VoxelBox box = structure.collider().boxes().get(0);
+            final double voxelX = box.minX() + 0.5;
+            final double voxelY = box.minY() + 0.5;
+            final double voxelZ = box.minZ() + 0.5;
+            final Vector3d voxelMetres = new Vector3d(
+                    voxelX * scale, voxelY * scale, voxelZ * scale);
+            final Vector3d collisionWorld = body.transformPoint(
+                    new Vector3d(voxelMetres).sub(com));
+            final Vector3d renderWorld = structurePose.transformPoint(new Vector3d(voxelMetres));
+            final double offset = collisionWorld.distance(renderWorld);
+
+            final String text = "#" + structure.body().id()
+                    + " bodyPos=" + format(body.position())
+                    + " structurePos=" + format(structurePose.position())
+                    + " com=" + format(com)
+                    + " R*com=" + format(rotatedCom)
+                    + " conventionErr=" + String.format("%.9f", conventionError)
+                    + " sampleVoxelCentre=" + format(voxelMetres)
+                    + " collisionWorld=" + format(collisionWorld)
+                    + " renderWorld=" + format(renderWorld)
+                    + " offset=" + String.format("%.9f", offset);
+            source.sendSuccess(() -> Component.literal(text), false);
+        }
         return 1;
     }
 

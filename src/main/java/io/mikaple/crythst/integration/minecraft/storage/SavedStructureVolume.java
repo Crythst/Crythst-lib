@@ -138,6 +138,8 @@ public final class SavedStructureVolume implements StatefulVoxelVolume {
                         BlockState state = null;
                         if (volume instanceof BlockVoxelVolume blockVolume) {
                             state = blockVolume.blockState(x, y, z);
+                        } else if (volume instanceof StatefulVoxelVolume stateful) {
+                            state = stateful.blockState(x, y, z);
                         } else if (structure != null) {
                             state = StructureBlockStates.get(structure, x, y, z);
                         }

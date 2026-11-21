@@ -28,9 +28,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInteraction.register();}.</p>
  *
  * <p>Mining and placement use Fabric's existing
- * {@link AttackBlockCallback}/{@link UseBlockCallback} hooks. The custom payload
- * is only needed for clicks that vanilla never reports to the server, chiefly
- * left-clicking water with a shovel.</p>
+ * {@link AttackBlockCallback}/{@link UseBlockCallback}/{@link UseItemCallback}
+ * hooks. The custom payload covers clicks that vanilla never reports to the
+ * server: mining a virtual block with air behind it, placing on a virtual-air
+ * target, and shovel-water recoil.</p>
  */
 public final class StructureInteractionEvents {
     private static final AtomicBoolean COMMON_REGISTERED = new AtomicBoolean();
@@ -106,6 +107,9 @@ public final class StructureInteractionEvents {
                 hitResult.getLocation(), serverPlayer)) {
             return InteractionResult.PASS;
         }
+        if (!StructureInteraction.beginPlacement(serverPlayer)) {
+            return InteractionResult.SUCCESS_SERVER;
+        }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
                 serverPlayer, hit, blockItem.getBlock().defaultBlockState());
         if (!result.success()) {
@@ -137,6 +141,9 @@ public final class StructureInteractionEvents {
                 serverPlayer.blockInteractionRange());
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
+        }
+        if (!StructureInteraction.beginPlacement(serverPlayer)) {
+            return InteractionResult.SUCCESS_SERVER;
         }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
                 serverPlayer, hit, blockItem.getBlock().defaultBlockState());

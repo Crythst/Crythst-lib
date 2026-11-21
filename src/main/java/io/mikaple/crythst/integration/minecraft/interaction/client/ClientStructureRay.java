@@ -4,6 +4,7 @@ import io.mikaple.crythst.client.network.ClientStructureCache;
 import io.mikaple.crythst.client.network.ClientStructureSnapshot;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureRayMath;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
@@ -32,7 +33,8 @@ public final class ClientStructureRay {
      * @param structure structure that was hit
      * @param distance  world-space distance from the eye to the hit
      */
-    public record Hit(long bodyId, double distance) {
+    public record Hit(long bodyId, double distance, Transform3d pose,
+                      org.joml.Vector3d point, double blockScale) {
     }
 
     /**
@@ -54,6 +56,9 @@ public final class ClientStructureRay {
                 .getGameTimeDeltaPartialTick(false);
         long bestBodyId = -1L;
         double bestDistance = reach;
+        Transform3d bestPose = null;
+        org.joml.Vector3d bestPoint = null;
+        double bestScale = 1.0;
         for (PhysicsStructure structure : ClientPhysicsView.structures()) {
             if (structure.closed()) {
                 continue;
@@ -63,6 +68,10 @@ public final class ClientStructureRay {
             if (distance >= 0.0 && distance < bestDistance) {
                 bestDistance = distance;
                 bestBodyId = state.bodyId();
+                bestPose = state.pose();
+                bestScale = state.blockScale();
+                bestPoint = new org.joml.Vector3d(origin)
+                        .add(new org.joml.Vector3d(direction).mul(distance));
             }
         }
         if (bestBodyId < 0L) {
@@ -73,10 +82,15 @@ public final class ClientStructureRay {
                 if (distance >= 0.0 && distance < bestDistance) {
                     bestDistance = distance;
                     bestBodyId = snapshot.bodyId();
+                    bestPose = snapshot.pose();
+                    bestScale = snapshot.blockScale();
+                    bestPoint = new org.joml.Vector3d(origin)
+                            .add(new org.joml.Vector3d(direction).mul(distance));
                 }
             }
         }
-        return bestBodyId < 0L ? null : new Hit(bestBodyId, bestDistance);
+        return bestBodyId < 0L ? null : new Hit(bestBodyId, bestDistance,
+                bestPose, bestPoint, bestScale);
     }
 
     /**
@@ -107,7 +121,7 @@ public final class ClientStructureRay {
                     if (!snapshot.isSolid(x, y, z)) {
                         continue;
                     }
-                    final double distance = rayBox(localOrigin, localDirection,
+                    final double distance = StructureRayMath.rayBox(localOrigin, localDirection,
                             x * scale, y * scale, z * scale,
                             (x + 1) * scale, (y + 1) * scale, (z + 1) * scale,
                             best);
@@ -147,7 +161,7 @@ public final class ClientStructureRay {
             final double maxX = (box.minX() + box.sizeX()) * scale - centerOfMass.x;
             final double maxY = (box.minY() + box.sizeY()) * scale - centerOfMass.y;
             final double maxZ = (box.minZ() + box.sizeZ()) * scale - centerOfMass.z;
-            final double distance = rayBox(localOrigin, localDirection,
+            final double distance = StructureRayMath.rayBox(localOrigin, localDirection,
                     minX, minY, minZ, maxX, maxY, maxZ, best);
             if (distance >= 0.0 && distance < best) {
                 best = distance;
@@ -155,76 +169,5 @@ public final class ClientStructureRay {
             }
         }
         return hit ? best : -1.0;
-    }
-
-    /**
-     * Slab test in body-local metres. Distances are preserved because the
-     * transform is rigid and the direction is normalized.
-     */
-    private static double rayBox(Vector3d origin, Vector3d direction,
-                                 double minX, double minY, double minZ,
-                                 double maxX, double maxY, double maxZ,
-                                 double maxDistance) {
-        double tMin = 0.0;
-        double tMax = maxDistance;
-
-        if (Math.abs(direction.x) < EPSILON) {
-            if (origin.x < minX || origin.x > maxX) {
-                return -1.0;
-            }
-        } else {
-            double t1 = (minX - origin.x) / direction.x;
-            double t2 = (maxX - origin.x) / direction.x;
-            if (t1 > t2) {
-                final double swap = t1;
-                t1 = t2;
-                t2 = swap;
-            }
-            tMin = Math.max(tMin, t1);
-            tMax = Math.min(tMax, t2);
-            if (tMin > tMax) {
-                return -1.0;
-            }
-        }
-
-        if (Math.abs(direction.y) < EPSILON) {
-            if (origin.y < minY || origin.y > maxY) {
-                return -1.0;
-            }
-        } else {
-            double t1 = (minY - origin.y) / direction.y;
-            double t2 = (maxY - origin.y) / direction.y;
-            if (t1 > t2) {
-                final double swap = t1;
-                t1 = t2;
-                t2 = swap;
-            }
-            tMin = Math.max(tMin, t1);
-            tMax = Math.min(tMax, t2);
-            if (tMin > tMax) {
-                return -1.0;
-            }
-        }
-
-        if (Math.abs(direction.z) < EPSILON) {
-            if (origin.z < minZ || origin.z > maxZ) {
-                return -1.0;
-            }
-        } else {
-            double t1 = (minZ - origin.z) / direction.z;
-            double t2 = (maxZ - origin.z) / direction.z;
-            if (t1 > t2) {
-                final double swap = t1;
-                t1 = t2;
-                t2 = swap;
-            }
-            tMin = Math.max(tMin, t1);
-            tMax = Math.min(tMax, t2);
-            if (tMin > tMax) {
-                return -1.0;
-            }
-        }
-
-        return tMin;
     }
 }

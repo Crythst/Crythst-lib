@@ -97,6 +97,23 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
         states[index(x, y, z)] = state;
     }
 
+    /**
+     * Full edit used by the interaction layer. The volume is already editable;
+     * this single entry point also keeps mass and material in sync for newly
+     * placed cells.
+     */
+    public void setBlock(int x, int y, int z, boolean value, double blockMass,
+                         PhysicsMaterial material, BlockState state) {
+        if (!bounds.contains(x, y, z)) {
+            throw new IndexOutOfBoundsException("Voxel outside bounds: " + x + "," + y + "," + z);
+        }
+        final int index = index(x, y, z);
+        solid[index] = value;
+        mass[index] = value ? Math.max(blockMass, 1.0e-9) : 0.0;
+        materials[index] = material == null ? PhysicsMaterial.DEFAULT : material;
+        states[index] = state;
+    }
+
     private int index(int x, int y, int z) {
         final int localX = x - bounds.minX();
         final int localY = y - bounds.minY();

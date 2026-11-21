@@ -5,6 +5,9 @@ import io.mikaple.crythst.integration.minecraft.BlockPhysicsMapper;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
+import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.query.BodyFilter;
 import io.mikaple.crythst.physics.query.RayHit;
 import io.mikaple.crythst.physics.query.RayQuery;
@@ -20,6 +23,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
@@ -36,6 +40,8 @@ import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 import java.util.List;
+import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -64,8 +70,55 @@ public final class StructureInteraction {
     public static final double FRONT_SLACK = 0.35;
 
     private static final List<BlockChangeListener> LISTENERS = new CopyOnWriteArrayList<>();
+    /**
+     * Two ticks is enough to merge the vanilla use-item/use-block packet with
+     * the PLACE payload from the same right-click. Vanilla cannot place twice
+     * that quickly. Keyed weakly because ServerPlayer instances are long-lived.
+     */
+    private static final Map<ServerPlayer, Long> LAST_PLACEMENT_TICK = new WeakHashMap<>();
+
+    /**
+     * Minimal edit surface shared by {@link MutableVoxelVolume} and restored
+     * stateful volumes. Keeping this adapter here avoids forcing every volume
+     * type to implement a common mutable interface.
+     */
+    private interface EditableVolume {
+        void setBlock(int x, int y, int z, boolean solid, double mass,
+                      PhysicsMaterial material, BlockState state);
+    }
 
     private StructureInteraction() {
+    }
+
+    private static EditableVolume editableVolume(VoxelVolume volume) {
+        if (volume instanceof MutableVoxelVolume mutable) {
+            return (x, y, z, solid, mass, material, state) -> {
+                if (solid) {
+                    mutable.setBlock(x, y, z, true, mass, material);
+                } else {
+                    mutable.setSolid(x, y, z, false);
+                }
+            };
+        }
+        if (volume instanceof RestoredStructureVolume restored) {
+            return restored::setBlock;
+        }
+        return null;
+    }
+
+    /**
+     * Reads the stored state from a stateful volume first, then from the
+     * interaction side table used by plain mutable volumes.
+     */
+    private static BlockState stateAt(VoxelVolume volume, PhysicsStructure structure,
+                                      int x, int y, int z) {
+        if (volume instanceof StatefulVoxelVolume stateful) {
+            final BlockState state = stateful.blockState(x, y, z);
+            if (state != null) {
+                return state;
+            }
+        }
+        return StructureBlockStates.get(structure, x, y, z);
     }
 
     /**
@@ -146,6 +199,36 @@ public final class StructureInteraction {
     }
 
     /**
+     * Whether a structure currently exposes an editable volume. Useful for
+     * diagnostics and for gameplay code deciding whether to offer editing UI.
+     */
+    public static boolean isEditable(PhysicsStructure structure) {
+        return structure != null && !structure.closed()
+                && editableVolume(structure.volume()) != null;
+    }
+
+    /**
+     * Called by each right-click path before placing. It collapses the
+     * potential duplicates from {@code UseBlockCallback}, {@code UseItemCallback}
+     * and the client {@code PLACE} payload for one physical click.
+     *
+     * @return {@code false} when this player already placed within the last two
+     *         ticks and the duplicate should be ignored
+     */
+    public static boolean beginPlacement(ServerPlayer player) {
+        if (player == null) {
+            return false;
+        }
+        final long now = player.level().getGameTime();
+        final Long previous = LAST_PLACEMENT_TICK.get(player);
+        if (previous != null && now - previous >= 0L && now - previous <= 1L) {
+            return false;
+        }
+        LAST_PLACEMENT_TICK.put(player, now);
+        return true;
+    }
+
+    /**
      * Removes one solid voxel from a mutable structure volume, rebuilds the
      * collider, refreshes the auxiliary block-ticking level and applies a
      * reaction impulse opposite to the player's look direction.
@@ -159,8 +242,9 @@ public final class StructureInteraction {
             return BreakResult.FAILED;
         }
         final VoxelVolume volume = structure.volume();
-        if (!(volume instanceof MutableVoxelVolume mutable)) {
-            // BlockVoxelVolume is a read-only view over real Minecraft blocks.
+        final EditableVolume editable = editableVolume(volume);
+        if (editable == null) {
+            // BlockVoxelVolume and unknown read-only views cannot be edited.
             return BreakResult.FAILED;
         }
         final int x = hit.voxelX();
@@ -175,8 +259,11 @@ public final class StructureInteraction {
             return BreakResult.FAILED;
         }
 
-        final BlockState previousState = StructureBlockStates.remove(structure, x, y, z);
-        mutable.setSolid(x, y, z, false);
+        final BlockState previousState = stateAt(volume, structure, x, y, z);
+        final double previousMass = volume.blockMass(x, y, z);
+        final PhysicsMaterial previousMaterial = volume.blockMaterial(x, y, z);
+        StructureBlockStates.remove(structure, x, y, z);
+        editable.setBlock(x, y, z, false, 0.0, PhysicsMaterial.DEFAULT, null);
 
         if (!hasSolidBlock(volume)) {
             // PhysicsStructure.reindex() rejects an empty volume. Removing the
@@ -187,7 +274,15 @@ public final class StructureInteraction {
             return new BreakResult(true, true, previousState);
         }
 
-        structure.reindex(volume);
+        try {
+            structure.reindex(volume);
+        } catch (RuntimeException e) {
+            editable.setBlock(x, y, z, true, previousMass, previousMaterial, previousState);
+            if (previousState != null) {
+                StructureBlockStates.set(structure, x, y, z, previousState);
+            }
+            return BreakResult.FAILED;
+        }
         physics.refreshStructure(structure, volume);
 
         applyImpulse(player, structure, hit.point(), -MINING_IMPULSE * scale(
@@ -200,8 +295,11 @@ public final class StructureInteraction {
     /**
      * Adds a block into the structure voxel adjacent to the hit face.
      *
-     * <p>The volume is not expanded: the target cell must already be inside the
-     * volume bounds and empty. A small reaction impulse is applied, mirroring
+     * <p>If the target is inside the current bounds it must be empty. If it is
+     * outside (building on an outer face), the grid is expanded by one cell and
+     * copied into a new mutable volume; a restored
+     * {@code RestoredStructureVolume} therefore becomes editable after the
+     * first outside placement. A small reaction impulse is applied, mirroring
      * the mining response.</p>
      */
     public static PlaceResult placeBlock(ServerPlayer player, StructureHit hit, BlockState state) {
@@ -214,14 +312,16 @@ public final class StructureInteraction {
             return PlaceResult.FAILED;
         }
         final VoxelVolume volume = structure.volume();
-        if (!(volume instanceof MutableVoxelVolume mutable)) {
+        final EditableVolume existing = editableVolume(volume);
+        if (existing == null) {
             return PlaceResult.FAILED;
         }
         final int x = hit.adjacentX();
         final int y = hit.adjacentY();
         final int z = hit.adjacentZ();
         final IntBounds3 bounds = volume.bounds();
-        if (!bounds.contains(x, y, z) || volume.isSolid(x, y, z)) {
+        final boolean inside = bounds.contains(x, y, z);
+        if (inside && volume.isSolid(x, y, z)) {
             return PlaceResult.FAILED;
         }
         final LevelPhysics physics = MinecraftPhysics.getIfPresent((ServerLevel) player.level());
@@ -234,16 +334,65 @@ public final class StructureInteraction {
         final double mass = properties.mass() > 0.0
                 ? properties.mass()
                 : MinecraftPhysics.config().defaultBlockMass;
-        mutable.setBlock(x, y, z, true, mass, properties.material());
+
+        final VoxelVolume targetVolume;
+        final EditableVolume targetEditable;
+        if (inside) {
+            targetVolume = volume;
+            targetEditable = existing;
+        } else {
+            // Building on an outer face expands the grid by one cell. The new
+            // volume is mutable, so restored structures become editable as soon
+            // as the player places the first outside block.
+            final IntBounds3 expandedBounds = bounds.union(
+                    new IntBounds3(x, y, z, x + 1, y + 1, z + 1));
+            final MutableVoxelVolume expanded = new MutableVoxelVolume(expandedBounds);
+            copyVolume(structure, volume, expanded);
+            targetVolume = expanded;
+            targetEditable = editableVolume(expanded);
+        }
+        if (targetEditable == null) {
+            return PlaceResult.FAILED;
+        }
+
+        targetEditable.setBlock(x, y, z, true, mass, properties.material(), state);
         StructureBlockStates.set(structure, x, y, z, state);
-        structure.reindex(volume);
-        physics.refreshStructure(structure, volume);
+        try {
+            structure.reindex(targetVolume);
+        } catch (RuntimeException e) {
+            // Roll back the edit if the collider cannot represent it (for
+            // example an oversized expanded volume).
+            targetEditable.setBlock(x, y, z, false, 0.0, PhysicsMaterial.DEFAULT, null);
+            StructureBlockStates.remove(structure, x, y, z);
+            return PlaceResult.FAILED;
+        }
+        physics.refreshStructure(structure, targetVolume);
 
         applyImpulse(player, structure, hit.point(), -MINING_IMPULSE * PLACE_IMPULSE_FRACTION * scale(
                 MinecraftPhysics.config().miningImpulseScale));
         playSound(player, structure.blockCenter(x, y, z), state, false);
         notifyListeners(player, structure, x, y, z, null, state);
         return new PlaceResult(true, x, y, z);
+    }
+
+    private static void copyVolume(PhysicsStructure structure, VoxelVolume from,
+                                   MutableVoxelVolume to) {
+        final IntBounds3 bounds = from.bounds();
+        for (int y = bounds.minY(); y < bounds.maxY(); y++) {
+            for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
+                for (int x = bounds.minX(); x < bounds.maxX(); x++) {
+                    if (!from.isSolid(x, y, z)) {
+                        continue;
+                    }
+                    to.setBlock(x, y, z, true, from.blockMass(x, y, z),
+                            from.blockMaterial(x, y, z));
+                    final BlockState state = stateAt(from, structure, x, y, z);
+                    if (state != null && !state.isAir()) {
+                        StructureBlockStates.set(structure, x, y, z, state);
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -256,7 +405,8 @@ public final class StructureInteraction {
         if (hit == null || hit.structure().closed()) {
             return null;
         }
-        return StructureBlockStates.get(hit.structure(), hit.voxelX(), hit.voxelY(), hit.voxelZ());
+        return stateAt(hit.structure().volume(), hit.structure(),
+                hit.voxelX(), hit.voxelY(), hit.voxelZ());
     }
 
     /**
@@ -319,7 +469,25 @@ public final class StructureInteraction {
         return switch (action) {
             case MINE -> {
                 final StructureHit hit = raycast(player);
-                yield hit != null && breakBlock(player, hit).success();
+                yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
+                        && breakBlock(player, hit).success();
+            }
+            case PLACE -> {
+                final ItemStack stack = player.getMainHandItem();
+                if (!(stack.getItem() instanceof BlockItem blockItem)) {
+                    yield false;
+                }
+                final StructureHit hit = raycast(player);
+                if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)
+                        || !beginPlacement(player)) {
+                    yield false;
+                }
+                final PlaceResult result = placeBlock(player, hit,
+                        blockItem.getBlock().defaultBlockState());
+                if (result.success() && !player.isCreative()) {
+                    stack.shrink(1);
+                }
+                yield result.success();
             }
             case SHOVEL_WATER -> shovelWater(player);
         };
@@ -360,16 +528,27 @@ public final class StructureInteraction {
 
     private static StructureHit resolve(PhysicsStructure structure, RayHit rayHit) {
         final VoxelVolume volume = structure.volume();
-        final Vector3d voxel = structure.worldToVoxel(new Vector3d(), rayHit.point());
+        // Step a tiny amount inside the surface before quantising. Without
+        // this, a hit exactly on a +X/+Y/+Z face rounds into the empty cell on
+        // the other side of the face.
+        final double inset = Math.max(1.0e-6, structure.blockScale() * 1.0e-4);
+        final Vector3d inside = new Vector3d(rayHit.point())
+                .fma(-inset, rayHit.normal());
+        final Vector3d voxel = structure.worldToVoxel(new Vector3d(), inside);
         final int baseX = (int) Math.round(voxel.x);
         final int baseY = (int) Math.round(voxel.y);
         final int baseZ = (int) Math.round(voxel.z);
+        final Direction face = localFace(structure, rayHit.normal());
+        final IntBounds3 bounds = volume.bounds();
+
+        if (bounds.contains(baseX, baseY, baseZ) && volume.isSolid(baseX, baseY, baseZ)) {
+            return new StructureHit(structure, rayHit, baseX, baseY, baseZ, face);
+        }
 
         int bestX = baseX;
         int bestY = baseY;
         int bestZ = baseZ;
         double bestDistance = Double.POSITIVE_INFINITY;
-        final IntBounds3 bounds = volume.bounds();
         for (int dy = -1; dy <= 1; dy++) {
             for (int dz = -1; dz <= 1; dz++) {
                 for (int dx = -1; dx <= 1; dx++) {
@@ -392,8 +571,7 @@ public final class StructureInteraction {
         if (bestDistance == Double.POSITIVE_INFINITY) {
             return null;
         }
-        return new StructureHit(structure, rayHit, bestX, bestY, bestZ,
-                localFace(structure, rayHit.normal()));
+        return new StructureHit(structure, rayHit, bestX, bestY, bestZ, face);
     }
 
     /**
