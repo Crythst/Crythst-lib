@@ -28,7 +28,6 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
-import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.BlockHitResult;
@@ -259,16 +258,27 @@ public final class StructureInteraction {
         if (physics == null) {
             return BreakResult.FAILED;
         }
+        final ServerLevel level = (ServerLevel) player.level();
 
         final BlockState previousState = stateAt(volume, structure, x, y, z);
         final double previousMass = volume.blockMass(x, y, z);
         final PhysicsMaterial previousMaterial = volume.blockMaterial(x, y, z);
+        final double blockScale = structure.blockScale();
+        // Capture the world centre before mutating or splitting the body. The
+        // last voxel closes its body below, and a split replaces the original
+        // structure with new components, so the feedback point must not be
+        // read from the body afterwards.
+        final Vector3d feedbackCenter = structure.blockCenter(x, y, z);
         StructureBlockStates.remove(structure, x, y, z);
         editable.setBlock(x, y, z, false, 0.0, PhysicsMaterial.DEFAULT, null);
 
         if (StructureSplitter.isMassless(volume)) {
             // A body with no solid cells or zero total mass cannot be
-            // simulated, so it is cleared instead of reindexed.
+            // simulated, so it is cleared instead of reindexed. Emit feedback
+            // first: this is the last block and there is no later success
+            // path for it.
+            StructureFeedback.breakBlock(level, feedbackCenter, previousState, blockScale,
+                    level.getRandom());
             StructureSplitter.removeIfMassless(physics, structure, volume);
             notifyListeners(player, structure, x, y, z, previousState, null);
             return new BreakResult(true, true, previousState);
@@ -283,6 +293,12 @@ public final class StructureInteraction {
             }
             return BreakResult.FAILED;
         }
+        // Emit feedback after the successful reindex but before the refresh
+        // pass, which may split or close this body. The stored centre is a
+        // world-space value, but playing the sound and particles while the body
+        // is still alive keeps the ordering obvious.
+        StructureFeedback.breakBlock(level, feedbackCenter, previousState, blockScale,
+                level.getRandom());
         // Removing a block can disconnect the remaining solid cells. The
         // refresh pass also performs that split and returns the bodies that now
         // represent the structure.
@@ -293,7 +309,6 @@ public final class StructureInteraction {
             applyImpulse(player, reactionTarget, hit.point(), -MINING_IMPULSE * scale(
                     MinecraftPhysics.config().miningImpulseScale));
         }
-        playSound(player, hit.point(), previousState, true);
         notifyListeners(player, reactionTarget != null ? reactionTarget : structure,
                 x, y, z, previousState, null);
         return new BreakResult(true, false, previousState);
@@ -335,6 +350,12 @@ public final class StructureInteraction {
         if (physics == null) {
             return PlaceResult.FAILED;
         }
+        final ServerLevel level = (ServerLevel) player.level();
+        final double blockScale = structure.blockScale();
+        // Resolve the world centre before expanding/reindexing the volume.
+        // reindex keeps the world pose stable, so this is the final location of
+        // the placed voxel as well.
+        final Vector3d feedbackCenter = structure.blockCenter(x, y, z);
 
         final BlockPhysicsMapper.BlockProperties properties =
                 MinecraftPhysics.blockPhysics().properties(state);
@@ -377,7 +398,8 @@ public final class StructureInteraction {
 
         applyImpulse(player, structure, hit.point(), -MINING_IMPULSE * PLACE_IMPULSE_FRACTION * scale(
                 MinecraftPhysics.config().miningImpulseScale));
-        playSound(player, structure.blockCenter(x, y, z), state, false);
+        StructureFeedback.placeBlock(level, feedbackCenter, state, blockScale,
+                level.getRandom());
         notifyListeners(player, structure, x, y, z, null, state);
         return new PlaceResult(true, x, y, z);
     }
@@ -636,17 +658,6 @@ public final class StructureInteraction {
             }
         }
         return best;
-    }
-
-    private static void playSound(ServerPlayer player, Vector3dc point, BlockState state,
-                                  boolean breaking) {
-        if (state == null) {
-            return;
-        }
-        final SoundType sound = state.getSoundType();
-        player.level().playSound(null, point.x(), point.y(), point.z(),
-                breaking ? sound.getBreakSound() : sound.getPlaceSound(),
-                SoundSource.BLOCKS, 0.8f, 0.95f + player.getRandom().nextFloat() * 0.1f);
     }
 
     private static void notifyListeners(ServerPlayer player, PhysicsStructure structure,
