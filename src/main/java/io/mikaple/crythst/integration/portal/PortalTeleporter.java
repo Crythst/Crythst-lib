@@ -157,8 +157,10 @@ public final class PortalTeleporter {
                 PortalTransform.viewDirection(entity.getYRot(), entity.getXRot())));
 
         final Vector3d entityCentre = toVector(entity.getBoundingBox().getCenter());
-        final Vector3d target = transform.transformPoint(
-                new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
+        final Vector3d base = entity instanceof ServerPlayer player
+                ? transformedPlayerFeet(player, transform)
+                : transform.transformPoint(new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
+        final Vector3d target = new Vector3d(base);
         target.add(pushDirection(destination.plane(), transformedVelocity,
                 transform.entry().local(entityCentre)).mul(EXIT_OFFSET));
 
@@ -190,6 +192,19 @@ public final class PortalTeleporter {
         entity.fallDistance = fallDistance;
         entity.setOnGround(onGround);
         return true;
+    }
+
+    /**
+     * Places the player's feet so the vanilla camera (feet + eye height along
+     * world up) ends up at the transformed eye position. This keeps the view
+     * continuous through the portal; tilted portals still do not rotate the
+     * player's gravity/up vector, which is a later milestone.
+     */
+    private static Vector3d transformedPlayerFeet(ServerPlayer player, PortalTransform transform) {
+        final Vec3 eye = player.getEyePosition();
+        final Vector3d transformedEye = transform.transformPoint(
+                new Vector3d(eye.x, eye.y, eye.z));
+        return transformedEye.sub(0.0, player.getEyeHeight(), 0.0);
     }
 
     private static void applyLocalTeleport(Entity entity, Vector3d target,

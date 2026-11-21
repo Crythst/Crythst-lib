@@ -49,6 +49,14 @@ public final class PortalRenderer {
     private static final float FALLBACK_BLUE = 0.86f;
     private static final float FALLBACK_ALPHA = 0.72f;
 
+    /**
+     * Diagnostic switch for target-vs-screen texture orientation. The default
+     * matches vanilla target-to-target blits; set
+     * {@code -Dcrythst.portal.flipV=true} if a particular backend presents the
+     * copy upside down.
+     */
+    private static final boolean FLIP_V = Boolean.getBoolean("crythst.portal.flipV");
+
     private static volatile boolean registered;
     private static volatile boolean viewFailureLogged;
 
@@ -66,6 +74,7 @@ public final class PortalRenderer {
         registered = true;
         PortalClientView.register();
         PortalCapture.register();
+        PortalTeleportFade.register();
         LevelRenderEvents.BEFORE_GIZMOS.register(PortalRenderer::render);
         Crythst.LOGGER.info(
                 "Crythst portal renderer registered (destination capture + procedural fallback)");
@@ -202,15 +211,16 @@ public final class PortalRenderer {
             final float y = (float) (corner.y - camera.pos.y);
             final float z = (float) (corner.z - camera.pos.z);
 
-            // Screen-space UV for the projective portal mapping. This matches
-            // the full-screen triangle convention in vanilla screenquad.vsh
-            // (NDC y = -1 maps to v = 0).
+            // Screen-space UV for the projective portal mapping. This is the
+            // same NDC -> texture convention used by vanilla screenquad.vsh
+            // and target-to-target blits (NDC y = -1 is v = 0).
             final Vector4f clip = viewProjection.transform(new Vector4f(x, y, z, 1.0f));
             if (clip.w <= 1.0e-4f) {
                 return null;
             }
             final float u = clip.x / clip.w * 0.5f + 0.5f;
-            final float v = clip.y / clip.w * 0.5f + 0.5f;
+            final float ndcV = clip.y / clip.w * 0.5f + 0.5f;
+            final float v = FLIP_V ? 1.0f - ndcV : ndcV;
             vertices[i] = new Vertex(x, y, z, u, v);
         }
 

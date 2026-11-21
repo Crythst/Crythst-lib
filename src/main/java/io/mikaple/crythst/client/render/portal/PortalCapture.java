@@ -17,6 +17,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
+import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
@@ -26,6 +27,7 @@ import net.minecraft.client.renderer.state.WindowRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -95,6 +97,10 @@ public final class PortalCapture {
     private static final Map<UUID, ViewTarget> TARGETS = new HashMap<>();
     private static final Set<UUID> READY = new HashSet<>();
 
+    /** Diagnostic switch to disable the second scene render. */
+    private static final boolean ENABLED = !"false".equalsIgnoreCase(
+            System.getProperty("crythst.portal.capture", "true"));
+
     private static CrossFrameResourcePool resourcePool;
     private static FogRenderer fogRenderer;
     private static GlobalSettingsUniform portalGlobalSettings;
@@ -145,7 +151,10 @@ public final class PortalCapture {
     }
 
     private static void captureDestinationViews(LevelExtractionContext context) {
-        if (capturing) {
+        if (capturing || !ENABLED) {
+            if (!ENABLED) {
+                READY.clear();
+            }
             return;
         }
         final Minecraft minecraft = Minecraft.getInstance();
@@ -231,6 +240,10 @@ public final class PortalCapture {
         final Runnable savedCompiledSectionCallback = levelState.playerCompiledSectionCallback;
         levelState.playerCompiledSectionCallback = null;
 
+        final LevelRenderer renderer = context.levelRenderer();
+        final var savedVisibleSections = List.copyOf(renderer.visibleSections());
+        final var savedNearbySections = List.copyOf(renderer.nearbyVisibleSections());
+
         capturing = true;
         final Set<UUID> captured = new HashSet<>();
         try {
@@ -260,7 +273,14 @@ public final class PortalCapture {
                 boolean rendered = false;
                 try {
                     levelState.cameraRenderState = portalCamera;
-                    context.levelRenderer().render(resourcePool, false, portalCamera,
+                    rebuildVisibleSections(renderer, portalCamera);
+                    if (renderer.visibleSections().isEmpty()) {
+                        // The occlusion graph has no sections around the exit
+                        // (e.g. destination outside the loaded/main view area).
+                        // Skipping is better than capturing a sky-only image.
+                        continue;
+                    }
+                    renderer.render(resourcePool, false, portalCamera,
                             fogSlice, fogColor, false, false);
                     rendered = true;
                 } catch (Throwable error) {
@@ -286,20 +306,40 @@ public final class PortalCapture {
                 count++;
             }
         } finally {
-            restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
-            levelState.shouldUseMultiDrawIndirectForTerrain = savedMultiDraw;
-            levelState.playerCompiledSectionCallback = savedCompiledSectionCallback;
-            // Restore the global camera UBO for the normal main pass. The next
-            // GameRenderer frame will overwrite it again; doing it here keeps
-            // the same frame consistent too.
-            if (portalGlobalSettings != null) {
-                updateGlobalSettings(context, mainCamera.pos);
-            }
+            // Clear the recursion guard first so a restore failure cannot
+            // disable capture for every later frame.
             capturing = false;
+            try {
+                restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
+                levelState.shouldUseMultiDrawIndirectForTerrain = savedMultiDraw;
+                levelState.playerCompiledSectionCallback = savedCompiledSectionCallback;
+                // Restore the global camera UBO for the normal main pass. The
+                // next GameRenderer frame will overwrite it again; doing it
+                // here keeps the same frame consistent too.
+                if (portalGlobalSettings != null) {
+                    updateGlobalSettings(context, mainCamera.pos);
+                }
+                // The normal main pass reuses LevelRenderer.visibleSections,
+                // which was populated for the main camera during extraction.
+                // Restore the exact lists saved before the portal captures.
+                renderer.clearVisibleSections();
+                renderer.visibleSections().addAll(savedVisibleSections);
+                renderer.nearbyVisibleSections().addAll(savedNearbySections);
+            } catch (Throwable error) {
+                if (!failureLogged) {
+                    failureLogged = true;
+                    Crythst.LOGGER.warn("Crythst portal capture cleanup failed; "
+                            + "the main render state may be incomplete this frame", error);
+                }
+            }
             READY.clear();
             READY.addAll(captured);
-            fogRenderer.endFrame();
-            resourcePool.endFrame();
+            if (fogRenderer != null) {
+                fogRenderer.endFrame();
+            }
+            if (resourcePool != null) {
+                resourcePool.endFrame();
+            }
         }
     }
 
@@ -316,8 +356,33 @@ public final class PortalCapture {
         levelState.blockBreakingRenderStates.addAll(breaking);
     }
 
-    private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {
-        if (camera.pos.distanceToSqr(
+    /**
+     * Rebuilds {@code LevelRenderer.visibleSections} for a camera.
+     *
+     * <p>{@code LevelExtractor} populates this list for the <em>main</em>
+     * camera during extraction. A second {@code LevelRenderer.render} call
+     * does not re-extract it, so without this the portal camera would reuse
+     * the main camera's visible-section set and could show only sky when the
+     * destination is outside the player's current view.</p>
+     */
+    private static void rebuildVisibleSections(LevelRenderer renderer, CameraRenderState camera) {
+        renderer.clearVisibleSections();
+        if (camera == null || camera.cullFrustum == null) {
+            return;
+        }
+        if (camera.pos != null) {
+            // Position the rotating section storage before querying the
+            // occlusion graph, so the graph and section objects match the
+            // portal camera's neighbourhood.
+            renderer.viewArea().repositionCamera(SectionPos.of(camera.pos));
+        }
+        renderer.sectionOcclusionGraph().addSectionsInFrustum(
+                camera.cullFrustum,
+                renderer.visibleSections(),
+                renderer.nearbyVisibleSections());
+    }
+
+    private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {        if (camera.pos.distanceToSqr(
                 portal.plane().origin().x, portal.plane().origin().y, portal.plane().origin().z)
                 > MAX_CAPTURE_DISTANCE_SQUARED) {
             return false;

@@ -67,10 +67,12 @@ public final class PortalTransform {
         final Vector3d r = plane.right();
         final Vector3d u = plane.up();
         final Vector3d n = plane.normal();
+        // JOML Matrix3d constructor arguments are column-major: the first
+        // triplet is column 0. Store right/up/normal as the three columns.
         return new Matrix3d(
-                r.x, u.x, n.x,
-                r.y, u.y, n.y,
-                r.z, u.z, n.z);
+                r.x, r.y, r.z,
+                u.x, u.y, u.z,
+                n.x, n.y, n.z);
     }
 
     public PortalPlane entry() {
