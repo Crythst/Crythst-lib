@@ -37,10 +37,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * only samples the structure pose and then looks up the snapshot by body id;
  * it never touches a level, a volume or a native body.</p>
  *
- * <p>The snapshots are deliberately a singleplayer-first bridge: there is no
- * network layer yet, so a remote client cannot receive them. In multiplayer
- * {@link MinecraftPhysics#getIfPresent(ServerLevel)} is either absent or lives
- * in another process, and the renderer falls back to its legacy cuboids.</p>
+ * <p>In singleplayer these snapshots are the local bridge from server-thread
+ * volumes to the client renderer. In multiplayer the server can live in
+ * another process, so the renderer uses the network snapshot cache instead;
+ * this class is not consulted for remote dimensions.</p>
  *
  * <p>Memory is bounded per structure and globally. Volumes larger than the
  * per-structure cap are not snapshotted. Snapshots are rebuilt at a throttled
@@ -178,7 +178,7 @@ public final class StructureBlockSnapshots {
 
     /**
      * Immutable snapshot for a body in one dimension, or {@code null} when the
-     * body is not tracked (not singleplayer, too large, or not solid).
+     * body is not tracked (not present locally, too large, or not solid).
      *
      * <p>Body ids are allocated per {@code PhysicsWorld}, so the dimension is
      * part of the lookup key to avoid collisions between dimensions.</p>

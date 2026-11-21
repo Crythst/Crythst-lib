@@ -66,11 +66,13 @@ public abstract class EquipmentLayerRendererRuntimeTextureMixin {
                                                        PoseStack poseStack,
                                                        SubmitNodeCollector collector,
                                                        int light,
-                                                       int outlineColor) {
+                                                       Identifier texture,
+                                                       int outlineColor,
+                                                       int order) {
         final Identifier generated = RuntimeArmorTextures.textureFor(layerType, assetId);
         // The original call site passes null here; passing generated preserves
         // vanilla for every armor piece the example does not claim.
         renderer.renderLayers(layerType, assetId, (Model) model, state, stack, poseStack,
-                collector, light, generated, outlineColor, 1);
+                collector, light, generated, outlineColor, order);
     }
 }
