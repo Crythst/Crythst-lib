@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "io.mikaple.crythst.mixin.player",
+  "compatibilityLevel": "JAVA_25",
+  "mixins": [
+    "ServerPlayerObbMixin"
+  ],
+  "client": [
+    "LocalPlayerObbMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
