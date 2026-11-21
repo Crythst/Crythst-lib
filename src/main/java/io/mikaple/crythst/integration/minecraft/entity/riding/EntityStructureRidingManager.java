@@ -18,7 +18,6 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
@@ -43,14 +42,14 @@ import java.util.function.Predicate;
 /**
  * Carries entities that stand on physics structures.
  *
- * <p>The pass runs after the physics world has advanced and after
- * {@link io.mikaple.crythst.integration.minecraft.entity.EntityPhysicsCollisionManager}.
+ * <p>The pass runs after the physics world has advanced. Ordinary structure
+ * contact is resolved inside vanilla {@code Entity.move}, so this pass only
+ * carries an entity with a moving platform; it does not correct penetration.
  * For every eligible entity it detects a structure top surface just below the
  * entity's feet and stores the entity position in structure-local space. On
  * later ticks the entity is moved by the structure's pose delta, so a moving or
  * rotating platform carries the entity with it. The entity's own movement is
- * preserved by re-anchoring the local point every tick, which also means a
- * collision correction from the earlier pass is adopted rather than fought.</p>
+ * preserved by re-anchoring the local point every tick.</p>
  *
  * <p>The manager never writes to a structure: it only reads the pose, the
  * immutable collider boxes and the body OBB. Entities therefore cannot push,
@@ -115,9 +114,7 @@ public final class EntityStructureRidingManager {
      * Subscribes the riding pass to the end of the server tick.
      *
      * <p>Call this after {@code PhysicsTicker.register()} so the pass sees the
-     * current pose and runs after
-     * {@code EntityPhysicsCollisionManager}. Calling it more than once is
-     * harmless.</p>
+     * current pose. Calling it more than once is harmless.</p>
      */
     public static void register() {
         if (registered) {
@@ -686,7 +683,19 @@ public final class EntityStructureRidingManager {
 
         if (EntityStructureRidingMath.needsCarryUpdate(
                 currentPosition, targetPosition, entity.getYRot(), targetYaw)) {
-            setPosition(entity, targetPosition, targetYaw);
+            if (entity instanceof ServerPlayer player) {
+                // Moving-platform riding must not glue the player with a
+                // contact teleport. Add the platform's per-tick displacement to
+                // the player velocity instead; vanilla movement then carries
+                // the player and the client keeps predicting its own position.
+                final Vec3 motion = player.getDeltaMovement();
+                player.setDeltaMovement(
+                        motion.x + anchorDelta.x,
+                        motion.y + anchorDelta.y,
+                        motion.z + anchorDelta.z);
+            } else {
+                setPosition(entity, targetPosition, targetYaw);
+            }
         }
         entity.setOnGround(true);
         entity.resetFallDistance();
@@ -717,22 +726,9 @@ public final class EntityStructureRidingManager {
     }
 
     private static void setPosition(Entity entity, Vector3d position, float yaw) {
-        final float pitch = entity.getXRot();
-        if (entity instanceof ServerPlayer player && player.connection != null) {
-            // Clients predict vanilla movement; a teleport is the only reliable
-            // way to keep the server and client copies together. Carry the
-            // entity's current velocity through the packet instead of the
-            // default zero, otherwise every carry tick would stop the player.
-            final Vec3 motion = player.getDeltaMovement();
-            player.setYRot(yaw);
-            player.setYHeadRot(yaw);
-            player.connection.teleport(new PositionMoveRotation(
-                    new Vec3(position.x, position.y, position.z), motion, yaw, pitch), Set.of());
-        } else {
-            entity.setPos(position.x, position.y, position.z);
-            entity.setYRot(yaw);
-            entity.setYHeadRot(yaw);
-        }
+        entity.setPos(position.x, position.y, position.z);
+        entity.setYRot(yaw);
+        entity.setYHeadRot(yaw);
     }
 
     private static Aabb toAabb(AABB box) {
