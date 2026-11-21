@@ -39,6 +39,9 @@ public final class CrythstPhysicsDebugRenderer implements DebugRenderer.SimpleDe
         if (all || enabled(CrythstDebugEntries.PHYSICS_BODIES)) {
             LooseBodyRenderer.emit(partialTicks);
         }
+        if (all || enabled(CrythstDebugEntries.PHYSICS_TERRAIN)) {
+            PhysicsGizmoRenderer.emitTerrain(ClientPhysicsView.terrain());
+        }
     }
 
     private static boolean enabled(Identifier id) {

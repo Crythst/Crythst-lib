@@ -10,6 +10,8 @@ import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
+import io.mikaple.crythst.physics.world.TerrainCollisionSnapshot;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.GizmoStyle;
@@ -46,8 +48,55 @@ public final class PhysicsGizmoRenderer {
     private static final int COLOR_WOOD = 0xFF8B5A2B;
     private static final int COLOR_METAL = 0xFFB0B0B0;
     private static final int COLOR_DIRT = 0xFF7B6B3A;
+    private static final int COLOR_TERRAIN = 0xFF44AA66;
+    private static final int COLOR_TERRAIN_PART = 0xFF66DD88;
+    private static final int COLOR_TERRAIN_REGION = 0xFF4488FF;
+    private static final int COLOR_TERRAIN_MISSING = 0xFFFF4040;
 
     private PhysicsGizmoRenderer() {
+    }
+
+
+    /**
+     * Cached terrain-collision sections and the expanded region each dynamic
+     * body requested. Box/part coordinates are absolute world metres.
+     */
+    public static void emitTerrain(TerrainCollisionSnapshot snapshot) {
+        if (snapshot == null || !snapshot.enabled()) {
+            return;
+        }
+        final GizmoStyle boxes = GizmoStyle.stroke(COLOR_TERRAIN, 1.0f);
+        final GizmoStyle parts = GizmoStyle.stroke(COLOR_TERRAIN_PART, 1.0f);
+        int budget = 4096;
+        for (TerrainCollisionSnapshot.Section section : snapshot.sections()) {
+            for (VoxelBox box : section.boxes()) {
+                if (budget-- <= 0) {
+                    break;
+                }
+                Gizmos.cuboid(new net.minecraft.world.phys.AABB(
+                        box.minX(), box.minY(), box.minZ(),
+                        box.minX() + box.sizeX(),
+                        box.minY() + box.sizeY(),
+                        box.minZ() + box.sizeZ()), boxes);
+            }
+            for (VoxelCellPart part : section.parts()) {
+                if (budget-- <= 0) {
+                    break;
+                }
+                Gizmos.cuboid(new net.minecraft.world.phys.AABB(
+                        part.minX(), part.minY(), part.minZ(),
+                        part.minX() + part.sizeX(),
+                        part.minY() + part.sizeY(),
+                        part.minZ() + part.sizeZ()), parts);
+            }
+        }
+        for (TerrainCollisionSnapshot.Region region : snapshot.regions()) {
+            final int color = region.outsideTerrain() ? COLOR_TERRAIN_MISSING : COLOR_TERRAIN_REGION;
+            Gizmos.cuboid(new net.minecraft.world.phys.AABB(
+                    region.expandedMinX(), region.expandedMinY(), region.expandedMinZ(),
+                    region.expandedMaxX(), region.expandedMaxY(), region.expandedMaxZ()),
+                    GizmoStyle.stroke(color, region.outsideTerrain() ? 2.0f : 1.0f));
+        }
     }
 
     /** Per-voxel merged collision boxes, coloured by physics material. */

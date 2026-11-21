@@ -4,6 +4,7 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
+import io.mikaple.crythst.physics.world.TerrainCollisionSnapshot;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.server.IntegratedServer;
 import net.minecraft.server.level.ServerLevel;
@@ -23,6 +24,7 @@ import java.util.List;
 public final class ClientPhysicsView {
     private static volatile List<PhysicsStructure> STRUCTURES = List.of();
     private static volatile PhysicsDebugSnapshot DEBUG;
+    private static volatile TerrainCollisionSnapshot TERRAIN;
 
     private ClientPhysicsView() {
     }
@@ -54,6 +56,7 @@ public final class ClientPhysicsView {
         }
         STRUCTURES = physics.renderStructures();
         DEBUG = physics.renderDebugSnapshot();
+        TERRAIN = physics.renderTerrainSnapshot();
     }
 
     /**
@@ -70,8 +73,14 @@ public final class ClientPhysicsView {
         return DEBUG;
     }
 
+    /** Latest terrain-collision cache snapshot. */
+    public static TerrainCollisionSnapshot terrain() {
+        return TERRAIN;
+    }
+
     public static void clear() {
         STRUCTURES = List.of();
         DEBUG = null;
+        TERRAIN = null;
     }
 }

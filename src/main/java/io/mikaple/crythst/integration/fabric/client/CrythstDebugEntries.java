@@ -46,6 +46,9 @@ public final class CrythstDebugEntries {
     /** Loose dynamic/kinematic bodies. */
     public static final Identifier PHYSICS_BODIES =
             Identifier.fromNamespaceAndPath("crythst", "physics_bodies");
+    /** Cached Minecraft terrain-collision sections. */
+    public static final Identifier PHYSICS_TERRAIN =
+            Identifier.fromNamespaceAndPath("crythst", "physics_terrain");
     /** F3 text entry for the structure voxel under the crosshair. */
     public static final Identifier STRUCTURE_TARGET =
             Identifier.fromNamespaceAndPath("crythst", "structure_target");
@@ -53,7 +56,7 @@ public final class CrythstDebugEntries {
     /** All renderer ids, in registration order. */
     public static final List<Identifier> ALL_RENDERERS = List.of(
             PHYSICS, PHYSICS_COLLIDERS, PHYSICS_BOUNDS, PHYSICS_DYNAMICS,
-            PHYSICS_CONTACTS, PHYSICS_BODIES);
+            PHYSICS_CONTACTS, PHYSICS_BODIES, PHYSICS_TERRAIN);
 
     /** Shared entry implementation; the debug options screen labels by id path. */
     public static final DebugScreenEntry ENTRY = new PhysicsEntry();
