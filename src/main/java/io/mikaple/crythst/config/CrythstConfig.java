@@ -19,10 +19,22 @@ public final class CrythstConfig {
 
     public boolean enabled = true;
     public double fixedTimeStep = 1.0 / 60.0;
-    public int maxSubSteps = 4;
+    public int maxSubSteps = 8;
     public int solverIterations = 10;
     public boolean allowSleep = true;
     public boolean deterministic = true;
+    /**
+     * When {@code true}, physics advances by exactly one server tick of game
+     * time per tick (50&nbsp;ms at 20&nbsp;TPS) instead of measuring wall-clock
+     * time between {@code END_SERVER_TICK} callbacks. This keeps the number of
+     * fixed substeps per tick stable, which is required for smooth
+     * tick-partial-tick render interpolation. Disable only for A/B testing.
+     */
+    public boolean serverTickTiming = true;
+    /**
+     * Wall-clock catch-up cap used only when {@link #serverTickTiming} is
+     * {@code false} (or by manual callers of {@code PhysicsWorld#advance}).
+     */
     public double maxFrameSeconds = 0.25;
     public double rebaseDistance = 2048.0;
     public volatile boolean debug = true;
@@ -101,7 +113,11 @@ public final class CrythstConfig {
 
     public CrythstConfig sanitised() {
         fixedTimeStep = fixedTimeStep > 0.0 ? fixedTimeStep : 1.0 / 60.0;
-        maxSubSteps = Math.max(1, maxSubSteps);
+        // A 20 TPS server needs at least 3 steps at 1/60 s or 6 at 1/120 s.
+        // Keep enough headroom that changing fixedTimeStep alone cannot
+        // silently slow the simulation down.
+        final int recommendedFor20Tps = (int) Math.ceil(1.0 / (20.0 * fixedTimeStep)) + 1;
+        maxSubSteps = Math.max(Math.max(1, recommendedFor20Tps), maxSubSteps);
         solverIterations = Math.max(1, solverIterations);
         maxFrameSeconds = maxFrameSeconds > 0.0 ? maxFrameSeconds : 0.25;
         rebaseDistance = rebaseDistance > 0.0 ? rebaseDistance : 2048.0;

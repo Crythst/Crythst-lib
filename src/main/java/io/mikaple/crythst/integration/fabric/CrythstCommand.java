@@ -7,6 +7,8 @@ import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.entity.EntityPhysicsCollisionManager;
+import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
 import io.mikaple.crythst.physics.body.BodyDef;
 import io.mikaple.crythst.physics.body.BodyHandle;
 import io.mikaple.crythst.physics.body.BodySnapshot;
@@ -41,6 +43,7 @@ public final class CrythstCommand {
         dispatcher.register(Commands.literal("crythst")
                 .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
                 .then(Commands.literal("status").executes(CrythstCommand::status))
+                .then(Commands.literal("timing").executes(CrythstCommand::timing))
                 .then(Commands.literal("bodies").executes(CrythstCommand::bodies))
                 .then(Commands.literal("pause").executes(context -> setPaused(context, true)))
                 .then(Commands.literal("resume").executes(context -> setPaused(context, false)))
@@ -50,6 +53,7 @@ public final class CrythstCommand {
                 .then(Commands.literal("unstuck").executes(CrythstCommand::unstuck))
                 .then(Commands.literal("clear").executes(CrythstCommand::clear))
                 .then(Commands.literal("debug").executes(CrythstCommand::toggleDebug))
+                .then(Commands.literal("entitydebug").executes(CrythstCommand::entityDebug))
                 .then(Commands.literal("playergravity")
                         .then(Commands.literal("look").executes(CrythstCommand::playerGravityLook))
                         .then(Commands.literal("reset").executes(CrythstCommand::playerGravityReset))
@@ -90,6 +94,22 @@ public final class CrythstCommand {
                 + " up=" + format(physics.world().up())
                 + " origin=" + format(physics.world().origin());
         source.sendSuccess(() -> Component.literal(text), false);
+        return 1;
+    }
+
+    /**
+     * Prints the fixed-step timing, render interpolation and jitter estimate for
+     * this dimension.
+     */
+    private static int timing(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context) {
+        final CommandSourceStack source = context.getSource();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(source.getLevel());
+        if (physics == null) {
+            source.sendSuccess(() -> Component.literal(
+                    "Crythst timing: no physics world for this dimension yet"), false);
+            return 0;
+        }
+        source.sendSuccess(() -> Component.literal(physics.timingText()), false);
         return 1;
     }
 
@@ -300,6 +320,65 @@ public final class CrythstCommand {
         source.sendSuccess(() -> Component.literal("Crythst gravity set to " + format(physics.world().gravity())
                 + " (up " + format(physics.world().up()) + ")"), true);
         return 1;
+    }
+
+    /**
+     * Prints the entity/pose/local-query/MTV data used by the one-way
+     * collision pass. Inspects entities within eight blocks so a mob or item
+     * near the command source can be diagnosed as well as the player.
+     */
+    private static int entityDebug(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context) {
+        final CommandSourceStack source = context.getSource();
+        final ServerLevel level = source.getLevel();
+        final net.minecraft.world.phys.Vec3 sourcePos = source.getPosition();
+        final java.util.List<EntityPhysicsCollisionManager.DebugReport> reports =
+                EntityPhysicsCollisionManager.inspectNear(level,
+                        new Vector3d(sourcePos.x, sourcePos.y, sourcePos.z), 8.0, 4);
+        if (reports.isEmpty()) {
+            source.sendSuccess(() -> Component.literal(
+                    "entitydebug: no entities within 8 blocks"), false);
+            return 0;
+        }
+
+        source.sendSuccess(() -> Component.literal(
+                "entitydebug: margin=" + String.format("%.3f", EntityPhysicsCollisionManager.effectiveMargin())
+                        + " stats=" + EntityPhysicsCollisionManager.lastStats()), false);
+        for (EntityPhysicsCollisionManager.DebugReport report : reports) {
+            final String header = "entity " + report.entityType()
+                    + " id=" + report.entityUuid()
+                    + " pos=" + format(report.position())
+                    + " aabb=" + format(report.entityBox().min())
+                    + ".." + format(report.entityBox().max());
+            source.sendSuccess(() -> Component.literal(header), false);
+            if (report.structures().isEmpty()) {
+                source.sendSuccess(() -> Component.literal("  no nearby structures"), false);
+                continue;
+            }
+            for (EntityPhysicsCollisionManager.StructureDebug structure : report.structures()) {
+                final EntityStructureSolver.Hit hit = structure.hit();
+                final String hitText = hit == null
+                        ? "hit=none"
+                        : "hit normal=" + format(hit.normal())
+                        + " depth=" + String.format("%.4f", hit.penetration())
+                        + " offset=" + format(hit.offset());
+                final String line = "  structure #" + structure.bodyId()
+                        + " posePos=" + format(structure.pose().position())
+                        + " poseRot=" + formatRotation(structure.pose().rotation())
+                        + " bounds=" + format(structure.bounds().min())
+                        + ".." + format(structure.bounds().max())
+                        + " localQuery=" + format(structure.localQuery().min())
+                        + ".." + format(structure.localQuery().max())
+                        + " " + hitText
+                        + " centerInside=" + structure.centerInside();
+                source.sendSuccess(() -> Component.literal(line), false);
+            }
+        }
+        return 1;
+    }
+
+    private static String formatRotation(org.joml.Quaterniondc rotation) {
+        return String.format("(%.3f, %.3f, %.3f, %.3f)",
+                rotation.x(), rotation.y(), rotation.z(), rotation.w());
     }
 
     private static String format(Vector3d value) {

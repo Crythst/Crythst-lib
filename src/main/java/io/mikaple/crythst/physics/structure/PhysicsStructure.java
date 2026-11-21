@@ -107,6 +107,16 @@ public final class PhysicsStructure implements AutoCloseable {
         return Transform3d.of(structurePosition, bodyPose.rotation());
     }
 
+    /**
+     * Samples the render pose between the last two published server ticks.
+     *
+     * <p>{@code alpha} is expected to be Minecraft's tick partial tick
+     * ({@code DeltaTracker#getGameTimeDeltaPartialTick}) because
+     * {@link #syncRenderPose()} is called exactly once per server tick. The
+     * physics clock's own accumulator is intentionally <em>not</em> used here:
+     * a server tick may run several fixed substeps in a burst, so its remainder
+     * does not describe how far the render clock has advanced between ticks.</p>
+     */
     public Transform3d interpolatedPose(double alpha) {
         return renderPose.sample(alpha);
     }
@@ -123,11 +133,37 @@ public final class PhysicsStructure implements AutoCloseable {
     }
 
     /**
-     * Copies the body pose into the render interpolation buffer. Call once per
-     * fixed step (or once per server tick) after simulation.
+     * Copies the body pose into the render interpolation buffer. Call exactly
+     * once per server tick, after simulation, so the two buffered poses line up
+     * with Minecraft's tick-based partial-tick interpolation. Do not call once
+     * per physics substep: substeps run in a burst inside one server tick, and
+     * the renderer would then interpolate only the last substep over the whole
+     * tick.
      */
     public void syncRenderPose() {
         renderPose.push(pose());
+    }
+
+    /**
+     * Translation distance covered by the current render interpolation pair.
+     * Diagnostic only; used by {@code /crythst timing}.
+     */
+    public double renderPoseTranslationDelta() {
+        return renderPose.previous().position().distance(renderPose.current().position());
+    }
+
+    /**
+     * Rotation angle in radians covered by the current render interpolation
+     * pair. Diagnostic only; used by {@code /crythst timing}.
+     */
+    public double renderPoseAngleDelta() {
+        final Quaterniond previous = renderPose.previous().rotation();
+        final Quaterniond current = renderPose.current().rotation();
+        final double dot = Math.abs(previous.x() * current.x()
+                + previous.y() * current.y()
+                + previous.z() * current.z()
+                + previous.w() * current.w());
+        return 2.0 * Math.acos(Math.min(1.0, dot));
     }
 
     public OrientedBox obb() {

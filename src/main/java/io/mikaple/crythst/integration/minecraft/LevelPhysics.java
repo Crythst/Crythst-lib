@@ -2,13 +2,16 @@ package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.config.CrythstConfig;
+import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureDef;
+import io.mikaple.crythst.physics.tick.PhysicsTimingMonitor;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.world.PhysicsWorld;
 import io.mikaple.crythst.physics.world.WorldSettings;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.TickRateManager;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -25,6 +28,7 @@ public final class LevelPhysics implements AutoCloseable {
     private final TerrainCollision terrain;
     private final UnstuckResolver unstuck;
     private final List<PhysicsStructure> structures = new ArrayList<>();
+    private final PhysicsTimingMonitor timing = new PhysicsTimingMonitor();
 
     /**
      * Auxiliary void level for block logic. Created lazily on the first
@@ -129,24 +133,37 @@ public final class LevelPhysics implements AutoCloseable {
      * that modify a volume must invoke this method (or the overload taking the
      * new volume) to keep block ticking in sync.
      */
-    public void refreshStructure(PhysicsStructure structure) {
-        refreshStructure(structure, structure.volume());
+    public List<PhysicsStructure> refreshStructure(PhysicsStructure structure) {
+        return refreshStructure(structure, structure.volume());
     }
 
     /**
-     * Re-copies a structure's blocks after a volume change.
+     * Re-copies a structure's blocks after a volume change and then repairs its
+     * topology.
+     *
+     * <p>Blocks that no longer form one six-connected component become
+     * independent bodies, and a body whose remaining mass is zero is removed.
+     * The caller must not keep using {@code structure} after this call: it is
+     * returned unchanged only when no split was needed.</p>
+     *
+     * @return the bodies that now represent the edited structure, as a
+     *         singleton list when nothing changed or one body per connected
+     *         component after a split; empty when the body was removed
      */
-    public void refreshStructure(PhysicsStructure structure, VoxelVolume volume) {
-        if (subLevel == null || closed) {
-            return;
+    public List<PhysicsStructure> refreshStructure(PhysicsStructure structure, VoxelVolume volume) {
+        if (closed) {
+            return structure.closed() ? List.of() : List.of(structure);
         }
-        try {
-            subLevel.removeStructure(structure);
-            subLevel.addStructure(structure, volume);
-        } catch (Throwable t) {
-            Crythst.LOGGER.warn("Could not refresh structure body #{} in the auxiliary void level",
-                    structure.body().id(), t);
+        if (subLevel != null) {
+            try {
+                subLevel.removeStructure(structure);
+                subLevel.addStructure(structure, volume);
+            } catch (Throwable t) {
+                Crythst.LOGGER.warn("Could not refresh structure body #{} in the auxiliary void level",
+                        structure.body().id(), t);
+            }
         }
+        return StructureSplitter.splitIfNeeded(this, structure, volume);
     }
 
     /**
@@ -198,24 +215,70 @@ public final class LevelPhysics implements AutoCloseable {
             return;
         }
         final long now = System.nanoTime();
-        double delta = (now - lastTickNanos) / 1_000_000_000.0;
+        final double wallDelta = Math.max(0.0, (now - lastTickNanos) / 1_000_000_000.0);
         lastTickNanos = now;
-        if (delta <= 0.0) {
-            return;
+
+        final TickRateManager tickRate = level.getServer().tickRateManager();
+        final boolean frozen = tickRate.isFrozen() && !tickRate.isSteppingForward();
+        final double simulationDelta;
+        if (frozen) {
+            simulationDelta = 0.0;
+        } else if (config.serverTickTiming) {
+            // Feed the fixed-step clock exactly one server tick of game time.
+            // Wall-clock jitter between END_SERVER_TICK callbacks (burst ticks,
+            // frame spikes, integrated-server scheduling) must not change how
+            // many substeps a tick runs: the renderer interpolates the two
+            // tick-boundary poses with Minecraft's tick partial tick, so
+            // variable steps per tick are visible as trembling.
+            simulationDelta = 1.0 / Math.max(1.0, tickRate.tickrate());
+        } else {
+            // Legacy wall-clock mode, retained for A/B testing and for servers
+            // that deliberately want physics to catch up in real time.
+            simulationDelta = Math.min(wallDelta, config.maxFrameSeconds);
         }
-        delta = Math.min(delta, config.maxFrameSeconds);
-        terrain.tick();
-        PlayerGravity.setWorldDirection(level.dimension(), world.gravity());
-        world.advance(delta);
-        unstuck.tick();
+
+        if (!frozen) {
+            terrain.tick();
+            PlayerGravity.setWorldDirection(level.dimension(), world.gravity());
+        }
+        final int steps = simulationDelta > 0.0 ? world.advance(simulationDelta) : 0;
+        if (!frozen) {
+            unstuck.tick();
+        }
+
+        // Publish exactly one pose per server tick. Do not push after each
+        // substep: substeps are simulated in a burst, and Minecraft's render
+        // alpha spans the tick, not the substep.
+        double maxPoseDelta = 0.0;
+        double maxPoseAngle = 0.0;
         for (PhysicsStructure structure : structures) {
             structure.syncRenderPose();
+            maxPoseDelta = Math.max(maxPoseDelta, structure.renderPoseTranslationDelta());
+            maxPoseAngle = Math.max(maxPoseAngle, structure.renderPoseAngleDelta());
         }
         renderDebugSnapshot = world.debugSnapshot();
         maybeRebase();
-        // Block logic advances with the simulated world. Ticking here means one
-        // random-tick pass per server tick, not one per Bullet sub-step.
-        tickSubLevel();
+        if (!frozen) {
+            // Block logic advances with the simulated world. Ticking here means
+            // one random-tick pass per server tick, not one per Bullet sub-step.
+            tickSubLevel();
+        }
+        timing.record(wallDelta, simulationDelta, steps, world.interpolationAlpha(),
+                maxPoseDelta, maxPoseAngle, config.serverTickTiming, frozen);
+    }
+
+    /**
+     * Latest timing/interpolation diagnostic for {@code /crythst timing}.
+     */
+    public PhysicsTimingMonitor.Snapshot timing() {
+        return timing.snapshot();
+    }
+
+    /**
+     * One-line timing summary for commands and logs.
+     */
+    public String timingText() {
+        return timing.snapshot().summary();
     }
 
     /**
@@ -224,12 +287,17 @@ public final class LevelPhysics implements AutoCloseable {
      */
     public void step(int count) {
         terrain.ensureNow();
+        final double fixedStep = world.settings().fixedTimeStep();
         for (int i = 0; i < count; i++) {
-            world.step(world.settings().fixedTimeStep());
+            world.step(fixedStep);
         }
         unstuck.force();
+        double maxPoseDelta = 0.0;
+        double maxPoseAngle = 0.0;
         for (PhysicsStructure structure : structures) {
             structure.syncRenderPose();
+            maxPoseDelta = Math.max(maxPoseDelta, structure.renderPoseTranslationDelta());
+            maxPoseAngle = Math.max(maxPoseAngle, structure.renderPoseAngleDelta());
         }
         renderDebugSnapshot = world.debugSnapshot();
         if (count > 0) {
@@ -237,6 +305,8 @@ public final class LevelPhysics implements AutoCloseable {
             // void level once for the batch to avoid multiplying random ticks
             // by the number of fixed steps.
             tickSubLevel();
+            timing.record(0.0, count * fixedStep, count, world.interpolationAlpha(),
+                    maxPoseDelta, maxPoseAngle, false, paused());
         }
     }
 

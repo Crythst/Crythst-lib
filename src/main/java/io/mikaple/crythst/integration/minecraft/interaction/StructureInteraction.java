@@ -7,6 +7,7 @@ import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
+import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.query.BodyFilter;
 import io.mikaple.crythst.physics.query.RayHit;
@@ -265,11 +266,10 @@ public final class StructureInteraction {
         StructureBlockStates.remove(structure, x, y, z);
         editable.setBlock(x, y, z, false, 0.0, PhysicsMaterial.DEFAULT, null);
 
-        if (!hasSolidBlock(volume)) {
-            // PhysicsStructure.reindex() rejects an empty volume. Removing the
-            // last block therefore removes the body instead.
-            StructureBlockStates.clear(structure);
-            physics.removeStructure(structure);
+        if (StructureSplitter.isMassless(volume)) {
+            // A body with no solid cells or zero total mass cannot be
+            // simulated, so it is cleared instead of reindexed.
+            StructureSplitter.removeIfMassless(physics, structure, volume);
             notifyListeners(player, structure, x, y, z, previousState, null);
             return new BreakResult(true, true, previousState);
         }
@@ -283,12 +283,19 @@ public final class StructureInteraction {
             }
             return BreakResult.FAILED;
         }
-        physics.refreshStructure(structure, volume);
+        // Removing a block can disconnect the remaining solid cells. The
+        // refresh pass also performs that split and returns the bodies that now
+        // represent the structure.
+        final List<PhysicsStructure> remaining = physics.refreshStructure(structure, volume);
+        final PhysicsStructure reactionTarget = nearestStructure(remaining, hit.point());
 
-        applyImpulse(player, structure, hit.point(), -MINING_IMPULSE * scale(
-                MinecraftPhysics.config().miningImpulseScale));
+        if (reactionTarget != null) {
+            applyImpulse(player, reactionTarget, hit.point(), -MINING_IMPULSE * scale(
+                    MinecraftPhysics.config().miningImpulseScale));
+        }
         playSound(player, hit.point(), previousState, true);
-        notifyListeners(player, structure, x, y, z, previousState, null);
+        notifyListeners(player, reactionTarget != null ? reactionTarget : structure,
+                x, y, z, previousState, null);
         return new BreakResult(true, false, previousState);
     }
 
@@ -610,18 +617,25 @@ public final class StructureInteraction {
         return Math.max(0.0, configValue);
     }
 
-    private static boolean hasSolidBlock(VoxelVolume volume) {
-        final IntBounds3 bounds = volume.bounds();
-        for (int y = bounds.minY(); y < bounds.maxY(); y++) {
-            for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
-                for (int x = bounds.minX(); x < bounds.maxX(); x++) {
-                    if (volume.isSolid(x, y, z)) {
-                        return true;
-                    }
-                }
+    /**
+     * Chooses the body that should receive a reaction impulse after a possible
+     * split: the component whose centre is closest to the edited block.
+     */
+    private static PhysicsStructure nearestStructure(List<PhysicsStructure> structures, Vector3dc point) {
+        PhysicsStructure best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (PhysicsStructure candidate : structures) {
+            if (candidate.closed()) {
+                continue;
+            }
+            final Vector3d center = candidate.pose().position();
+            final double distance = center.distanceSquared(point);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = candidate;
             }
         }
-        return false;
+        return best;
     }
 
     private static void playSound(ServerPlayer player, Vector3dc point, BlockState state,
