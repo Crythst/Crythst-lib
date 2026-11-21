@@ -1,14 +1,17 @@
 package io.mikaple.crythst.integration.fabric.network;
 
 import io.mikaple.crythst.integration.minecraft.BlockVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSyncLimits;
 import io.mikaple.crythst.network.structure.StructureTooLargeException;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
+import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -41,9 +44,9 @@ public final class StructureSnapshotFactory {
         final List<Integer> palette = new ArrayList<>();
         final Map<Integer, Integer> paletteIndex = new HashMap<>();
         final BlockVoxelVolume blockVolume = volume instanceof BlockVoxelVolume candidate ? candidate : null;
-        final int fallbackStateId = blockVolume == null
-                ? Block.getId(Blocks.STONE.defaultBlockState())
-                : -1;
+        final boolean hasSideTableStates = volume instanceof MutableVoxelVolume
+                && StructureBlockStates.size(structure) > 0;
+        final int fallbackStateId = Block.getId(Blocks.STONE.defaultBlockState());
 
         final int sizeX = bounds.sizeX();
         final int sizeY = bounds.sizeY();
@@ -54,9 +57,14 @@ public final class StructureSnapshotFactory {
                     if (!volume.isSolid(x, y, z)) {
                         continue;
                     }
-                    final int stateId = blockVolume == null
+                    final BlockState state = blockVolume != null
+                            ? blockVolume.blockState(x, y, z)
+                            : hasSideTableStates
+                                    ? StructureBlockStates.get(structure, x, y, z)
+                                    : null;
+                    final int stateId = state == null || state.isAir()
                             ? fallbackStateId
-                            : Block.getId(blockVolume.blockState(x, y, z));
+                            : Block.getId(state);
                     Integer index = paletteIndex.get(stateId);
                     if (index == null) {
                         if (palette.size() >= StructureSyncLimits.MAX_PALETTE) {

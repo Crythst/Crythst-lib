@@ -11,7 +11,7 @@ package io.mikaple.crythst.network.structure;
  */
 public final class StructureSyncLimits {
     /** Wire format version. Bump when any payload layout changes. */
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = 2;
 
     /** Maximum number of voxels in one structure snapshot. */
     public static final int MAX_CELLS = 1_048_576;

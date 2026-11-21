@@ -13,12 +13,17 @@ import java.util.List;
 /**
  * Server-to-client full or partial structure snapshot.
  *
- * <p>A full sync is split over {@code batchCount} packets. The first packet has
- * {@code batchIndex == 0} and {@code replaceAll == true}; receiving it makes the
- * client drop its cache before applying the batch. Delta additions use
- * {@code replaceAll == false} and a single batch.</p>
+ * <p>{@code syncId} is a per-player session token. The first packet of a full
+ * sync has {@code batchIndex == 0} and {@code replaceAll == true}; receiving it
+ * makes the client drop its cache, adopt this session and apply the batch.
+ * Delta additions use {@code replaceAll == false}; pose/remove packets from
+ * another session are ignored. This prevents body ids that collide across
+ * dimensions (or stale packets from a previous level) from corrupting the
+ * current view.</p>
  */
 public record StructureSnapshotPayload(
+        long syncId,
+        Identifier dimension,
         List<StructureSnapshot> structures,
         int batchIndex,
         int batchCount,
@@ -32,6 +37,12 @@ public record StructureSnapshotPayload(
             StreamCodec.of(StructureSnapshotPayload::write, StructureSnapshotPayload::read);
 
     public StructureSnapshotPayload {
+        if (syncId < 0L) {
+            throw new IllegalArgumentException("syncId must be non-negative: " + syncId);
+        }
+        if (dimension == null) {
+            throw new IllegalArgumentException("dimension must not be null");
+        }
         structures = List.copyOf(structures);
         if (batchCount < 1 || batchCount > StructureSyncLimits.MAX_BATCHES) {
             throw new IllegalArgumentException("Invalid batch count " + batchCount);
@@ -50,6 +61,8 @@ public record StructureSnapshotPayload(
     }
 
     private static void write(FriendlyByteBuf buf, StructureSnapshotPayload payload) {
+        buf.writeVarLong(payload.syncId());
+        buf.writeIdentifier(payload.dimension());
         buf.writeBoolean(payload.replaceAll());
         buf.writeVarInt(payload.batchIndex());
         buf.writeVarInt(payload.batchCount());
@@ -60,6 +73,11 @@ public record StructureSnapshotPayload(
     }
 
     private static StructureSnapshotPayload read(FriendlyByteBuf buf) {
+        final long syncId = buf.readVarLong();
+        if (syncId < 0L) {
+            throw new DecoderException("Invalid sync id " + syncId);
+        }
+        final Identifier dimension = buf.readIdentifier();
         final boolean replaceAll = buf.readBoolean();
         final int batchIndex = buf.readVarInt();
         final int batchCount = buf.readVarInt();
@@ -78,7 +96,8 @@ public record StructureSnapshotPayload(
             structures.add(StructureSnapshotCodec.read(buf));
         }
         try {
-            return new StructureSnapshotPayload(structures, batchIndex, batchCount, replaceAll);
+            return new StructureSnapshotPayload(
+                    syncId, dimension, structures, batchIndex, batchCount, replaceAll);
         } catch (IllegalArgumentException e) {
             throw new DecoderException("Invalid structure snapshot payload", e);
         }

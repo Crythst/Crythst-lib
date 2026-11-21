@@ -18,9 +18,9 @@ public final class StructureSync {
      * Registers payload codecs, the server request receiver, and the
      * end-of-tick broadcaster. Safe to call once per process.
      *
-     * <p>Registering this after the physics ticker makes the diff see the pose
-     * produced by the current server tick; registering earlier works but sends
-     * poses one tick behind.</p>
+     * <p>The broadcaster registers its tick listener on {@code SERVER_STARTED},
+     * so it always runs after {@code PhysicsTicker}'s end-of-tick listener
+     * regardless of mod-initializer order.</p>
      */
     public static void registerCommon() {
         StructureSyncProtocol.registerPayloads();
@@ -43,5 +43,22 @@ public final class StructureSync {
     @Environment(EnvType.CLIENT)
     public static void requestFullSync() {
         StructureSyncClient.requestFullSync();
+    }
+
+    /** Server-side sync counters, for a debug command/overlay. */
+    public static String serverStatusText() {
+        return StructureSyncServer.statusText();
+    }
+
+    /** Client-side cache/session counters, for a debug command/overlay. */
+    @Environment(EnvType.CLIENT)
+    public static String clientStatusText() {
+        return io.mikaple.crythst.client.network.ClientStructureCache.statusText();
+    }
+
+    /** Logs the client cache state. Useful after a resync or client reload. */
+    @Environment(EnvType.CLIENT)
+    public static void logClientStatus() {
+        StructureSyncClient.logStatus();
     }
 }

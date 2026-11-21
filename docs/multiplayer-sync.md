@@ -1,4 +1,4 @@
-# Multiplayer structure sync (v1)
+# Multiplayer structure sync (v2)
 
 Crythst can mirror server-side physics structures to clients. The server owns the
 authoritative bodies and voxel volumes; clients receive immutable snapshots and
@@ -41,15 +41,19 @@ with `RegistryFriendlyByteBuf` (which extends it).
 ### `StructureSnapshotPayload`
 
 ```text
-boolean   replaceAll          // first packet of a full sync only
-VarInt    batchIndex          // 0-based
-VarInt    batchCount          // >= 1
-VarInt    structureCount
+VarLong    syncId             // fresh per-player session for each full sync
+Identifier dimension          // dimension the structures belong to
+boolean    replaceAll         // first packet of a full sync only
+VarInt     batchIndex         // 0-based
+VarInt     batchCount         // >= 1
+VarInt     structureCount
   repeated StructureSnapshot
 ```
 
 An empty full sync is a single packet with `batchCount = 1`, `batchIndex = 0`,
-`replaceAll = true`, `structureCount = 0`; it clears the client cache.
+`replaceAll = true`, `structureCount = 0`; it clears the client cache and adopts
+the new session/dimension. Delta snapshots, poses and removals must carry the
+same `syncId` and dimension or the client ignores them.
 
 ### `StructureSnapshot`
 
@@ -75,6 +79,7 @@ the palette; empty cells are the single byte `0` in the common case.
 ### `StructurePosePayload`
 
 ```text
+VarLong   syncId
 VarInt    updateCount
   repeated:
     VarLong bodyId
@@ -82,12 +87,14 @@ VarInt    updateCount
     double[4] rotation quaternion
 ```
 
-A client ignores updates for body ids it has not seen.
+A client ignores updates from a stale session and updates for body ids it has
+not seen.
 
 ### `StructureRemovePayload`
 
 ```text
-VarInt  bodyIdCount
+VarLong   syncId
+VarInt    bodyIdCount
 VarLong[] bodyIds
 ```
 
@@ -125,10 +132,10 @@ player is marked unsynchronised and receives a full snapshot on the next tick.
 If a structure becomes unrepresentable after previously being sent, the server
 sends a remove so clients do not keep stale blocks.
 
-**Registration order is a latency choice:** registering structure sync
-*after* `PhysicsTicker.register()` lets the diff read the pose produced by the
-current physics tick. If it is registered earlier, poses are one server tick
-behind; snapshots and removals still work, only moving structures lag slightly.
+The broadcaster registers its `END_SERVER_TICK` listener on
+`ServerLifecycleEvents.SERVER_STARTED`. That happens after every mod
+initializer has run, so the diff always runs after `PhysicsTicker` and reads the
+pose produced by the current physics tick, regardless of initializer order.
 
 ## Payload limits and batching
 
@@ -136,7 +143,7 @@ Constants live in `StructureSyncLimits`.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `PROTOCOL_VERSION` | 1 | bump when layouts change |
+| `PROTOCOL_VERSION` | 2 | bump when layouts change |
 | `MAX_CELLS` | 1,048,576 | maximum voxels in one structure |
 | `MAX_PALETTE` | 4,096 | maximum distinct block states |
 | `MAX_STRUCTURES_PER_BATCH` | 4,096 | structures / removals per packet |
@@ -147,7 +154,7 @@ Constants live in `StructureSyncLimits`.
 
 Snapshots are batched **at structure granularity**: a batch is flushed before
 the next structure would exceed `TARGET_BATCH_BYTES`. There is no intra-structure
-chunking in v1, so a single structure larger than `MAX_STRUCTURE_BYTES` (or
+chunking in v2, so a single structure larger than `MAX_STRUCTURE_BYTES` (or
 larger than `MAX_CELLS`) is skipped and logged by the server instead of
 disconnecting the client. If intra-structure chunking is added later, it should
 extend `StructureSnapshotPayload` with a volume chunk index rather than change
@@ -255,29 +262,53 @@ public void onInitializeClient() {
 `registerPayloads()` is idempotent, so both entrypoints may call through
 `StructureSync` safely.
 
+## Diagnostics
+
+Enable packet-level logging with:
+
+```text
+-Dcrythst.debug.structureSync=true
+```
+
+Status strings are always available without enabling logs:
+
+```java
+StructureSync.serverStatusText(); // levels, tracked/sent counts, sessions, skipped bodies, last error
+StructureSync.clientStatusText(); // structures, revision, syncId, dimension, last batch, stale counts
+StructureSync.logClientStatus();  // logs the client status once
+```
+
+A command or debug overlay can call these directly. They include the counts,
+revision, last batch, dimension and skipped-body diagnostics required to tell
+whether the client is on the same session/dimension as the server.
+
 ## Caveats
 
 - **Block-state registry ids are not portable across versions or mod sets.**
   The palette uses `Block.getId(state)` / `Block.stateById(id)`. Client and
   server must have the same block registry. A future version should send block
   registry names plus property values for cross-version compatibility.
-- **No block entities in v1.** Chests, signs, spawners, etc. render as their
+- **No block entities in v2.** Chests, signs, spawners, etc. render as their
   block state only. Their NBT is not sent. Adding a BE map will bump
   `PROTOCOL_VERSION`.
-- **Non-`BlockVoxelVolume` volumes are sent as stone.** `MutableVoxelVolume` and
-  other gameplay volumes only expose solidity, so every solid cell becomes
-  `Blocks.STONE`. A future extension can add a material/state resolver to
-  `StructureSnapshotFactory`.
-- **Volume-change detection uses object identity.** Mutating a `VoxelVolume` in
-  place without replacing the volume/collider is not detected. Call
+- **Mutable volume states come from the interaction side table.**
+  `MutableVoxelVolume` only exposes solidity, so `StructureSnapshotFactory`
+  consults `StructureBlockStates` first and falls back to `Blocks.STONE` for
+  cells without a recorded state. This matches the singleplayer
+  `StructureBlockSnapshots` producer.
+- **Volume-change detection uses object identity.** `PhysicsStructure.reindex`
+  now installs the replacement volume and rebuilds the collider, both of which
+  the diff observes. Mutating a volume in place *without* reindexing is still
+  not detected and would also leave the physics collider stale; call
   `PhysicsStructure.reindex(...)` (and `LevelPhysics.refreshStructure(...)`)
-  after edits. Note that the current `PhysicsStructure.reindex(newVolume)`
-  rebuilds the collider but keeps its original `volume()` field; if a mutable
-  volume is replaced, the snapshot factory may still read the old grid. Prefer a
-  live `BlockVoxelVolume` until that API is tightened.
-- **Structure ids are per-level, not global.** The client cache holds one
-  dimension at a time. Join, dimension change and explicit requests use
-  `replaceAll` snapshots, which clear the cache before applying.
+  after edits.
+- **Structure ids are per-level, not global.** Each full sync carries a
+  per-player `syncId` plus the dimension. Pose/remove/delta packets from another
+  session are ignored, and the client clears its cache on a client-level
+  dimension change even if the new full sync is delayed.
+- **Structure pose already includes the COM offset.** The client batch renderer
+  maps unshifted voxel coordinates through the wire structure pose; subtracting
+  the wire COM a second time would double-shift the geometry.
 - **Clients without Crythst are skipped.** `ServerPlayNetworking.canSend` gates
   all sends, so a vanilla/other client is unaffected.
 - **The C2S request is not rate-limited.** A malicious client could spam
@@ -285,7 +316,7 @@ public void onInitializeClient() {
   permission check if the server is exposed to untrusted clients.
 - **No compression.** Palettes and VarInt cells keep the common case small, but
   a large heterogeneous structure can approach the cap. Compression can be
-  added as a new payload flag without breaking v1 decoding if negotiated.
+  added as a new payload flag without breaking v2 decoding if negotiated.
 - **One snapshot per changed structure.** Edits during a tick are coalesced at
   the next `END_SERVER_TICK`; intermediate states are never sent.
 

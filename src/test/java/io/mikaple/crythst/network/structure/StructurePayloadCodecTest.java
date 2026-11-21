@@ -7,6 +7,7 @@ import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.Test;
@@ -37,10 +38,13 @@ class StructurePayloadCodecTest {
                 1234.5,
                 new Vector3d(0.25, 1.0, -0.5));
         final StructureSnapshotPayload payload = new StructureSnapshotPayload(
+                1234L, Identifier.fromNamespaceAndPath("minecraft", "overworld"),
                 List.of(snapshot), 0, 1, true);
 
         final StructureSnapshotPayload decoded = roundTrip(StructureSnapshotPayload.STREAM_CODEC, payload);
 
+        assertEquals(1234L, decoded.syncId());
+        assertEquals(Identifier.fromNamespaceAndPath("minecraft", "overworld"), decoded.dimension());
         assertEquals(0, decoded.batchIndex());
         assertEquals(1, decoded.batchCount());
         assertTrue(decoded.replaceAll());
@@ -75,14 +79,18 @@ class StructurePayloadCodecTest {
     void emptyFullSyncRoundTrips() {
         final StructureSnapshotPayload decoded = roundTrip(
                 StructureSnapshotPayload.STREAM_CODEC,
-                new StructureSnapshotPayload(List.of(), 0, 1, true));
+                new StructureSnapshotPayload(9L,
+                        Identifier.fromNamespaceAndPath("minecraft", "the_nether"),
+                        List.of(), 0, 1, true));
+        assertEquals(9L, decoded.syncId());
+        assertEquals(Identifier.fromNamespaceAndPath("minecraft", "the_nether"), decoded.dimension());
         assertTrue(decoded.structures().isEmpty());
         assertTrue(decoded.replaceAll());
     }
 
     @Test
     void posePayloadRoundTrips() {
-        final StructurePosePayload payload = new StructurePosePayload(List.of(
+        final StructurePosePayload payload = new StructurePosePayload(77L, List.of(
                 new StructurePosePayload.PoseUpdate(1L, Transform3d.of(new Vector3d(1, 2, 3))),
                 new StructurePosePayload.PoseUpdate(9001L, Transform3d.of(
                         new Vector3d(-4.5, 0.0, 8.25),
@@ -90,6 +98,7 @@ class StructurePayloadCodecTest {
 
         final StructurePosePayload decoded = roundTrip(StructurePosePayload.STREAM_CODEC, payload);
 
+        assertEquals(77L, decoded.syncId());
         assertEquals(2, decoded.updates().size());
         assertEquals(1L, decoded.updates().get(0).bodyId());
         assertEquals(9001L, decoded.updates().get(1).bodyId());
@@ -101,7 +110,8 @@ class StructurePayloadCodecTest {
     void removePayloadRoundTrips() {
         final StructureRemovePayload decoded = roundTrip(
                 StructureRemovePayload.STREAM_CODEC,
-                new StructureRemovePayload(new long[]{2L, 4L, 9001L}));
+                new StructureRemovePayload(55L, new long[]{2L, 4L, 9001L}));
+        assertEquals(55L, decoded.syncId());
         assertArrayEquals(new long[]{2L, 4L, 9001L}, decoded.bodyIds());
     }
 

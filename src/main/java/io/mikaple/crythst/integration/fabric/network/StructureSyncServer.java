@@ -9,6 +9,7 @@ import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureRequestPayload;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
+import io.mikaple.crythst.network.structure.StructureSyncDebug;
 import io.mikaple.crythst.network.structure.StructureSyncLimits;
 import io.mikaple.crythst.network.structure.StructureSyncProtocol;
 import io.mikaple.crythst.network.structure.StructureTooLargeException;
@@ -20,8 +21,9 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -35,25 +37,45 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Server-side structure broadcaster.
  *
- * <p>The authorititative structure list lives in {@link LevelPhysics}. This
- * class never mutates it; once per server tick it diffs a cheap fingerprint
+ * <p>The authoritative structure list lives in {@link LevelPhysics}. This class
+ * never mutates it; once per server tick it diffs a cheap fingerprint
  * (pose, volume identity, collider identity) and sends snapshots, removals and
  * batched pose updates to players in the same dimension.</p>
  *
- * <p>Registering this after the physics ticker makes the diff read poses from
- * the current tick. Registering it earlier still works but sends poses one
- * server tick behind.</p>
+ * <p>Every full sync assigns a fresh per-player {@code syncId}. All subsequent
+ * pose/removal packets carry that id, so body ids that collide across
+ * dimensions (or stale packets from a previous level) cannot corrupt a client
+ * view.</p>
+ *
+ * <p>The tick listener is registered on {@code SERVER_STARTED}, after every
+ * mod initializer has registered its own listeners. That guarantees this diff
+ * runs after {@code PhysicsTicker}'s end-of-tick physics update and therefore
+ * reads the current pose.</p>
  */
 public final class StructureSyncServer {
     private static final Map<ResourceKey<Level>, LevelState> LEVEL_STATES = new HashMap<>();
     private static final Map<UUID, ResourceKey<Level>> PLAYER_LEVELS = new HashMap<>();
+    private static final Map<UUID, Long> PLAYER_SYNC_IDS = new HashMap<>();
     private static final Set<UUID> SYNCED_PLAYERS = new HashSet<>();
 
+    private static final AtomicLong NEXT_SYNC_ID = new AtomicLong();
+    private static final AtomicBoolean TICK_REGISTERED = new AtomicBoolean();
+
     private static boolean registered;
+    private static long sentSnapshotBatches;
+    private static long sentSnapshotStructures;
+    private static long sentPoseBatches;
+    private static long sentPoseUpdates;
+    private static long sentRemovalBatches;
+    private static long sentRemovals;
+    private static long skippedBodies;
+    private static String lastError = "";
 
     private StructureSyncServer() {
     }
@@ -68,9 +90,18 @@ public final class StructureSyncServer {
                 (payload, context) -> requestFullSync(context.player()));
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> onJoin(handler.getPlayer()));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> onDisconnect(handler.getPlayer()));
-        ServerTickEvents.END_SERVER_TICK.register(StructureSyncServer::tick);
+        // Registered lazily on SERVER_STARTED. Mod initializers have all run by
+        // then, so this END_SERVER_TICK listener is queued after PhysicsTicker.
+        ServerLifecycleEvents.SERVER_STARTED.register(server -> registerTickListener());
         ServerLevelEvents.UNLOAD.register((server, level) -> LEVEL_STATES.remove(level.dimension()));
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> reset());
+    }
+
+    private static void registerTickListener() {
+        if (TICK_REGISTERED.compareAndSet(false, true)) {
+            ServerTickEvents.END_SERVER_TICK.register(StructureSyncServer::tick);
+            StructureSyncDebug.log("server tick listener registered after mod initializers");
+        }
     }
 
     private static void onJoin(ServerPlayer player) {
@@ -92,6 +123,7 @@ public final class StructureSyncServer {
         }
         final UUID id = player.getUUID();
         PLAYER_LEVELS.remove(id);
+        PLAYER_SYNC_IDS.remove(id);
         SYNCED_PLAYERS.remove(id);
     }
 
@@ -119,6 +151,11 @@ public final class StructureSyncServer {
             final List<StructurePosePayload.PoseUpdate> poses = new ArrayList<>();
             diff(physics, state, added, removed, poses);
 
+            if (StructureSyncDebug.enabled() && (!added.isEmpty() || !removed.isEmpty() || !poses.isEmpty())) {
+                StructureSyncDebug.log("tick {} added={} removed={} poses={}",
+                        level.dimension().identifier(), added.size(), removed.size(), poses.size());
+            }
+
             if (players.isEmpty()) {
                 continue;
             }
@@ -127,8 +164,9 @@ public final class StructureSyncServer {
                 final UUID id = player.getUUID();
                 final ResourceKey<Level> previousLevel = PLAYER_LEVELS.put(id, level.dimension());
                 final boolean dimensionChanged = previousLevel != null && !previousLevel.equals(level.dimension());
+                final Long syncId = PLAYER_SYNC_IDS.get(id);
 
-                if (dimensionChanged || !SYNCED_PLAYERS.contains(id)) {
+                if (dimensionChanged || !SYNCED_PLAYERS.contains(id) || syncId == null) {
                     if (sendFullSync(player, physics)) {
                         SYNCED_PLAYERS.add(id);
                     } else {
@@ -139,18 +177,20 @@ public final class StructureSyncServer {
 
                 boolean delivered = true;
                 if (!removed.isEmpty()) {
-                    delivered = sendRemovals(player, removed);
+                    delivered = sendRemovals(player, removed, syncId);
                 }
                 if (delivered && !added.isEmpty()) {
-                    delivered = sendSnapshotBatches(player, added, false);
+                    delivered = sendSnapshotBatches(player, added,
+                            level.dimension().identifier(), syncId, false);
                 }
                 if (delivered && !poses.isEmpty()) {
-                    delivered = sendPoses(player, poses);
+                    delivered = sendPoses(player, poses, syncId);
                 }
                 if (!delivered) {
                     // Force a full resync on the next tick instead of leaving
                     // the client with a partially applied delta.
                     SYNCED_PLAYERS.remove(id);
+                    PLAYER_SYNC_IDS.remove(id);
                 }
             }
         }
@@ -218,9 +258,13 @@ public final class StructureSyncServer {
             out.add(snapshot);
             return true;
         } catch (StructureTooLargeException e) {
+            skippedBodies++;
+            lastError = e.getMessage();
             Crythst.LOGGER.warn("Not syncing structure to clients: {}", e.getMessage());
             return false;
         } catch (RuntimeException e) {
+            skippedBodies++;
+            lastError = "body #" + structure.body().id() + ": " + e;
             Crythst.LOGGER.warn("Could not capture structure body #{} for synchronisation",
                     structure.body().id(), e);
             return false;
@@ -244,6 +288,7 @@ public final class StructureSyncServer {
         try {
             canSend = ServerPlayNetworking.canSend(player, StructureSnapshotPayload.TYPE);
         } catch (RuntimeException e) {
+            lastError = "channel query: " + e;
             Crythst.LOGGER.warn("Could not query structure sync channel for {}", player.getUUID(), e);
             return false;
         }
@@ -252,50 +297,78 @@ public final class StructureSyncServer {
                     player.getUUID());
             return false;
         }
-        return sendSnapshotBatches(player, collect(physics), true);
+
+        final long syncId = NEXT_SYNC_ID.incrementAndGet();
+        final List<StructureSnapshot> snapshots = collect(physics);
+        // Use the physics source level, not the player's current level: during
+        // a dimension transfer the old level may still list the player while
+        // we are sending snapshots for that source world.
+        final Identifier dimension = physics != null
+                ? physics.level().dimension().identifier()
+                : player.level().dimension().identifier();
+        if (!sendSnapshotBatches(player, snapshots, dimension, syncId, true)) {
+            return false;
+        }
+        PLAYER_SYNC_IDS.put(player.getUUID(), syncId);
+        StructureSyncDebug.log("full sync -> {} dimension={} sync={} structures={}",
+                player.getUUID(), dimension, syncId, snapshots.size());
+        return true;
     }
 
     private static boolean sendSnapshotBatches(ServerPlayer player,
                                                List<StructureSnapshot> snapshots,
+                                               Identifier dimension,
+                                               long syncId,
                                                boolean replaceAll) {
         final List<List<StructureSnapshot>> batches;
         try {
             batches = StructureSyncProtocol.batchSnapshots(snapshots);
         } catch (StructureTooLargeException e) {
+            lastError = e.getMessage();
             Crythst.LOGGER.warn("Could not batch structure snapshots: {}", e.getMessage());
             return false;
         }
 
         final int batchCount = batches.size();
         for (int index = 0; index < batchCount; index++) {
+            final List<StructureSnapshot> batch = batches.get(index);
             if (!send(player, new StructureSnapshotPayload(
-                    batches.get(index), index, batchCount, replaceAll && index == 0))) {
+                    syncId, dimension, batch, index, batchCount, replaceAll && index == 0))) {
                 return false;
             }
+            sentSnapshotBatches++;
+            sentSnapshotStructures += batch.size();
         }
         return true;
     }
 
-    private static boolean sendRemovals(ServerPlayer player, List<Long> removed) {
+    private static boolean sendRemovals(ServerPlayer player, List<Long> removed, long syncId) {
         for (int start = 0; start < removed.size(); start += StructureSyncLimits.MAX_STRUCTURES_PER_BATCH) {
             final int end = Math.min(start + StructureSyncLimits.MAX_STRUCTURES_PER_BATCH, removed.size());
             final long[] ids = new long[end - start];
             for (int i = start; i < end; i++) {
                 ids[i - start] = removed.get(i);
             }
-            if (!send(player, new StructureRemovePayload(ids))) {
+            if (!send(player, new StructureRemovePayload(syncId, ids))) {
                 return false;
             }
+            sentRemovalBatches++;
+            sentRemovals += ids.length;
         }
         return true;
     }
 
-    private static boolean sendPoses(ServerPlayer player, List<StructurePosePayload.PoseUpdate> poses) {
+    private static boolean sendPoses(ServerPlayer player,
+                                     List<StructurePosePayload.PoseUpdate> poses,
+                                     long syncId) {
         for (int start = 0; start < poses.size(); start += StructureSyncLimits.MAX_POSE_UPDATES) {
             final int end = Math.min(start + StructureSyncLimits.MAX_POSE_UPDATES, poses.size());
-            if (!send(player, new StructurePosePayload(List.copyOf(poses.subList(start, end))))) {
+            final List<StructurePosePayload.PoseUpdate> batch = List.copyOf(poses.subList(start, end));
+            if (!send(player, new StructurePosePayload(syncId, batch))) {
                 return false;
             }
+            sentPoseBatches++;
+            sentPoseUpdates += batch.size();
         }
         return true;
     }
@@ -305,6 +378,7 @@ public final class StructureSyncServer {
             ServerPlayNetworking.send(player, payload);
             return true;
         } catch (RuntimeException e) {
+            lastError = payload.type().id() + ": " + e;
             Crythst.LOGGER.warn("Could not send structure sync payload {} to {}",
                     payload.type().id(), player.getUUID(), e);
             return false;
@@ -321,11 +395,48 @@ public final class StructureSyncServer {
         return Math.abs(dot) < 1.0 - 1.0e-8;
     }
 
+    /** Human-readable diagnostics for a debug command/overlay. */
+    public static String statusText() {
+        int tracked = 0;
+        for (LevelState state : LEVEL_STATES.values()) {
+            tracked += state.tracked.size();
+        }
+        final StringBuilder text = new StringBuilder(192);
+        text.append("server levels=").append(LEVEL_STATES.size())
+                .append(" tracked=").append(tracked)
+                .append(" syncedPlayers=").append(SYNCED_PLAYERS.size())
+                .append(" sessions=").append(PLAYER_SYNC_IDS.size())
+                .append(" snapshotBatches=").append(sentSnapshotBatches)
+                .append(" snapshotStructures=").append(sentSnapshotStructures)
+                .append(" poseBatches=").append(sentPoseBatches)
+                .append(" poseUpdates=").append(sentPoseUpdates)
+                .append(" removalBatches=").append(sentRemovalBatches)
+                .append(" removals=").append(sentRemovals)
+                .append(" skipped=").append(skippedBodies)
+                .append(" lastError=").append(lastError.isEmpty() ? "none" : lastError);
+        for (Map.Entry<ResourceKey<Level>, LevelState> entry : LEVEL_STATES.entrySet()) {
+            text.append(" [").append(entry.getKey().identifier())
+                    .append(" tracked=").append(entry.getValue().tracked.size())
+                    .append(" sent=").append(entry.getValue().sent.size())
+                    .append(']');
+        }
+        return text.toString();
+    }
+
     /** Clears all per-server state. Called on server stop and useful in tests. */
     public static void reset() {
         LEVEL_STATES.clear();
         PLAYER_LEVELS.clear();
+        PLAYER_SYNC_IDS.clear();
         SYNCED_PLAYERS.clear();
+        sentSnapshotBatches = 0L;
+        sentSnapshotStructures = 0L;
+        sentPoseBatches = 0L;
+        sentPoseUpdates = 0L;
+        sentRemovalBatches = 0L;
+        sentRemovals = 0L;
+        skippedBodies = 0L;
+        lastError = "";
     }
 
     private record TrackedStructure(Transform3d pose, VoxelVolume volume, VoxelColliderData collider) {

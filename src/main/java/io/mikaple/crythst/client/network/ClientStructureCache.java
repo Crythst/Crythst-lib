@@ -4,6 +4,8 @@ import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
+import io.mikaple.crythst.network.structure.StructureSyncDebug;
+import net.minecraft.resources.Identifier;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -16,6 +18,11 @@ import java.util.Map;
  * receiver on the render thread and {@code StructureSyncClient} also wraps the
  * call in {@code Minecraft#execute}, so this is guaranteed in practice.</p>
  *
+ * <p>Each full snapshot establishes a per-player {@code syncId}. Pose and
+ * removal packets from another session are ignored, which protects the cache
+ * from body ids that collide across dimensions or from stale packets that were
+ * queued before a dimension change.</p>
+ *
  * <p>Renderers should call {@link #snapshots()} or {@link #byId()} once per
  * frame/tick and use {@link #revision()} to avoid rebuilding meshes when
  * nothing changed. The cache never touches a server {@code Level}.</p>
@@ -23,29 +30,76 @@ import java.util.Map;
 public final class ClientStructureCache {
     private static volatile Map<Long, ClientStructureSnapshot> snapshots = Map.of();
     private static volatile long revision;
+    private static volatile long activeSyncId;
+    private static volatile Identifier activeDimension;
+    private static volatile int lastBatchIndex = -1;
+    private static volatile int lastBatchCount;
+    private static volatile int lastSnapshotCount;
+    private static volatile long appliedBatches;
+    private static volatile long appliedPoses;
+    private static volatile long appliedRemovals;
+    private static volatile long stalePackets;
+    private static volatile long unknownPoseUpdates;
+    private static volatile long unknownRemovals;
 
     private ClientStructureCache() {
     }
 
-    /** Applies one server snapshot batch. */
-    public static synchronized void apply(StructureSnapshotPayload payload) {
-        final Map<Long, ClientStructureSnapshot> next;
-        if (payload.replaceAll() && payload.firstBatch()) {
-            next = new HashMap<>();
-        } else {
-            next = new HashMap<>(snapshots);
+    /**
+     * Applies one server snapshot batch.
+     *
+     * @return {@code false} when the packet belongs to a stale session
+     */
+    public static synchronized boolean apply(StructureSnapshotPayload payload) {
+        final boolean reset = payload.replaceAll() && payload.firstBatch();
+        if (!reset && payload.syncId() != activeSyncId) {
+            stalePackets++;
+            StructureSyncDebug.log("client ignored snapshot sync={} active={} batch={}/{}",
+                    payload.syncId(), activeSyncId, payload.batchIndex(), payload.batchCount());
+            return false;
         }
+        if (!reset && activeDimension != null && !activeDimension.equals(payload.dimension())) {
+            stalePackets++;
+            StructureSyncDebug.log("client ignored snapshot dimension={} active={} sync={}",
+                    payload.dimension(), activeDimension, payload.syncId());
+            return false;
+        }
+        if (reset) {
+            activeSyncId = payload.syncId();
+            activeDimension = payload.dimension();
+        }
+
+        final Map<Long, ClientStructureSnapshot> next =
+                reset ? new HashMap<>() : new HashMap<>(snapshots);
         for (StructureSnapshot wire : payload.structures()) {
             next.put(wire.bodyId(), ClientStructureSnapshot.fromWire(wire));
         }
         snapshots = Map.copyOf(next);
         revision++;
+        appliedBatches++;
+        lastBatchIndex = payload.batchIndex();
+        lastBatchCount = payload.batchCount();
+        lastSnapshotCount = payload.structures().size();
+        StructureSyncDebug.log("client snapshot sync={} batch={}/{} structures={} total={} replaceAll={}",
+                payload.syncId(), payload.batchIndex(), payload.batchCount(),
+                payload.structures().size(), snapshots.size(), reset);
+        return true;
     }
 
-    /** Applies a batched pose update; unknown body ids are ignored. */
-    public static synchronized void applyPose(StructurePosePayload payload) {
+    /**
+     * Applies a batched pose update; unknown body ids are ignored.
+     *
+     * @return {@code false} when the packet belongs to a stale session
+     */
+    public static synchronized boolean applyPose(StructurePosePayload payload) {
+        if (payload.syncId() != activeSyncId) {
+            stalePackets++;
+            StructureSyncDebug.log("client ignored pose sync={} active={} updates={}",
+                    payload.syncId(), activeSyncId, payload.updates().size());
+            return false;
+        }
         if (payload.updates().isEmpty()) {
-            return;
+            return true;
         }
         final Map<Long, ClientStructureSnapshot> next = new HashMap<>(snapshots);
         boolean changed = false;
@@ -54,30 +108,53 @@ public final class ClientStructureCache {
             if (existing != null) {
                 next.put(update.bodyId(), existing.withPose(update.pose()));
                 changed = true;
+            } else {
+                unknownPoseUpdates++;
             }
         }
         if (changed) {
             snapshots = Map.copyOf(next);
             revision++;
         }
+        appliedPoses++;
+        StructureSyncDebug.log("client pose sync={} updates={} knownChanged={} total={}",
+                payload.syncId(), payload.updates().size(), changed, snapshots.size());
+        return true;
     }
 
-    /** Removes structures by body id. */
-    public static synchronized void applyRemove(StructureRemovePayload payload) {
-        if (payload.bodyIds().length == 0) {
-            return;
+    /**
+     * Removes structures by body id.
+     *
+     * @return {@code false} when the packet belongs to a stale session
+     */
+    public static synchronized boolean applyRemove(StructureRemovePayload payload) {
+        if (payload.syncId() != activeSyncId) {
+            stalePackets++;
+            StructureSyncDebug.log("client ignored remove sync={} active={} ids={}",
+                    payload.syncId(), activeSyncId, payload.bodyIds().length);
+            return false;
+        }
+        final long[] ids = payload.bodyIds();
+        if (ids.length == 0) {
+            return true;
         }
         final Map<Long, ClientStructureSnapshot> next = new HashMap<>(snapshots);
         boolean changed = false;
-        for (long bodyId : payload.bodyIds()) {
+        for (long bodyId : ids) {
             if (next.remove(bodyId) != null) {
                 changed = true;
+            } else {
+                unknownRemovals++;
             }
         }
         if (changed) {
             snapshots = Map.copyOf(next);
             revision++;
         }
+        appliedRemovals++;
+        StructureSyncDebug.log("client remove sync={} ids={} changed={} total={}",
+                payload.syncId(), ids.length, changed, snapshots.size());
+        return true;
     }
 
     public static Collection<ClientStructureSnapshot> snapshots() {
@@ -101,8 +178,39 @@ public final class ClientStructureCache {
         return revision;
     }
 
+    /** Session id established by the latest full snapshot, or 0 before one. */
+    public static long activeSyncId() {
+        return activeSyncId;
+    }
+
+    /** Dimension adopted by the latest full snapshot, or {@code null}. */
+    public static Identifier activeDimension() {
+        return activeDimension;
+    }
+
+    /** Human-readable diagnostics for a debug command/overlay. */
+    public static String statusText() {
+        return "client structures=" + snapshots.size()
+                + " revision=" + revision
+                + " syncId=" + activeSyncId
+                + " dimension=" + (activeDimension == null ? "none" : activeDimension)
+                + " lastBatch=" + lastBatchIndex + "/" + lastBatchCount
+                + " lastBatchStructures=" + lastSnapshotCount
+                + " batches=" + appliedBatches
+                + " poses=" + appliedPoses
+                + " removals=" + appliedRemovals
+                + " stale=" + stalePackets
+                + " unknownPoseIds=" + unknownPoseUpdates
+                + " unknownRemovalIds=" + unknownRemovals;
+    }
+
     public static synchronized void clear() {
         snapshots = Map.of();
+        activeSyncId = 0L;
+        activeDimension = null;
+        lastBatchIndex = -1;
+        lastBatchCount = 0;
+        lastSnapshotCount = 0;
         revision++;
     }
 }
