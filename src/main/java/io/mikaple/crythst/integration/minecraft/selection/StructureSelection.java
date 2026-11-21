@@ -64,7 +64,7 @@ public final class StructureSelection {
             return vanilla;
         }
         final StructureBlockHitResult structure = StructureRaycaster.nearest(
-                views, context.getFrom(), context.getTo());
+                StructureSelectionIgnore.filterIfActive(views), context.getFrom(), context.getTo());
         if (structure == null) {
             return vanilla;
         }
@@ -83,7 +83,7 @@ public final class StructureSelection {
      */
     public static @Nullable StructureBlockHitResult raycast(
             Iterable<? extends StructureVoxelView> views, Vec3 from, Vec3 to) {
-        return StructureRaycaster.nearest(views, from, to);
+        return StructureRaycaster.nearest(StructureSelectionIgnore.filterIfActive(views), from, to);
     }
 
     /**
@@ -92,7 +92,8 @@ public final class StructureSelection {
     public static @Nullable StructureBlockHitResult raycast(
             Iterable<? extends StructureVoxelView> views, Vec3 from,
             org.joml.Vector3dc direction, double reach) {
-        return StructureRaycaster.nearest(views, from, direction, reach);
+        return StructureRaycaster.nearest(
+                StructureSelectionIgnore.filterIfActive(views), from, direction, reach);
     }
 
     /**

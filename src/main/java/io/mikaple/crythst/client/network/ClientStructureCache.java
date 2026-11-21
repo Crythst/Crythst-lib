@@ -228,6 +228,21 @@ public final class ClientStructureCache {
         return POSE_TIMELINES.size();
     }
 
+    /**
+     * Smoothed publish interval for a body's pose timeline, in seconds.
+     *
+     * <p>Used by the public client pose API to derive a finite-difference
+     * velocity without exposing the timeline itself. Returns the 20 TPS
+     * default when no timeline exists yet.</p>
+     */
+    public static double interpolatedIntervalSeconds(long bodyId) {
+        final PoseTimeline timeline = POSE_TIMELINES.get(bodyId);
+        if (timeline == null) {
+            return 0.05;
+        }
+        return Math.max(0.05, timeline.delayNanos() / 1.0e9);
+    }
+
     private static PoseTimeline timeline(long bodyId) {
         return POSE_TIMELINES.computeIfAbsent(bodyId, ignored -> new PoseTimeline());
     }
