@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.collision;
 
 import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
+import io.mikaple.crythst.integration.minecraft.entity.riding.EntityStructureRidingMath;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import org.joml.Vector3d;
@@ -283,6 +284,95 @@ public final class StructureMotionSolver {
             }
         }
         return result;
+    }
+
+    /**
+     * Restores the horizontal part of a player's intended motion when vanilla
+     * sneak edge-protection removed it because it cannot see a structure.
+     *
+     * <p>{@code Player.maybeBackOffFromEdge} asks {@code level.noCollision}
+     * whether the space under the next position is empty. Physics structures
+     * are not vanilla blocks, so above a structure floor that call reports a
+     * fall and a crouched player's whole horizontal step is reduced to zero.
+     * When the structure really does support the target footprint, the
+     * original step is safe and must be kept; otherwise (a real structure edge)
+     * vanilla's truncation remains in force.</p>
+     *
+     * @param box          entity box at the start of the move, after any sneak
+     *                     height change
+     * @param clippedMotion motion after vanilla edge protection
+     * @param intendedMotion entity delta movement before edge protection
+     * @param maxDownStep  vanilla max up-step used as the support probe depth
+     * @param source       structure collision source, or {@code null}
+     * @return the motion the entity should use for structure collision
+     */
+    public static Vector3d restoreSneakMotion(Aabb box, Vector3dc clippedMotion,
+                                              Vector3dc intendedMotion, double maxDownStep,
+                                              StructureCollisionSource source) {
+        final Vector3d clipped = new Vector3d(clippedMotion);
+        if (box == null || intendedMotion == null || source == null) {
+            return clipped;
+        }
+        final double intendedX = intendedMotion.x();
+        final double intendedZ = intendedMotion.z();
+        if (intendedX * intendedX + intendedZ * intendedZ < 1.0e-12) {
+            return clipped;
+        }
+
+        // Never enlarge motion along an axis; only put back a component that
+        // vanilla shortened while keeping the same direction.
+        if (Math.abs(clipped.x) > Math.abs(intendedX) + 1.0e-9
+                || Math.abs(clipped.z) > Math.abs(intendedZ) + 1.0e-9) {
+            return clipped;
+        }
+        if (Math.signum(intendedX) * Math.signum(clipped.x) < 0.0
+                || Math.signum(intendedZ) * Math.signum(clipped.z) < 0.0) {
+            return clipped;
+        }
+
+        final double restoredX = Math.abs(intendedX) > Math.abs(clipped.x) + 1.0e-9
+                ? intendedX : clipped.x;
+        final double restoredZ = Math.abs(intendedZ) > Math.abs(clipped.z) + 1.0e-9
+                ? intendedZ : clipped.z;
+        if (restoredX == clipped.x && restoredZ == clipped.z) {
+            return clipped;
+        }
+        if (!hasSupportAt(box, restoredX, restoredZ, maxDownStep, source)) {
+            return clipped;
+        }
+        return new Vector3d(restoredX, clipped.y, restoredZ);
+    }
+
+    /**
+     * Whether moving the entity footprint by {@code (deltaX, deltaZ)} leaves a
+     * structure top no more than {@code maxDown} below the current feet.
+     * Mirrors vanilla's "is there ground under the next position" edge check,
+     * but reads structure colliders instead of world blocks.
+     */
+    public static boolean hasSupportAt(Aabb box, double deltaX, double deltaZ,
+                                       double maxDown, StructureCollisionSource source) {
+        if (box == null || source == null || !(maxDown > 0.0)) {
+            return false;
+        }
+        final Vector3d size = box.size();
+        final double halfX = size.x * 0.5;
+        final double halfZ = size.z * 0.5;
+        final Vector3d center = box.center();
+        final Vector3d feet = new Vector3d(
+                center.x + deltaX, box.min().y, center.z + deltaZ);
+        final Aabb query = box.offset(new Vector3d(deltaX, -maxDown, deltaZ)).expand(0.02);
+        final List<StructureCollisionBox> candidates = source.candidates(query);
+        for (StructureCollisionBox structure : candidates) {
+            if (structure.isEmpty()) {
+                continue;
+            }
+            if (EntityStructureRidingMath.findSupport(
+                    structure.pose(), structure.boxes(), structure.blockScale(),
+                    feet, halfX, halfZ, maxDown, MAX_BOXES_PER_STRUCTURE) != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Substep count used for one motion. Exposed for tests and diagnostics. */

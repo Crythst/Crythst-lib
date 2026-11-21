@@ -1,37 +1,40 @@
 package io.mikaple.crythst.integration.minecraft.player;
 
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.config.CrythstConfig;
-import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.OrientedBox;
-import io.mikaple.crythst.math.Transform3d;
-import io.mikaple.crythst.physics.structure.PhysicsStructure;
-import io.mikaple.crythst.physics.voxel.VoxelBox;
-import io.mikaple.crythst.physics.voxel.VoxelColliderData;
-import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
-import org.joml.Quaterniond;
 import org.joml.Vector3d;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
- * Post-move collision correction for players with non-default gravity.
+ * Post-move terrain correction for players with non-default gravity.
  *
- * <p>Vanilla movement still predicts a Y-up AABB. This coordinator therefore
- * runs at the end of the player tick, builds the player's {@link PlayerObb},
- * finds the shallowest penetration against nearby terrain and physics
- * structures, and moves the player out along the minimum translation vector.
- * It is a correction pass, not a replacement for vanilla's swept movement.</p>
+ * <p>Vanilla movement always predicts a Y-up AABB. When gravity is rotated the
+ * actual body volume is an OBB whose local {@code +Y} follows gravity, so the
+ * vanilla box can leave part of the body inside terrain. This coordinator runs
+ * at the end of the player tick, builds that OBB around the vanilla AABB centre
+ * and moves the player out along the minimum translation vector.</p>
  *
- * <p>The same code runs on the integrated client and the dedicated server:
- * client-side it provides local prediction against terrain; server-side it also
- * checks Crythst's physics structures. On a server the corrected position is
- * sent with {@code ServerPlayer.connection.teleport}, so a strongly divergent
- * client prediction can rubber-band. This is documented in
- * {@code docs/player-obb-collision.md}.</p>
+ * <p>The pass is deliberately terrain-only. Physics structures already take
+ * part in vanilla {@code Entity.move} through {@code EntityStructureCollision},
+ * and resolving them again with this post-tick box would double-resolve floors
+ * and make crouching feel sticky.</p>
+ *
+ * <p>Both sides run the same code. No teleport packet is sent for a contact:
+ * small corrections are applied locally on the client and server, which keeps
+ * the client's prediction and the server's authoritative position in sync
+ * without wiping delta movement every tick.</p>
  */
 public final class PlayerObbCollision {
     /** More than a few contacts can be chained (corner + floor + wall). */
@@ -45,6 +48,31 @@ public final class PlayerObbCollision {
 
     /** Broad-phase padding around the player OBB. */
     private static final double BROADPHASE_MARGIN = 0.25;
+
+    /** A correction deeper than this is applied fully instead of softly. */
+    private static final double DEEP_PUSH = 0.25;
+
+    /** Contact normals within this angle of gravity-up are support contacts. */
+    private static final double SUPPORT_DOT = 0.55;
+
+    /** Base depth range in which a support exit wins over a shallower wall. */
+    private static final double SUPPORT_LIMIT = 0.6;
+
+    /** Support depth never grows beyond this, even for a long fall. */
+    private static final double MAX_SUPPORT_LIMIT = 2.0;
+
+    /** Minimum travelled distance worth a swept check, in metres. */
+    private static final double SWEEP_MIN_DISTANCE = 0.3;
+
+    /** Sample count used between the previous and current player position. */
+    private static final int SWEEP_SAMPLES = 4;
+
+    /** Largest snap-back a swept check may apply. */
+    private static final double MAX_SWEEP_CORRECTION = 2.0;
+
+    /** Debug output is limited to one line per player per second. */
+    private static final long DEBUG_INTERVAL_NANOS = 1_000_000_000L;
+    private static final Map<UUID, Long> LAST_DEBUG_NANOS = new ConcurrentHashMap<>();
 
     private PlayerObbCollision() {
     }
@@ -81,16 +109,38 @@ public final class PlayerObbCollision {
         }
 
         final Vector3d total = new Vector3d();
+        final List<Vector3d> contactNormals = new ArrayList<>(4);
+
+        // A fast fall can move the rotated OBB completely past a thin ledge
+        // between ticks. Vanilla only swept the Y-up AABB, so recover the first
+        // grazing sample before resolving the current position.
+        final OrientedBox currentBox = PlayerObb.obb(player, up);
+        if (findPushAt(player, currentBox, up) == null) {
+            final Vector3d swept = sweptCorrection(player, currentBox, up);
+            if (swept != null) {
+                player.setPos(player.getX() + swept.x,
+                        player.getY() + swept.y,
+                        player.getZ() + swept.z);
+                total.add(swept);
+                addContact(contactNormals, new Vector3d(swept).normalize());
+            }
+        }
+
         for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
             final Vector3d push = findPush(player, up);
             if (push == null || push.lengthSquared() < MIN_PUSH * MIN_PUSH) {
                 break;
             }
 
-            final Vector3d delta = new Vector3d(push).mul(strength);
-            final double length = delta.length();
-            if (length > MAX_PUSH_PER_ITERATION) {
-                delta.mul(MAX_PUSH_PER_ITERATION / length);
+            // Use the configured softness for shallow contacts, but separate a
+            // genuinely embedded player in one pass. Capping still happens so a
+            // corrupted collider cannot fling the body.
+            final double length = push.length();
+            final double factor = length > DEEP_PUSH ? 1.0 : strength;
+            final Vector3d delta = new Vector3d(push).mul(factor);
+            final double deltaLength = delta.length();
+            if (deltaLength > MAX_PUSH_PER_ITERATION) {
+                delta.mul(MAX_PUSH_PER_ITERATION / deltaLength);
             }
             player.setPos(
                     player.getX() + delta.x,
@@ -98,61 +148,52 @@ public final class PlayerObbCollision {
                     player.getZ() + delta.z
             );
             total.add(delta);
+            addContact(contactNormals, new Vector3d(push).normalize());
         }
 
         if (total.lengthSquared() < MIN_PUSH * MIN_PUSH) {
             return;
         }
 
-        // Remove the component of velocity that still points into the surface.
-        // Vanilla gravity will add it again next tick, but the position
-        // correction stops it from accumulating until the player sinks.
-        final Vector3d outward = new Vector3d(total).normalize();
+        // Remove only the components that point into the surfaces. Projecting
+        // against every contact keeps tangential walking/sneaking velocity.
         final Vec3 motion = player.getDeltaMovement();
-        final double intoSurface = motion.x * outward.x
-                + motion.y * outward.y
-                + motion.z * outward.z;
-        if (intoSurface < 0.0) {
-            player.setDeltaMovement(
-                    motion.x - outward.x * intoSurface,
-                    motion.y - outward.y * intoSurface,
-                    motion.z - outward.z * intoSurface
-            );
+        final Vector3d filtered = new Vector3d(motion.x, motion.y, motion.z);
+        for (Vector3d normal : contactNormals) {
+            final double intoSurface = filtered.dot(normal);
+            if (intoSurface < 0.0) {
+                filtered.fma(-intoSurface, normal);
+            }
+        }
+        if (filtered.x != motion.x || filtered.y != motion.y || filtered.z != motion.z) {
+            player.setDeltaMovement(filtered.x, filtered.y, filtered.z);
         }
 
-        // Small corrections are already applied by the client's own tick
-        // predictor. A teleport packet wipes delta movement, which makes
-        // sneaking/walking feel glued, so only large corrections (a real
-        // penetration or a desync) are forced from the server.
-        if (player instanceof ServerPlayer serverPlayer && serverPlayer.connection != null
-                && total.lengthSquared() > 0.5 * 0.5) {
-            serverPlayer.connection.teleport(
-                    serverPlayer.getX(),
-                    serverPlayer.getY(),
-                    serverPlayer.getZ(),
-                    serverPlayer.getYRot(),
-                    serverPlayer.getXRot()
-            );
-        }
+        // No ServerPlayer.connection.teleport: a contact correction must not
+        // erase the client's predicted movement. The client runs this same
+        // terrain pass, so both sides converge without a packet.
+        logDebug(player, up, PlayerObb.obb(player, up), total);
     }
 
     /**
-     * Finds the shallowest penetration against all local obstacles.
+     * Finds the shallowest terrain penetration for the rotated player box.
      *
      * @return a world-space push vector, or {@code null} when free
      */
     private static Vector3d findPush(Player player, Vector3d up) {
-        final OrientedBox box = PlayerObb.obb(player, up);
+        return findPushAt(player, PlayerObb.obb(player, up), up);
+    }
+
+    private static Vector3d findPushAt(Player player, OrientedBox box, Vector3d up) {
         final Aabb broad = box.toAabb().expand(BROADPHASE_MARGIN);
         final Level level = player.level();
-
-        Vector3d best = null;
-        double bestLength = Double.POSITIVE_INFINITY;
 
         final net.minecraft.world.phys.AABB query = new net.minecraft.world.phys.AABB(
                 broad.min().x, broad.min().y, broad.min().z,
                 broad.max().x, broad.max().y, broad.max().z
         );
+
+        final List<Vector3d> pushes = new ArrayList<>(4);
         for (VoxelShape shape : level.getBlockCollisions(player, query)) {
             if (shape.isEmpty()) {
                 continue;
@@ -163,74 +204,155 @@ public final class PlayerObbCollision {
                         new Vector3d(raw.maxX, raw.maxY, raw.maxZ)
                 );
                 final Vector3d push = PlayerObb.penetration(box, obstacle);
-                final double length = lengthSquared(push);
-                if (push != null && length < bestLength) {
-                    best = push;
-                    bestLength = length;
+                if (push != null && push.lengthSquared() >= MIN_PUSH * MIN_PUSH) {
+                    pushes.add(push);
                 }
             }
         }
 
-        if (player instanceof ServerPlayer serverPlayer) {
-            final LevelPhysics physics = MinecraftPhysics.getIfPresent(serverPlayer.level());
-            if (physics != null) {
-                for (PhysicsStructure structure : physics.structures()) {
-                    if (structure.closed() || !structure.aabb().intersects(broad)) {
-                        continue;
-                    }
-                    final Vector3d push = structurePenetration(box, structure);
-                    final double length = lengthSquared(push);
-                    if (push != null && length < bestLength) {
-                        best = push;
-                        bestLength = length;
-                    }
-                }
-            }
-        }
-
-        return best;
+        final Vec3 motion = player.getDeltaMovement();
+        final double verticalSpeed = motion.x * up.x + motion.y * up.y + motion.z * up.z;
+        final boolean preferSupport = player.onGround() || verticalSpeed <= 0.0;
+        final double supportLimit = Math.min(MAX_SUPPORT_LIMIT,
+                SUPPORT_LIMIT + Math.max(0.0, -verticalSpeed));
+        return selectPush(pushes, up, preferSupport, supportLimit);
     }
 
     /**
-     * Tests the player box against every merged voxel box of one structure.
+     * Chooses which penetration to resolve. A support exit (normal close to
+     * gravity-up) wins over a shallower sideways push while the player is
+     * grounded or descending, mirroring the movement structure solver. Without
+     * this, standing on a floor with rotated gravity can be treated as a wall
+     * contact and shove the player sideways.
+     *
+     * <p>Package-visible for pure unit tests.</p>
      */
-    private static Vector3d structurePenetration(OrientedBox playerBox, PhysicsStructure structure) {
-        final Transform3d pose = structure.pose();
-        final Quaterniond rotation = pose.rotation();
-        final VoxelColliderData collider = structure.collider();
-        final double scale = structure.blockScale();
-
+    static Vector3d selectPush(List<Vector3d> pushes, Vector3d up,
+                               boolean preferSupport, double supportLimit) {
         Vector3d best = null;
         double bestLength = Double.POSITIVE_INFINITY;
+        Vector3d support = null;
+        double supportLength = Double.POSITIVE_INFINITY;
 
-        for (VoxelBox voxel : collider.boxes()) {
-            // structure.pose() maps unshifted voxel coordinates. Do not
-            // subtract the centre of mass again: that is a body-pose local
-            // convention and would shift every box by -R*COM.
-            final Vector3d localCenter = new Vector3d(
-                    voxel.minX() + voxel.sizeX() * 0.5,
-                    voxel.minY() + voxel.sizeY() * 0.5,
-                    voxel.minZ() + voxel.sizeZ() * 0.5
-            ).mul(scale);
-            final Vector3d worldCenter = pose.transformPoint(localCenter);
-            final Vector3d halfExtents = new Vector3d(
-                    voxel.sizeX(), voxel.sizeY(), voxel.sizeZ()
-            ).mul(scale * 0.5);
-
-            final OrientedBox obstacle = new OrientedBox(worldCenter, halfExtents, rotation);
-            final Vector3d push = PlayerObb.penetration(playerBox, obstacle);
-            final double length = lengthSquared(push);
-            if (push != null && length < bestLength) {
-                best = push;
+        for (Vector3d push : pushes) {
+            if (push == null) {
+                continue;
+            }
+            final double lengthSquared = push.lengthSquared();
+            if (lengthSquared < MIN_PUSH * MIN_PUSH) {
+                continue;
+            }
+            final double length = Math.sqrt(lengthSquared);
+            final double alignment = push.dot(up) / length;
+            if (preferSupport && alignment > SUPPORT_DOT && length <= supportLimit
+                    && length < supportLength) {
+                support = new Vector3d(push);
+                supportLength = length;
+            }
+            if (length < bestLength) {
+                best = new Vector3d(push);
                 bestLength = length;
             }
         }
-
-        return best;
+        return support != null ? support : best;
     }
 
-    private static double lengthSquared(Vector3d vector) {
-        return vector == null ? Double.POSITIVE_INFINITY : vector.lengthSquared();
+    /**
+     * Sweeps the rotated OBB between the previous and current tick positions.
+     * Only used when the current box is already clear, i.e. the Y-up vanilla
+     * sweep let the rotated body pass through terrain.
+     */
+    private static Vector3d sweptCorrection(Player player, OrientedBox currentBox, Vector3d up) {
+        final Vec3 previous = player.oldPosition();
+        final Vec3 current = player.position();
+        final double dx = current.x - previous.x;
+        final double dy = current.y - previous.y;
+        final double dz = current.z - previous.z;
+        if (dx * dx + dy * dy + dz * dz < SWEEP_MIN_DISTANCE * SWEEP_MIN_DISTANCE) {
+            return null;
+        }
+
+        final double width = player.getBbWidth();
+        final double height = player.getBbHeight();
+
+        // If the old position was already embedded, this tick is a recovery,
+        // not a tunnelling event. Do not drag the player further backwards.
+        final OrientedBox previousBox = PlayerObb.box(
+                previous.x, previous.y, previous.z, width, height, up);
+        if (findPushAt(player, previousBox, up) != null) {
+            return null;
+        }
+
+        for (int sample = 1; sample < SWEEP_SAMPLES; sample++) {
+            final double t = (double) sample / SWEEP_SAMPLES;
+            final OrientedBox sampleBox = PlayerObb.box(
+                    previous.x + dx * t,
+                    previous.y + dy * t,
+                    previous.z + dz * t,
+                    width, height, up);
+            final Vector3d hit = findPushAt(player, sampleBox, up);
+            if (hit == null) {
+                continue;
+            }
+
+            // Move from the current centre to the first sampled contact plus
+            // its separation vector. That is the earliest position vanilla's
+            // Y-up sweep should have stopped at.
+            final Vector3d target = sampleBox.center().add(hit);
+            final Vector3d correction = target.sub(currentBox.center());
+            if (correction.lengthSquared() > MAX_SWEEP_CORRECTION * MAX_SWEEP_CORRECTION) {
+                return null;
+            }
+            return correction;
+        }
+        return null;
+    }
+
+    private static void addContact(List<Vector3d> contacts, Vector3d normal) {
+        for (Vector3d existing : contacts) {
+            if (existing.dot(normal) > 0.9999) {
+                return;
+            }
+        }
+        contacts.add(normal);
+    }
+
+    private static void logDebug(Player player, Vector3d up, OrientedBox box, Vector3d correction) {
+        final CrythstConfig config = MinecraftPhysics.config();
+        if (config == null || !config.debug) {
+            return;
+        }
+        final long now = System.nanoTime();
+        final UUID id = player.getUUID();
+        final Long previous = LAST_DEBUG_NANOS.get(id);
+        if (previous != null && now - previous < DEBUG_INTERVAL_NANOS) {
+            return;
+        }
+        LAST_DEBUG_NANOS.put(id, now);
+
+        final Vec3 position = player.position();
+        final Aabb aabb = new Aabb(
+                new Vector3d(player.getBoundingBox().minX, player.getBoundingBox().minY,
+                        player.getBoundingBox().minZ),
+                new Vector3d(player.getBoundingBox().maxX, player.getBoundingBox().maxY,
+                        player.getBoundingBox().maxZ)
+        );
+        final Vector3d anchor = new Vector3d(
+                position.x, position.y + player.getBbHeight() * 0.5, position.z);
+        Crythst.LOGGER.debug(
+                "playerObb side={} up=({},{},{}) position=({},{},{}) anchor=({},{},{}) aabb=[{},{}] obbCenter=({},{},{}) correction=({},{},{}) length={}",
+                player.level().isClientSide() ? "client" : "server",
+                fmt(up.x), fmt(up.y), fmt(up.z),
+                fmt(position.x), fmt(position.y), fmt(position.z),
+                fmt(anchor.x), fmt(anchor.y), fmt(anchor.z),
+                aabb.min(), aabb.max(),
+                fmt(box.center().x), fmt(box.center().y), fmt(box.center().z),
+                fmt(correction.x), fmt(correction.y), fmt(correction.z),
+                fmt(correction.length()));
+    }
+
+    private static String fmt(double value) {
+        return String.format(java.util.Locale.ROOT, "%.4f", value);
     }
 
     /**
@@ -240,5 +362,48 @@ public final class PlayerObbCollision {
     public static OrientedBox currentBox(Player player) {
         final Vector3d up = PlayerObb.upOrNull(player);
         return up == null ? null : PlayerObb.obb(player, up);
+    }
+
+    /**
+     * Diagnostic snapshot for a debug command or log. The correction is the
+     * current one-iteration push, not a position delta already applied.
+     */
+    public static DebugInfo debug(Player player) {
+        final Vector3d up = PlayerObb.upOrNull(player);
+        if (up == null) {
+            return null;
+        }
+        final OrientedBox box = PlayerObb.obb(player, up);
+        final Vector3d push = findPushAt(player, box, up);
+        final Vec3 position = player.position();
+        return new DebugInfo(
+                up,
+                new Vector3d(position.x,
+                        position.y + player.getBbHeight() * 0.5,
+                        position.z),
+                new Aabb(
+                        new Vector3d(player.getBoundingBox().minX, player.getBoundingBox().minY,
+                                player.getBoundingBox().minZ),
+                        new Vector3d(player.getBoundingBox().maxX, player.getBoundingBox().maxY,
+                                player.getBoundingBox().maxZ)
+                ),
+                box.center(),
+                push == null ? null : new Vector3d(push).normalize(),
+                push == null ? 0.0 : push.length(),
+                push == null ? new Vector3d() : push
+        );
+    }
+
+    /** Debug view of the rotated terrain correction. */
+    public record DebugInfo(Vector3d up, Vector3d anchor, Aabb playerAabb,
+                            Vector3d obbCenter, Vector3d penetrationNormal,
+                            double penetrationDepth, Vector3d correction) {
+        public DebugInfo {
+            up = new Vector3d(up);
+            anchor = new Vector3d(anchor);
+            obbCenter = new Vector3d(obbCenter);
+            penetrationNormal = penetrationNormal == null ? null : new Vector3d(penetrationNormal);
+            correction = new Vector3d(correction);
+        }
     }
 }

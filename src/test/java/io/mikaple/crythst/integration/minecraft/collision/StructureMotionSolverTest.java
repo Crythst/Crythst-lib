@@ -301,4 +301,101 @@ class StructureMotionSolverTest {
                 StructureMotionSolver.substeps(new Vector3d(10.0, 0.0, 0.0), false));
         assertNotNull(StructureMotionSolver.substeps(new Vector3d(0.02, 0.0, 0.0), false));
     }
+
+    @Test
+    void crouchedPlayerSlidingOnAFloorKeepsHorizontalMotion() {
+        final StructureCollisionSource floor = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 8, 1, 8)), 1.0);
+        // Sneaking height is 1.5 instead of 1.8; the feet stay on the floor.
+        final Aabb crouched = entityBox(1.0, 1.0, 1.0, 1.6, 2.5, 1.6);
+        final StructureMotionSolver.Result result = solve(
+                crouched, new Vector3d(0.12, -0.08, 0.0), true, 0.6, floor);
+
+        assertTrue(result.touched());
+        assertTrue(result.support(), "crouched feet must still find the floor: " + result);
+        assertTrue(result.contacts().get(0).normal().y > 0.99);
+        assertEquals(0.12, result.motion().x, 1.0e-6,
+                "support must not cancel horizontal walking while crouched");
+        assertEquals(0.0, result.motion().z, 1.0e-6);
+        assertTrue(Math.abs(result.motion().y) < 0.02,
+                "floor contact should only cancel the downward step: " + result.motion());
+    }
+
+    @Test
+    void crouchedDiagonalWalkingPreservesBothTangentialAxes() {
+        final StructureCollisionSource floor = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 8, 1, 8)), 1.0);
+        final Aabb crouched = entityBox(2.0, 1.0, 2.0, 2.6, 2.5, 2.6);
+        final StructureMotionSolver.Result result = solve(
+                crouched, new Vector3d(0.09, -0.08, 0.07), true, 0.6, floor);
+
+        assertTrue(result.support());
+        assertEquals(0.09, result.motion().x, 1.0e-6);
+        assertEquals(0.07, result.motion().z, 1.0e-6);
+    }
+
+    @Test
+    void sneakEdgeProtectionIsRestoredWhenTheStructureSupportsTheTarget() {
+        final StructureCollisionSource floor = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 8, 1, 8)), 1.0);
+        final Aabb crouched = entityBox(2.0, 1.0, 2.0, 2.6, 2.5, 2.6);
+        final Vector3d clipped = new Vector3d(0.0, -0.08, 0.0);
+        final Vector3d intended = new Vector3d(0.15, -0.08, 0.10);
+
+        final Vector3d restored = StructureMotionSolver.restoreSneakMotion(
+                crouched, clipped, intended, 0.6, floor);
+
+        assertEquals(0.15, restored.x, 1.0e-9);
+        assertEquals(0.10, restored.z, 1.0e-9);
+        assertEquals(-0.08, restored.y, 1.0e-9);
+    }
+
+    @Test
+    void sneakEdgeProtectionStillStopsAtARealStructureEdge() {
+        final StructureCollisionSource smallFloor = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 1, 1)), 1.0);
+        // Most of the crouched footprint is past the +X edge of the floor.
+        final Aabb crouched = entityBox(0.8, 1.0, 0.2, 1.4, 2.5, 0.8);
+        final Vector3d clipped = new Vector3d(0.0, -0.08, 0.0);
+        final Vector3d intended = new Vector3d(0.20, -0.08, 0.0);
+
+        final Vector3d restored = StructureMotionSolver.restoreSneakMotion(
+                crouched, clipped, intended, 0.6, smallFloor);
+
+        assertEquals(0.0, restored.x, 1.0e-9,
+                "without support the vanilla edge protection must remain");
+        assertEquals(-0.08, restored.y, 1.0e-9);
+    }
+
+    @Test
+    void crouchedPlayerOnAMovingPlatformKeepsWalkAndPlatformMotion() {
+        final double platformStep = 0.05;
+        final double walkStep = 0.08;
+        Aabb crouched = entityBox(2.0, 1.0, 2.0, 2.6, 2.5, 2.6);
+        double playerX = 2.0;
+        double playerY = 1.0;
+
+        for (int tick = 0; tick < 20; tick++) {
+            final Transform3d pose = Transform3d.of(
+                    new Vector3d(tick * platformStep, 0.0, 0.0));
+            final StructureCollisionSource moving = source(pose,
+                    List.of(box(0, 0, 0, 12, 1, 12)), 1.0);
+            // The riding pass adds the platform's tick delta to the player's
+            // velocity; the crouched foot box still gets the walk input.
+            final Vector3d motion = new Vector3d(platformStep + walkStep, -0.08, 0.0);
+            final StructureMotionSolver.Result result = solve(
+                    crouched, motion, true, 0.6, moving);
+
+            assertTrue(result.support(), "moving platform must stay support");
+            assertEquals(platformStep + walkStep, result.motion().x, 1.0e-6,
+                    "platform carry and crouched walking must both survive");
+            playerX += result.motion().x;
+            playerY += result.motion().y;
+            crouched = entityBox(playerX, playerY, 2.0,
+                    playerX + 0.6, playerY + 1.5, 2.6);
+        }
+
+        assertEquals(2.0 + 20 * (platformStep + walkStep), playerX, 1.0e-6);
+        assertEquals(1.0, playerY, 0.02, "crouched platform support must not sink");
+    }
 }

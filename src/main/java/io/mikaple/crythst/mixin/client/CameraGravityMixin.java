@@ -9,13 +9,13 @@ import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Quaterniond;
-import org.joml.Vector3d;
 import org.joml.Quaternionf;
+import org.joml.Vector3d;
 import org.joml.Vector3f;
 import org.joml.Vector3fc;
 import org.spongepowered.asm.mixin.Mixin;
@@ -29,17 +29,29 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * Rotates the extracted camera into the player's gravity frame.
  *
  * <p>Vanilla builds the camera orientation {@code R} from the player's yaw and
- * pitch and stores it in {@link CameraRenderState#orientation}. Its local up is
- * world up. When the player has directional gravity we left-multiply by the
- * quaternion {@code Q} that maps world up to the player's up, so the camera's
- * whole basis is rotated into the gravity frame:</p>
+ * pitch and stores it in {@link CameraRenderState#orientation}. Its view
+ * direction is {@code R * (0,0,-1)} and its reference up is
+ * {@code R * (0,1,0)}. With directional gravity we rebuild the state from the
+ * camera's own vanilla rotation and left-multiply by {@code Q}, the quaternion
+ * that maps world up onto the player's gravity up:</p>
  *
- * <pre>orientation' = Q * orientation</pre>
+ * <pre>
+ * orientation' = Q * R
+ * forward'     = Q * vanillaLook
+ * local up'    = Q * worldUp
+ * </pre>
  *
- * <p>The view matrix is rebuilt exactly the way
- * {@code Camera.getViewRotationMatrix} does it, i.e. from the conjugate of the
- * orientation. The culling frustum is rebuilt from the rotated view matrix so
- * that terrain is not culled against the old, rotated-away view.</p>
+ * <p>Starting from {@code Camera#rotation()} rather than from
+ * {@code state#orientation} is important: portal capture and other nested
+ * extraction paths can call {@code extractRenderState} again on a state that
+ * already contains a gravity-rotated quaternion. Reading the authoritative
+ * vanilla value makes the injection idempotent and never applies {@code Q}
+ * twice.</p>
+ *
+ * <p>The third-person camera position is computed by vanilla in the world-up
+ * frame. Its offset from the player's eye is rotated by the same {@code Q}, so
+ * the camera stays behind the rotated view. First-person offsets are zero and
+ * the vanilla position is written back untouched.</p>
  *
  * <p>When {@code Q} is the identity (no override, or gravity pointing straight
  * down) the injection returns before touching the render state. This keeps the
@@ -55,29 +67,43 @@ public abstract class CameraGravityMixin {
         if (gravity == null) {
             return;
         }
-
-        // Left-multiply in world space: the whole camera basis, including its
-        // local up, is carried into the player's gravity frame.
-        state.orientation.set(new Quaternionf(gravity).mul(state.orientation));
-        crythst$logGravityCamera(gravity, state);
-
-        // Third-person offset is computed by vanilla in the world-up frame.
-        // Rotate the offset from the eye into the gravity frame; first-person
-        // offsets are ~zero and therefore unchanged. State-only mutation keeps
-        // repeated extractor calls (portal captures) from applying Q twice.
         final Player player = Minecraft.getInstance().player;
-        if (player != null && state.pos != null) {
-            final Vec3 eye = player.getEyePosition(state.cameraEntityPartialTicks);
-            final Vector3d offset = new Vector3d(
-                    state.pos.x - eye.x, state.pos.y - eye.y, state.pos.z - eye.z);
-            offset.rotate(new Quaterniond(gravity.x, gravity.y, gravity.z, gravity.w));
-            state.pos = new Vec3(eye.x + offset.x, eye.y + offset.y, eye.z + offset.z);
-            state.blockPos = BlockPos.containing(state.pos);
+        if (player == null) {
+            return;
         }
 
-        // Update the yaw/pitch exposed to entity/particle extraction so they
-        // match the rotated view rather than the vanilla world-up frame.
+        // Compose from the camera's vanilla rotation, never from whatever the
+        // render state currently holds. Nested extraction therefore cannot
+        // stack Q on top of a previous gravity rotation.
+        final Quaternionf vanillaOrientation = new Quaternionf(
+                ((Camera) (Object) this).rotation());
+        state.orientation.set(new Quaternionf(gravity).mul(vanillaOrientation));
+
+        // Rotate the third-person offset from the eye into the gravity frame.
+        // In first person the offset is zero, so leave the vanilla position and
+        // block position exactly as extracted.
+        final Vec3 vanillaPosition = ((Camera) (Object) this).position();
+        final Vec3 eyePosition = player.getEyePosition(state.cameraEntityPartialTicks);
+        final Vector3d eye = new Vector3d(eyePosition.x, eyePosition.y, eyePosition.z);
+        final Vector3d vanilla = new Vector3d(
+                vanillaPosition.x, vanillaPosition.y, vanillaPosition.z);
+        final Vector3d rotatedPosition = state.isFirstPerson
+                ? vanilla
+                : PlayerGravity.rotateOffset(
+                        new Quaterniond(gravity.x, gravity.y, gravity.z, gravity.w),
+                        eye, vanilla);
+        final Vector3d offset = new Vector3d(rotatedPosition).sub(eye);
+        if (!state.isFirstPerson) {
+            state.pos = new Vec3(rotatedPosition.x, rotatedPosition.y, rotatedPosition.z);
+        } else {
+            state.pos = vanillaPosition;
+        }
+        state.blockPos = BlockPos.containing(state.pos);
+
+        // The direction the rotated camera shows, and the gravity up. These are
+        // also what looks/raycasts must use (PlayerGravity.lookDirection).
         final Vector3f forward = state.orientation.transform(new Vector3f(0.0f, 0.0f, -1.0f));
+        final Vector3f up = gravity.transform(new Vector3f(0.0f, 1.0f, 0.0f));
         final float[] yawPitch = PortalTransform.yawPitch(
                 new Vector3d(forward.x, forward.y, forward.z));
         state.yRot = yawPitch[0];
@@ -94,24 +120,38 @@ public abstract class CameraGravityMixin {
             frustum.prepare(state.pos.x, state.pos.y, state.pos.z);
             state.cullFrustum.set(frustum);
         }
+
+        crythst$logGravityCamera(gravity, forward, up, offset);
     }
 
     @Unique
     private static long crythst$lastGravityLogNanos;
 
     @Unique
-    private static void crythst$logGravityCamera(Quaternionf gravity, CameraRenderState state) {
+    private static void crythst$logGravityCamera(Quaternionf gravity, Vector3f forward,
+                                                 Vector3f up, Vector3d posOffset) {
         final long now = System.nanoTime();
         if (now - crythst$lastGravityLogNanos < 1_000_000_000L) {
             return;
         }
         crythst$lastGravityLogNanos = now;
-        final Vector3f up = state.orientation.transform(new Vector3f(0.0f, 1.0f, 0.0f));
-        Crythst.LOGGER.info("Crythst gravity camera: q=({}, {}, {}, {}) up=({}, {}, {})",
-                String.format("%.3f", gravity.x), String.format("%.3f", gravity.y),
-                String.format("%.3f", gravity.z), String.format("%.3f", gravity.w),
-                String.format("%.3f", up.x), String.format("%.3f", up.y),
-                String.format("%.3f", up.z));
+        Crythst.LOGGER.info(
+                "Crythst gravity camera: q=({}, {}, {}, {}) up=({}, {}, {}) "
+                        + "forward=({}, {}, {}) posOffset=({}, {}, {})",
+                fmt(gravity.x), fmt(gravity.y), fmt(gravity.z), fmt(gravity.w),
+                fmt(up.x), fmt(up.y), fmt(up.z),
+                fmt(forward.x), fmt(forward.y), fmt(forward.z),
+                fmt(posOffset.x), fmt(posOffset.y), fmt(posOffset.z));
+    }
+
+    @Unique
+    private static String fmt(float value) {
+        return String.format("%.3f", value);
+    }
+
+    @Unique
+    private static String fmt(double value) {
+        return String.format("%.3f", value);
     }
 
     /**

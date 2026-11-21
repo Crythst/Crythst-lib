@@ -41,7 +41,23 @@ public final class PlayerObbDebugRenderer implements DebugRenderer.SimpleDebugRe
             if (!(entity instanceof Player player) || !PlayerGravity.hasDirectionalGravity(player)) {
                 continue;
             }
-            draw(PlayerObb.obb(player), EDGE, FILL);
+            // Match vanilla's own F3 + B visibility rule: no box around the
+            // first-person camera entity.
+            if (entity.isInvisible()
+                    || (entity == minecraft.getCameraEntity()
+                    && minecraft.options.getCameraType().isFirstPerson())) {
+                continue;
+            }
+            // The collision OBB is built from the tick position. Shift it by
+            // the same interpolation the entity renderer uses, so the F3 + B
+            // box sits exactly on the rendered avatar.
+            final Vec3 tickPosition = player.position();
+            final Vec3 renderPosition = player.getPosition(partialTicks);
+            final Vec3 delta = renderPosition.subtract(tickPosition);
+            final OrientedBox box = PlayerObb.obb(player);
+            draw(delta.lengthSqr() < 1.0e-12 ? box : new OrientedBox(
+                    box.center().add(delta.x, delta.y, delta.z),
+                    box.halfExtents(), box.rotation()), EDGE, FILL);
         }
     }
 

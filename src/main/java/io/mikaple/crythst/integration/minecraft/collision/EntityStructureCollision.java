@@ -58,7 +58,19 @@ public final class EntityStructureCollision {
         }
 
         final Aabb box = toAabb(entity.getBoundingBox());
-        final Vector3d wanted = new Vector3d(motion.x, motion.y, motion.z);
+        Vector3d wanted = new Vector3d(motion.x, motion.y, motion.z);
+        // Vanilla sneak edge-protection only consults world blocks. On a
+        // structure floor it therefore removes the whole horizontal step
+        // because the structure is not a block in level.noCollision. Restore
+        // the intended component only when the structure supports the target.
+        if (entity instanceof Player player && player.isShiftKeyDown()
+                && entity.onGround()) {
+            final Vec3 intended = entity.getDeltaMovement();
+            wanted = StructureMotionSolver.restoreSneakMotion(
+                    box, wanted,
+                    new Vector3d(intended.x, intended.y, intended.z),
+                    entity.maxUpStep(), source);
+        }
         // Use the same substep count for LocalPlayer and ServerPlayer so both
         // sides run an identical loop against their copy of the poses.
         final boolean playerSubsteps = entity instanceof Player;
@@ -75,7 +87,7 @@ public final class EntityStructureCollision {
         );
 
         if (!structures.touched()) {
-            return vanilla.collide(motion);
+            return vanilla.collide(toVec(wanted));
         }
 
         Vec3 allowed = vanilla.collide(toVec(structures.motion()));

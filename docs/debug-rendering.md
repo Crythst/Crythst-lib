@@ -89,6 +89,19 @@ from `LevelPhysics.renderStructures()` and
   for the visual block grid.
 - **Debug layers are read-only.** They never mutate a body, pose or collider.
 
+## F3 + B player hitboxes
+
+Vanilla's `EntityHitboxDebugRenderer` always draws an axis-aligned box. For a
+player with directional gravity that box is wrong: the collision shape is an
+OBB whose local `+Y` follows `PlayerGravity.up(player)`.
+
+`EntityHitboxDebugRendererMixin` cancels `showHitboxes` for those players, and
+`PlayerObbDebugRenderer` (registered while `ENTITY_HITBOXES` is enabled) draws
+the same OBB the collision pass uses. Its centre is shifted by the entity's
+render interpolation so it coincides with the rendered avatar. The camera,
+avatar and this OBB all consume the same `PlayerGravity.viewRotation` /
+`up` frame; see [player-gravity-camera.md](player-gravity-camera.md).
+
 ## Related diagnostics
 
 `/crythst timing`, `/crythst align` and `/crythst entitydebug` are command-line
