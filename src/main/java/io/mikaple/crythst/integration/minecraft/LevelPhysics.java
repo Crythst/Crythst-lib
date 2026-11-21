@@ -12,8 +12,10 @@ import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureDef;
 import io.mikaple.crythst.physics.tick.PhysicsTimingMonitor;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
+import io.mikaple.crythst.physics.world.CcdMotionGuard;
 import io.mikaple.crythst.physics.world.PhysicsWorld;
 import io.mikaple.crythst.physics.world.StepListener;
+import io.mikaple.crythst.physics.world.TerrainCollisionSnapshot;
 import io.mikaple.crythst.physics.world.WorldSettings;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.TickRateManager;
@@ -270,7 +272,11 @@ public final class LevelPhysics implements AutoCloseable {
         }
 
         if (!frozen) {
-            terrain.tick();
+            // The terrain region is expanded by the velocity over the same
+            // interval the physics clock is about to advance, so a fast body
+            // cannot outrun the cache between refreshes.
+            terrain.tick(simulationDelta);
+            CcdMotionGuard.update(world, simulationDelta);
             PlayerGravity.setWorldDirection(level.dimension(), world.gravity());
         }
         final int steps = simulationDelta > 0.0 ? world.advance(simulationDelta) : 0;
@@ -318,8 +324,9 @@ public final class LevelPhysics implements AutoCloseable {
      * tests.
      */
     public void step(int count) {
-        terrain.ensureNow();
         final double fixedStep = world.settings().fixedTimeStep();
+        terrain.ensureNow(fixedStep * Math.max(1, count));
+        CcdMotionGuard.update(world, fixedStep * Math.max(1, count));
         for (int i = 0; i < count; i++) {
             world.step(fixedStep);
         }
@@ -392,6 +399,28 @@ public final class LevelPhysics implements AutoCloseable {
 
     public void invalidateTerrain() {
         terrain.invalidateAll();
+    }
+
+    /**
+     * Immutable terrain-collision diagnostics. The snapshot is published by the
+     * server thread and is safe to read from the render thread (for example the
+     * {@code crythst:physics_terrain} F3+F6 layer).
+     *
+     * <p>It contains cached section keys, their static body ids and merged
+     * boxes, the number of exact partial-block boxes, the refresh reason/count
+     * and one region entry per dynamic body with its AABB, motion-expanded AABB
+     * and whether the current AABB is fully covered by cached terrain.</p>
+     */
+    public TerrainCollisionSnapshot terrainSnapshot() {
+        return terrain.snapshot();
+    }
+
+    /**
+     * Alias with an explicit render-thread name; the returned snapshot is
+     * immutable and replaced atomically by the server thread.
+     */
+    public TerrainCollisionSnapshot renderTerrainSnapshot() {
+        return terrain.snapshot();
     }
 
     /**
