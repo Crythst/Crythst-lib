@@ -141,6 +141,10 @@ public final class BatchedStructureRenderer {
     private static int submittedBatches;
     private static long submittedVertices;
     private static int culledSections;
+    private static int culledByDistance;
+    private static int culledByFrustum;
+    private static int culledByOcclusion;
+    private static boolean occlusionCullingActive;
     private static int fallbackBlocks;
     private static int fallbackBodies;
     private static int specialBlocks;
@@ -218,6 +222,22 @@ public final class BatchedStructureRenderer {
     }
 
     /**
+     * Enables or disables the Sable-style per-body section occlusion BFS.
+     *
+     * <p>Occlusion is only applied when the camera is inside the body; from
+     * outside, sections are still distance/frustum culled. This switch exists
+     * for A/B testing and can also be set with
+     * {@code -Dcrythst.render.occlusionCulling=false}.</p>
+     */
+    public static void setOcclusionCullingEnabled(boolean enabled) {
+        SectionCulling.setOcclusionCullingEnabled(enabled);
+    }
+
+    public static boolean occlusionCullingEnabled() {
+        return SectionCulling.occlusionCullingEnabled();
+    }
+
+    /**
      * Returns the current solid-occupancy mask for a structure body, or
      * {@link StructureLightOccluder#EMPTY} when the body is not cached.
      *
@@ -250,7 +270,22 @@ public final class BatchedStructureRenderer {
      * }</pre>
      */
     public static String poseDiagnosticsText() {
-        return POSE_MONITOR.summary();
+        final String pose = POSE_MONITOR.summary();
+        final String culling = cullingDiagnosticsText();
+        if (pose.isEmpty()) {
+            return culling;
+        }
+        return culling.isEmpty() ? pose : pose + " | " + culling;
+    }
+
+    /**
+     * Last frame's section-culling counters, suitable for {@code /crythst
+     * timing}. Shows how many sections were rejected by distance, frustum and
+     * occlusion, plus how many enclosed full solid blocks contributed no
+     * quads.
+     */
+    public static String cullingDiagnosticsText() {
+        return stats.cullingSummary();
     }
 
     /**
@@ -299,6 +334,10 @@ public final class BatchedStructureRenderer {
         submittedBatches = 0;
         submittedVertices = 0L;
         culledSections = 0;
+        culledByDistance = 0;
+        culledByFrustum = 0;
+        culledByOcclusion = 0;
+        occlusionCullingActive = false;
         fallbackBlocks = 0;
         fallbackBodies = 0;
         specialBlocks = 0;
@@ -314,9 +353,6 @@ public final class BatchedStructureRenderer {
             final StructureRenderState state = structure.renderStateAt(frameNanos);
             serverBodyIds.add(state.bodyId());
             POSE_MONITOR.observe(state.bodyId(), state.pose());
-            if (!isVisible(camera, state.aabb())) {
-                continue;
-            }
 
             final StructureBlockSnapshots.Snapshot snapshot =
                     StructureBlockSnapshots.get(dimension, state.bodyId());
@@ -328,6 +364,14 @@ public final class BatchedStructureRenderer {
                 if (network != null && network.nonAirBlocks() > 0) {
                     final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
                     final double blockScale = network.blockScale();
+                    // Cull against the rendered snapshot bounds, not the
+                    // collider AABB: non-collidable blocks at a structure edge
+                    // may make the mesh larger than the physics shape.
+                    if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
+                            geometry, state.pose(), blockScale),
+                            bodyFrustumMargin(blockScale))) {
+                        continue;
+                    }
                     final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
                             dimension, geometry, state.pose(), blockScale);
                     body.beginFrame(state.pose(), blockScale, camera);
@@ -338,18 +382,28 @@ public final class BatchedStructureRenderer {
                     collectSections(body, camera, maxDistanceSq);
                     continue;
                 }
-                if (FALLBACK_BODIES.size() < MAX_FALLBACK_BODIES) {
+                if (isVisible(camera, state.aabb(),
+                        bodyFrustumMargin(state.blockScale()))
+                        && FALLBACK_BODIES.size() < MAX_FALLBACK_BODIES) {
                     FALLBACK_BODIES.add(state);
                 }
                 continue;
             }
 
+            final StructureBatchSnapshots.Snapshot geometry =
+                    StructureBatchSnapshots.fromServer(snapshot);
+            final double blockScale = state.blockScale();
+            // Snapshot bounds cover every rendered block, including
+            // non-collidable edge blocks that the collider AABB can miss.
+            if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
+                    geometry, state.pose(), blockScale),
+                    bodyFrustumMargin(blockScale))) {
+                continue;
+            }
+
             final StructureBatchCache.Body body = StructureBatchCache.getOrCreate(
-                    dimension,
-                    StructureBatchSnapshots.fromServer(snapshot),
-                    state.pose(),
-                    state.blockScale());
-            body.beginFrame(state.pose(), state.blockScale(), camera);
+                    dimension, geometry, state.pose(), blockScale);
+            body.beginFrame(state.pose(), blockScale, camera);
 
             if (buildBudget > 0L) {
                 buildBudget -= StructureBatchCache.buildPending(body, buildBudget);
@@ -371,7 +425,7 @@ public final class BatchedStructureRenderer {
             POSE_MONITOR.observe(network.bodyId(), pose);
             final double blockScale = network.blockScale();
             if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
-                    geometry, pose, blockScale))) {
+                    geometry, pose, blockScale), bodyFrustumMargin(blockScale))) {
                 continue;
             }
 
@@ -388,6 +442,9 @@ public final class BatchedStructureRenderer {
         final long buildEnd = System.nanoTime();
         StructureBatchCache.retryOverBudgetSections();
 
+        // Opaque/cutout: near-to-far improves early depth rejection. The
+        // translucent pass writes depth, so it must be sorted far-to-near or a
+        // near section can hide every translucent section behind it.
         OPAQUE.sort(NEAR_FIRST);
         for (StructureBatchCache.Section section : OPAQUE) {
             if (submittedBatches >= MAX_BATCHES_PER_FRAME) {
@@ -451,6 +508,11 @@ public final class BatchedStructureRenderer {
                 submittedBatches,
                 submittedVertices,
                 culledSections,
+                culledByDistance,
+                culledByFrustum,
+                culledByOcclusion,
+                StructureBatchCache.enclosedBlockCount(),
+                occlusionCullingActive,
                 StructureBatchCache.pendingCount(),
                 StructureBatchCache.overBudgetCount(),
                 fallbackBodies,
@@ -464,17 +526,46 @@ public final class BatchedStructureRenderer {
 
     private static void collectSections(StructureBatchCache.Body body,
                                         CameraRenderState camera, double maxDistanceSq) {
-        for (StructureBatchCache.Section section : body.sections) {
+        for (int index = 0; index < body.sections.length; index++) {
+            final StructureBatchCache.Section section = body.sections[index];
             final boolean hasNormal = section.vertexCount > 0L;
             final boolean hasSpecial = section.specialCellCount > 0;
             final boolean pending = section.dirty || section.overBudget;
             if (!hasNormal && !hasSpecial && !pending) {
                 continue;
             }
-            if (!section.prepareFrame(camera, maxDistanceSq)) {
-                culledSections++;
-                continue;
+
+            switch (section.prepareFrame(camera, maxDistanceSq)) {
+                case DISTANCE -> {
+                    culledSections++;
+                    culledByDistance++;
+                    continue;
+                }
+                case FRUSTUM -> {
+                    culledSections++;
+                    culledByFrustum++;
+                    continue;
+                }
+                case VISIBLE, OCCLUSION -> {
+                    // fall through to the optional occlusion pass
+                }
             }
+
+            // Only a section with a completed mesh may be rejected by the
+            // section BFS. Dirty and over-budget sections still go through the
+            // bounded per-block fallback, so they can never be hidden merely
+            // because their vertex mesh is not ready yet. The BFS itself is
+            // computed lazily and falls back to all-visible when the camera is
+            // outside the body.
+            if (section.built && !pending && SectionCulling.occlusionCullingEnabled()) {
+                occlusionCullingActive |= body.occlusionCullingActive();
+                if (!body.isSectionOcclusionVisible(index)) {
+                    culledSections++;
+                    culledByOcclusion++;
+                    continue;
+                }
+            }
+
             if (hasSpecial) {
                 SPECIAL_SECTIONS.add(section);
             }
@@ -651,15 +742,25 @@ public final class BatchedStructureRenderer {
         return submitted;
     }
 
-    private static boolean isVisible(CameraRenderState camera, Aabb bounds) {
+    /**
+     * Body-level frustum margin in world units. A fixed one-block margin is
+     * too small when {@code blockScale} is greater than one: a model may
+     * overhang the collider by a whole voxel, which is {@code blockScale}
+     * world units. This was a cause of bodies popping out at oblique view
+     * angles. Small structures keep the generous one-block minimum.
+     */
+    private static double bodyFrustumMargin(double blockScale) {
+        return Math.max(1.0, blockScale * SectionCulling.MODEL_MARGIN_BLOCKS);
+    }
+
+    private static boolean isVisible(CameraRenderState camera, Aabb bounds,
+                                     double margin) {
         if (camera.cullFrustum == null || !camera.initialized) {
             return true;
         }
-        // Models can overhang their collider by a block; keep the structure
-        // alive at the frustum edge rather than popping the whole body.
         return camera.cullFrustum.isVisible(new AABB(
-                bounds.min().x - 1.0, bounds.min().y - 1.0, bounds.min().z - 1.0,
-                bounds.max().x + 1.0, bounds.max().y + 1.0, bounds.max().z + 1.0));
+                bounds.min().x - margin, bounds.min().y - margin, bounds.min().z - margin,
+                bounds.max().x + margin, bounds.max().y + margin, bounds.max().z + margin));
     }
 
     private static int specialLight(ClientLevel level, BlockPos pos, BlockState state,

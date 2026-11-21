@@ -8,6 +8,9 @@ import net.minecraft.world.level.block.state.BlockState;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,6 +48,65 @@ class SectionMeshCullingTest {
         final StructureVoxelView view = new FixedView(stone, 16, 0, 0);
         assertTrue(SectionMesh.isCulled(view, stone, quads(Direction.EAST.ordinal()),
                 0, 15, 0, 0));
+    }
+
+    @Test
+    void enclosedBlockSkipsAllQuadsButOpenTopKeepsTheTopFace() {
+        final BlockState stone = Blocks.STONE.defaultBlockState();
+        final Map<Long, BlockState> cells = new HashMap<>();
+        for (Direction direction : Direction.values()) {
+            cells.put(key(direction.getStepX(), direction.getStepY(), direction.getStepZ()),
+                    stone);
+        }
+        final StructureVoxelView enclosed = view(cells);
+
+        assertTrue(SectionCulling.isFullyEnclosed(enclosed, stone, 0, 0, 0),
+                "six full-cube neighbours mean no visible quads");
+        // Open the top and verify the top face itself is still emitted.
+        cells.remove(key(0, 1, 0));
+        final StructureVoxelView openTop = view(cells);
+        assertFalse(SectionCulling.isFullyEnclosed(openTop, stone, 0, 0, 0));
+        assertFalse(SectionMesh.isCulled(openTop, stone,
+                quads(Direction.UP.ordinal()), 0, 0, 0, 0),
+                "the exposed top face must never be culled by enclosed logic");
+    }
+
+    @Test
+    void enclosedBlockDoesNotHideASideFaceWhenThatNeighbourIsOpen() {
+        final BlockState stone = Blocks.STONE.defaultBlockState();
+        final Map<Long, BlockState> cells = new HashMap<>();
+        for (Direction direction : Direction.values()) {
+            if (direction != Direction.EAST) {
+                cells.put(key(direction.getStepX(), direction.getStepY(), direction.getStepZ()),
+                        stone);
+            }
+        }
+        final StructureVoxelView view = view(cells);
+
+        assertFalse(SectionCulling.isFullyEnclosed(view, stone, 0, 0, 0));
+        assertFalse(SectionMesh.isCulled(view, stone,
+                quads(Direction.EAST.ordinal()), 0, 0, 0, 0));
+    }
+
+    private static StructureVoxelView view(Map<Long, BlockState> cells) {
+        return new StructureVoxelView() {
+            @Override
+            public boolean isOccluded(int x, int y, int z) {
+                final BlockState state = cells.get(key(x, y, z));
+                return state != null && state.canOcclude();
+            }
+
+            @Override
+            public BlockState stateAt(int x, int y, int z) {
+                return cells.get(key(x, y, z));
+            }
+        };
+    }
+
+    private static long key(int x, int y, int z) {
+        return (((long) x) & 0x3FFFFFFL) << 38
+                | (((long) y) & 0xFFFL) << 26
+                | (((long) z) & 0x3FFFFFFL);
     }
 
     private static BlockGeometry.Quads quads(int face) {

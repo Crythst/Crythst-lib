@@ -5,6 +5,7 @@ import io.mikaple.crythst.client.render.block.SpecialBlockRenderers;
 import io.mikaple.crythst.client.render.light.StructureLightOccluder;
 import io.mikaple.crythst.math.Transform3d;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.state.BlockState;
@@ -52,7 +53,6 @@ final class StructureBatchCache {
     private static final Map<BodyKey, Body> BODIES = new ConcurrentHashMap<>();
     private static final AtomicLong CACHED_VERTICES = new AtomicLong();
     private static final Vector3d SCRATCH_A = new Vector3d();
-    private static final Vector3d SCRATCH_B = new Vector3d();
 
     private static ResourceKey<Level> currentDimension;
     private static long paletteGeneration = -1L;
@@ -145,7 +145,9 @@ final class StructureBatchCache {
                     : section.countVertices();
             section.pendingVertices = required;
             if (required == 0L) {
+                final int enclosed = section.pendingEnclosedBlocks;
                 section.invalidate();
+                section.enclosedBlockCount = enclosed;
                 section.dirty = false;
                 section.built = true;
                 continue;
@@ -167,10 +169,11 @@ final class StructureBatchCache {
                 break;
             }
 
+            final int[] enclosed = new int[1];
             final SectionMesh[] meshes = SectionMesh.build(
                     section.states, section.sizeX, section.sizeY, section.sizeZ,
-                    section.originX, section.originY, section.originZ, body);
-            section.install(meshes);
+                    section.originX, section.originY, section.originZ, body, enclosed);
+            section.install(meshes, enclosed[0]);
             built += required;
         }
         return built;
@@ -278,6 +281,22 @@ final class StructureBatchCache {
         return count;
     }
 
+    /**
+     * Full solid blocks whose six neighbours are also full solid blocks and
+     * which therefore contributed no quads to the resident section meshes.
+     */
+    static int enclosedBlockCount() {
+        int count = 0;
+        for (Body body : BODIES.values()) {
+            for (Section section : body.sections) {
+                if (section.built) {
+                    count += section.enclosedBlockCount;
+                }
+            }
+        }
+        return count;
+    }
+
     private static void prune(long now) {
         BODIES.entrySet().removeIf(entry -> {
             final Body body = entry.getValue();
@@ -322,7 +341,10 @@ final class StructureBatchCache {
         final Section[] sections;
 
         StructureBatchSnapshots.Snapshot snapshot;
+        /** Occupancy for AO ({@code canOcclude()}). */
         StructureLightOccluder occluder = StructureLightOccluder.EMPTY;
+        /** Exact whole-cube occupancy for enclosed-block culling. */
+        StructureLightOccluder opaqueOccluder = StructureLightOccluder.EMPTY;
         long contentRevision;
         long lastSeenNanos;
         long vertexCount;
@@ -334,6 +356,16 @@ final class StructureBatchCache {
         double frameCameraX;
         double frameCameraY;
         double frameCameraZ;
+
+        // Camera in structure-local voxel coordinates and the optional
+        // occlusion BFS result for this frame.
+        double frameCameraVoxelX;
+        double frameCameraVoxelY;
+        double frameCameraVoxelZ;
+        boolean frameCameraInsideBody;
+        boolean frameOcclusionReady;
+        /** {@code null} means "everything visible" (disabled or camera outside). */
+        boolean[] frameOcclusion;
 
         private Body(BodyKey key, StructureBatchSnapshots.Snapshot snapshot,
                      Transform3d pose, double blockScale,
@@ -396,33 +428,54 @@ final class StructureBatchCache {
         }
 
         /**
-         * Rebuilds the solid-occupancy mask from the current section states.
-         * The mask is the shared source of truth for face culling and AO, and
-         * is exposed for future entity/light-engine consumers.
+         * Rebuilds both per-body occupancy masks from the current section
+         * states. {@link #occluder} follows {@code canOcclude()} for AO and the
+         * public occlusion API; {@link #opaqueOccluder} keeps only whole-cube
+         * states and backs the enclosed-block predicate.
          */
         void rebuildOccluder() {
             final StructureLightOccluder.Builder builder =
+                    StructureLightOccluder.builder(minX, minY, minZ, sizeX, sizeY, sizeZ);
+            final StructureLightOccluder.Builder opaqueBuilder =
                     StructureLightOccluder.builder(minX, minY, minZ, sizeX, sizeY, sizeZ);
             for (Section section : sections) {
                 final int layerStride = section.sizeX * section.sizeZ;
                 for (int index = 0; index < section.states.length; index++) {
                     final BlockState state = section.states[index];
-                    if (state == null || state.isAir() || !state.canOcclude()) {
+                    if (state == null || state.isAir()) {
+                        continue;
+                    }
+                    final boolean canOcclude = state.canOcclude();
+                    final boolean fullCube = state.isSolidRender();
+                    if (!canOcclude && !fullCube) {
                         continue;
                     }
                     final int x = index % section.sizeX;
                     final int z = (index / section.sizeX) % section.sizeZ;
                     final int y = index / layerStride;
-                    builder.setSolid(section.originX + x, section.originY + y,
-                            section.originZ + z, true);
+                    final int worldX = section.originX + x;
+                    final int worldY = section.originY + y;
+                    final int worldZ = section.originZ + z;
+                    if (canOcclude) {
+                        builder.setSolid(worldX, worldY, worldZ, true);
+                    }
+                    if (fullCube) {
+                        opaqueBuilder.setSolid(worldX, worldY, worldZ, true);
+                    }
                 }
             }
             occluder = builder.build();
+            opaqueOccluder = opaqueBuilder.build();
         }
 
         @Override
         public boolean isOccluded(int x, int y, int z) {
             return occluder.isSolid(x, y, z);
+        }
+
+        @Override
+        public boolean isFullyOpaque(int x, int y, int z) {
+            return opaqueOccluder.isSolid(x, y, z);
         }
 
         @Override
@@ -539,6 +592,73 @@ final class StructureBatchCache {
             this.frameCameraX = camera.pos.x;
             this.frameCameraY = camera.pos.y;
             this.frameCameraZ = camera.pos.z;
+
+            // Occlusion is only valid from inside the body. Convert the camera
+            // to structure-local voxel coordinates once; the BFS is lazy so a
+            // body that is fully frustum-culled pays nothing for it.
+            frameOcclusionReady = false;
+            frameOcclusion = null;
+            if (blockScale > 1.0e-9) {
+                final Vector3d local = pose.inverseTransformPoint(
+                        new Vector3d(camera.pos.x, camera.pos.y, camera.pos.z));
+                final double inverseScale = 1.0 / blockScale;
+                frameCameraVoxelX = local.x * inverseScale;
+                frameCameraVoxelY = local.y * inverseScale;
+                frameCameraVoxelZ = local.z * inverseScale;
+                frameCameraInsideBody = frameCameraVoxelX >= minX
+                        && frameCameraVoxelY >= minY
+                        && frameCameraVoxelZ >= minZ
+                        && frameCameraVoxelX < minX + sizeX
+                        && frameCameraVoxelY < minY + sizeY
+                        && frameCameraVoxelZ < minZ + sizeZ;
+            } else {
+                frameCameraVoxelX = 0.0;
+                frameCameraVoxelY = 0.0;
+                frameCameraVoxelZ = 0.0;
+                frameCameraInsideBody = false;
+            }
+        }
+
+        /**
+         * @return whether this body actually used section occlusion this frame
+         */
+        boolean occlusionCullingActive() {
+            ensureFrameOcclusion();
+            return frameOcclusion != null;
+        }
+
+        /**
+         * Occlusion result for one section. Any camera-outside / disabled /
+         * malformed case returns visible; the caller then keeps the normal
+         * distance and frustum culling path.
+         */
+        boolean isSectionOcclusionVisible(int sectionIndex) {
+            if (!SectionCulling.occlusionCullingEnabled()) {
+                return true;
+            }
+            ensureFrameOcclusion();
+            return frameOcclusion == null || frameOcclusion[sectionIndex];
+        }
+
+        private void ensureFrameOcclusion() {
+            if (frameOcclusionReady) {
+                return;
+            }
+            frameOcclusionReady = true;
+            if (!SectionCulling.occlusionCullingEnabled()
+                    || !frameCameraInsideBody
+                    || sections.length == 0) {
+                frameOcclusion = null;
+                return;
+            }
+
+            final int startX = (int) Math.floor(frameCameraVoxelX - minX) / SECTION_SIZE;
+            final int startY = (int) Math.floor(frameCameraVoxelY - minY) / SECTION_SIZE;
+            final int startZ = (int) Math.floor(frameCameraVoxelZ - minZ) / SECTION_SIZE;
+            frameOcclusion = SectionOcclusion.computeVisible(
+                    sectionsX, sectionsY, sectionsZ,
+                    startX, startY, startZ, true,
+                    (sectionIndex, direction) -> sections[sectionIndex].faceFullyOpaque(direction));
         }
     }
 
@@ -570,8 +690,14 @@ final class StructureBatchCache {
         boolean built;
         boolean overBudget;
         long vertexCount;
+        /** Full solid blocks skipped by enclosed-block culling at build time. */
+        int enclosedBlockCount;
+        /** Cached per-face opacity used by the section occlusion BFS. */
+        boolean[] faceOpaque;
         /** Cached result of {@link #countVertices()} for a dirty section. */
         long pendingVertices = -1L;
+        /** Enclosed blocks seen while counting a dirty section's vertices. */
+        int pendingEnclosedBlocks;
 
         double frameDistanceSq;
         double frameCenterX;
@@ -644,9 +770,28 @@ final class StructureBatchCache {
                 final int y = index / (sizeX * sizeZ);
                 states[index] = snapshot.stateAt(originX + x, originY + y, originZ + z);
             }
+            faceOpaque = null;
             collectSpecialCells();
             markDirty();
             return true;
+        }
+
+        /**
+         * Cached "this section face is a solid wall" test for the occlusion
+         * BFS. It is recomputed only after a content change.
+         */
+        boolean faceFullyOpaque(Direction direction) {
+            boolean[] cached = faceOpaque;
+            if (cached == null) {
+                cached = new boolean[6];
+                for (Direction face : Direction.values()) {
+                    cached[face.ordinal()] = SectionCulling.isFaceFullyOpaque(
+                            body, originX, originY, originZ,
+                            sizeX, sizeY, sizeZ, face);
+                }
+                faceOpaque = cached;
+            }
+            return cached[direction.ordinal()];
         }
 
         /** Drops the built mesh and queues a rebuild. */
@@ -700,6 +845,7 @@ final class StructureBatchCache {
 
         long countVertices() {
             long count = 0L;
+            int enclosed = 0;
             final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
             final StructureVoxelView view = body;
             final int layerStride = sizeX * sizeZ;
@@ -709,16 +855,20 @@ final class StructureBatchCache {
                         || (anySpecial && SpecialBlockRenderers.isRegistered(state.getBlock()))) {
                     continue;
                 }
-                final BlockGeometry geometry = BlockGeometryCache.get(state);
-                if (geometry.empty) {
-                    continue;
-                }
                 final int x = index % sizeX;
                 final int z = (index / sizeX) % sizeZ;
                 final int y = index / layerStride;
                 final int worldX = originX + x;
                 final int worldY = originY + y;
                 final int worldZ = originZ + z;
+                if (SectionCulling.isFullyEnclosed(view, state, worldX, worldY, worldZ)) {
+                    enclosed++;
+                    continue;
+                }
+                final BlockGeometry geometry = BlockGeometryCache.get(state);
+                if (geometry.empty) {
+                    continue;
+                }
                 for (BlockGeometry.Layer layer : BlockGeometry.LAYERS) {
                     final BlockGeometry.Quads quads = geometry.quads(layer);
                     for (int quad = 0; quad < quads.quadCount; quad++) {
@@ -729,10 +879,11 @@ final class StructureBatchCache {
                     }
                 }
             }
+            pendingEnclosedBlocks = enclosed;
             return count;
         }
 
-        void install(SectionMesh[] newMeshes) {
+        void install(SectionMesh[] newMeshes, int enclosedBlocks) {
             long installed = 0L;
             for (int i = 0; i < meshes.length; i++) {
                 meshes[i] = newMeshes[i];
@@ -750,6 +901,7 @@ final class StructureBatchCache {
                 body.vertexCount += installed;
             }
             pendingVertices = -1L;
+            enclosedBlockCount = enclosedBlocks;
             dirty = false;
             built = true;
             overBudget = false;
@@ -761,6 +913,7 @@ final class StructureBatchCache {
                 body.vertexCount -= vertexCount;
                 vertexCount = 0L;
             }
+            enclosedBlockCount = 0;
             for (int i = 0; i < meshes.length; i++) {
                 meshes[i] = null;
             }
@@ -775,12 +928,18 @@ final class StructureBatchCache {
             return meshes[BlockGeometry.Layer.TRANSLUCENT.index()] != null;
         }
 
+        enum CullReason {
+            VISIBLE,
+            DISTANCE,
+            FRUSTUM,
+            OCCLUSION
+        }
+
         /**
-         * Computes the section's world centre, distance and frustum visibility.
-         *
-         * @return whether the section should be submitted this frame
+         * Computes the section's world centre, distance and conservative
+         * frustum visibility.
          */
-        boolean prepareFrame(CameraRenderState camera, double maxDistanceSq) {
+        CullReason prepareFrame(CameraRenderState camera, double maxDistanceSq) {
             final Transform3d pose = body.framePose;
             final double centerX = (localMinX + localMaxX) * 0.5;
             final double centerY = (localMinY + localMaxY) * 0.5;
@@ -792,40 +951,28 @@ final class StructureBatchCache {
             final double dz = SCRATCH_A.z - body.frameCameraZ;
             frameDistanceSq = dx * dx + dy * dy + dz * dz;
             if (frameDistanceSq > maxDistanceSq) {
-                return false;
+                return CullReason.DISTANCE;
             }
             frameCenterX = SCRATCH_A.x;
             frameCenterY = SCRATCH_A.y;
             frameCenterZ = SCRATCH_A.z;
 
             if (camera.cullFrustum == null || !camera.initialized) {
-                return true;
+                return CullReason.VISIBLE;
             }
 
-            double minX = Double.POSITIVE_INFINITY;
-            double minY = Double.POSITIVE_INFINITY;
-            double minZ = Double.POSITIVE_INFINITY;
-            double maxX = Double.NEGATIVE_INFINITY;
-            double maxY = Double.NEGATIVE_INFINITY;
-            double maxZ = Double.NEGATIVE_INFINITY;
-            // Baked models may overhang their voxel (fences, plants, modded
-            // models). A one-block margin keeps an overhanging face from being
-            // culled when only the cube itself leaves the frustum.
-            final double margin = body.blockScale;
-            for (int corner = 0; corner < 8; corner++) {
-                SCRATCH_B.set(
-                        (corner & 1) == 0 ? localMinX - margin : localMaxX + margin,
-                        (corner & 2) == 0 ? localMinY - margin : localMaxY + margin,
-                        (corner & 4) == 0 ? localMinZ - margin : localMaxZ + margin);
-                pose.transformPoint(SCRATCH_B, SCRATCH_B);
-                minX = Math.min(minX, SCRATCH_B.x);
-                minY = Math.min(minY, SCRATCH_B.y);
-                minZ = Math.min(minZ, SCRATCH_B.z);
-                maxX = Math.max(maxX, SCRATCH_B.x);
-                maxY = Math.max(maxY, SCRATCH_B.y);
-                maxZ = Math.max(maxZ, SCRATCH_B.z);
-            }
-            return camera.cullFrustum.isVisible(new AABB(minX, minY, minZ, maxX, maxY, maxZ));
+            // Every transformed corner must be inside the hull. A one-block
+            // model margin keeps fences/plants/modded overhangs alive at the
+            // frustum edge. The hull is exact for the rotated section box, so
+            // this test can only keep extra sections, never drop a visible one.
+            final double margin = body.blockScale * SectionCulling.MODEL_MARGIN_BLOCKS;
+            final AABB bounds = SectionCulling.sectionBounds(pose,
+                    localMinX, localMinY, localMinZ,
+                    localMaxX, localMaxY, localMaxZ,
+                    margin);
+            return camera.cullFrustum.isVisible(bounds)
+                    ? CullReason.VISIBLE
+                    : CullReason.FRUSTUM;
         }
 
         /**

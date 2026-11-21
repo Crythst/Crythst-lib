@@ -15,7 +15,12 @@ package io.mikaple.crythst.client.render.structure.batch;
  * @param cachedVertices        vertices resident in all section caches
  * @param submittedBatches      {@code submitCustomGeometry} nodes this frame
  * @param submittedVertices     vertices replayed into those nodes this frame
- * @param culledSections        sections rejected by distance or frustum culling
+ * @param culledSections        sections rejected by any culling stage
+ * @param culledByDistance      sections rejected by the render-distance cut-off
+ * @param culledByFrustum       sections rejected by the conservative frustum hull
+ * @param culledByOcclusion     sections rejected by the section occlusion BFS
+ * @param enclosedBlocks        full solid blocks skipped by enclosed-block culling
+ * @param occlusionCulling      whether the section BFS ran for any body this frame
  * @param pendingSections       sections still waiting for a build budget slot
  * @param overBudgetSections    sections that cannot be cached within the vertex budget
  * @param fallbackBodies        structures drawn as coloured collider cuboids
@@ -35,6 +40,11 @@ public record BatchStats(
         int submittedBatches,
         long submittedVertices,
         int culledSections,
+        int culledByDistance,
+        int culledByFrustum,
+        int culledByOcclusion,
+        int enclosedBlocks,
+        boolean occlusionCulling,
         int pendingSections,
         int overBudgetSections,
         int fallbackBodies,
@@ -46,7 +56,18 @@ public record BatchStats(
         double submitMillisLastFrame
 ) {
     public static final BatchStats EMPTY = new BatchStats(
-            0L, 0, 0, 0, 0L, 0, 0L, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0);
+            0L,                 // frame
+            0, 0, 0, 0L,        // cached bodies/sections/batches/vertices
+            0, 0L,              // submitted batches/vertices
+            0,                  // culled sections (total)
+            0, 0, 0,            // distance/frustum/occlusion
+            0,                  // enclosed blocks
+            false,              // occlusion culling active
+            0, 0,               // pending / over-budget sections
+            0, 0,               // fallback bodies / blocks
+            0, 0,               // cached special cells / submitted special blocks
+            0,                  // model cache entries
+            0.0, 0.0);          // build / submit millis
 
     /**
      * One-line summary suitable for a HUD or log message.
@@ -56,12 +77,27 @@ public record BatchStats(
                 + submittedBatches + " batches / " + submittedVertices + " vertices submitted, "
                 + cachedBodies + " bodies, " + cachedSections + " sections, "
                 + cachedBatches + " cached batches, " + cachedVertices + " cached vertices, "
-                + culledSections + " culled, " + pendingSections + " pending, "
+                + culledSections + " culled ("
+                + culledByDistance + " distance, " + culledByFrustum + " frustum, "
+                + culledByOcclusion + " occlusion), "
+                + enclosedBlocks + " enclosed blocks, "
+                + (occlusionCulling ? "occlusion on" : "occlusion off") + ", "
+                + pendingSections + " pending, "
                 + overBudgetSections + " over-budget, "
                 + fallbackBodies + " fallback bodies / " + fallbackBlocks + " fallback blocks, "
                 + submittedSpecialBlocks + " special blocks (" + cachedSpecialCells + " cached), "
                 + modelCacheEntries + " models, "
                 + String.format(java.util.Locale.ROOT, "build %.3f ms, frame %.3f ms",
                 buildMillisLastFrame, submitMillisLastFrame);
+    }
+
+    /**
+     * Compact culling line for {@code /crythst timing}.
+     */
+    public String cullingSummary() {
+        return "culling: " + culledByDistance + " distance / "
+                + culledByFrustum + " frustum / " + culledByOcclusion + " occlusion, "
+                + enclosedBlocks + " enclosed blocks, "
+                + (occlusionCulling ? "occlusion active" : "occlusion idle");
     }
 }

@@ -17,6 +17,8 @@ multiplayer structures from `ClientStructureCache`.
 | `src/main/java/io/mikaple/crythst/client/render/structure/batch/BatchedStructureRenderer.java` | Public entry point, registration, frame culling/sorting/submission, stats. |
 | `.../batch/StructureBatchCache.java` | Per-body 16³ section grid, snapshot content diffing, build budget, cache lifecycle. |
 | `.../batch/SectionMesh.java` | Flat section-local vertex soup for one render layer and its replay loop. |
+| `.../batch/SectionCulling.java` | Pure conservative section AABB, enclosed-block predicate, and occlusion on/off switch. |
+| `.../batch/SectionOcclusion.java` | Pure section-graph BFS used for optional occlusion culling. |
 | `.../batch/SpecialBlockCell.java` | Section-local reference to a block drawn by a `SpecialBlockRenderer`. |
 | `.../batch/BlockGeometry.java` | Pose-independent quads for one block state, split into solid/cutout/translucent layers. |
 | `.../batch/BlockGeometryCache.java` | Palette cache: `BlockState` → baked quads with atlas UVs, tint and emission. |
@@ -93,9 +95,13 @@ are then distance- and frustum-culled individually):
 2. Get or create the body cache; refresh it if a new snapshot object was
    published.
 3. Build at most `MAX_BUILD_VERTICES_PER_FRAME` vertices of dirty sections.
-4. Prepare every section: world centre, distance, frustum AABB.
-5. Put sections with a solid/cutout mesh into the opaque list and sections with
-   a translucent mesh into the translucent list.
+4. Prepare every section: world centre, distance, and a conservative frustum
+   AABB from all eight transformed corners plus a one-block model margin.
+5. Optionally run the per-body section occlusion BFS (only when the camera is
+   inside the body), then put surviving sections with a solid/cutout mesh into
+   the opaque list and sections with a translucent mesh into the translucent
+   list. A section whose normal mesh is still pending is never rejected by the
+   BFS; it stays on the bounded per-block fallback path.
 6. Sort opaque sections near-to-far and translucent sections far-to-near.
 7. Submit one `SubmitNodeCollector.submitCustomGeometry(PoseStack, RenderType,
    VertexConsumer)` per non-empty section/layer, up to
@@ -104,6 +110,44 @@ are then distance- and frustum-culled individually):
 The vertex replay uses a cached `CustomGeometryRenderer` per `SectionMesh`; the
 per-frame fallback light value is written into the mesh immediately before
 submission. No lambda is allocated per batch per frame.
+
+### Section culling
+
+`SectionCulling` deliberately separates the three culling stages so each one
+can be tested without a level or a frustum:
+
+* **Bounds/frustum.** `sectionBounds(pose, min, max, margin)` transforms all
+  eight section corners and returns their AABB. A rigid transform maps the
+  section box to the convex hull of those corners, so the AABB cannot clip
+  visible geometry; the test is conservative, never aggressive. The margin is
+  one full block in structure-local metres (`blockScale` world units), which
+  covers fences, plants, modded models and special renderers that overhang
+  their voxel. Body-level frustum culling uses the snapshot's rendered world
+  bounds (not the collider AABB, which can miss non-collidable edge blocks)
+  plus the same conservative margin. The old fixed one-block margin on the
+  collider AABB was too small for scaled-up structures and could pop a body out
+  at oblique angles.
+* **Enclosed blocks.** During meshing, a full solid block
+  (`BlockState.isSolidRender()`) whose six neighbours are also full solid
+  blocks contributes no quads. `isSolidRender()` is stricter than
+  `canOcclude()`: stairs, slabs, glass and other shaped states never count, so
+  an exposed top or side face is never skipped. The neighbour lookup uses a
+  cached per-body whole-cube occupancy mask; the existing `canOcclude()` mask
+  remains the source for AO.
+* **Section visibility BFS.** When the camera is inside the body's voxel
+  bounds, a BFS starts at the camera's section and crosses only section faces
+  that are not completely opaque (`SectionOcclusion`). A solid wall therefore
+  stops propagation while a hole or an empty section keeps the neighbour
+  visible. If the camera is outside the body, or occlusion is disabled, the
+  result is "all sections visible" and only distance/frustum culling applies.
+  The BFS is computed lazily, at most once per body per frame.
+
+Occlusion culling can be disabled for A/B with
+`-Dcrythst.render.occlusionCulling=false` or at runtime through
+`BatchedStructureRenderer.setOcclusionCullingEnabled(false)`. The current
+counters are visible in `BatchStats` and in the text appended to
+`/crythst timing` (`poseDiagnosticsText()`), including sections rejected by
+distance, frustum and occlusion plus the number of enclosed blocks skipped.
 
 ### Internal faces, AO and face light
 
@@ -114,7 +158,9 @@ Structures are meshed like small voxel chunks, not like independent blocks:
   lookup crosses section borders, so a wall spanning two sections loses the
   hidden seam faces. Cells outside the snapshot are air, so the outer shell is
   never culled. `Block.shouldRenderFace` handles full cubes, slabs, glass and
-  modded shape occlusion instead of only checking `isSolid()`.
+  modded shape occlusion instead of only checking `isSolid()`. A whole block
+  whose six neighbours are full cubes is skipped before any of its quads are
+  considered (see section culling above).
 * **Vertex AO.** For full-cube states (`isSolidRender()`), each quad vertex asks
   the occupancy mask about the two edge neighbours and the diagonal corner
   around the adjacent air cell. The classic rule gives AO levels 0–3; the
@@ -243,7 +289,7 @@ baked quad, so no faces are dropped and no black/default quads are introduced.
 | Event | Action |
 | --- | --- |
 | New snapshot object every few server ticks | Per-section content comparison; only changed sections are invalidated. An unchanged snapshot object does not rebuild anything. |
-| Block edited in a structure | The changed section(s) fail the content compare and are rebuilt on the next build budget slot. Sections within one voxel of a changed section are also invalidated so border culling/AO stays correct; more than 16 changed sections invalidates the whole body. The occupancy mask is rebuilt from the refreshed section states. |
+| Block edited in a structure | The changed section(s) fail the content compare and are rebuilt on the next build budget slot. Sections within one voxel of a changed section are also invalidated so border culling/AO stays correct; more than 16 changed sections invalidates the whole body. The occupancy masks and the cached per-section face-opacity flags are rebuilt from the refreshed section states. |
 | Block scale changed | The whole body cache is recreated. Centre-of-mass changes only move the per-frame structure pose; section geometry is unshifted and does not need a rebuild. |
 | Snapshot bounds changed | The whole body cache is recreated. |
 | Client resource reload (textures/models) | Reload listener clears all body meshes first, then the palette; a palette generation counter also forces a clear if a body is touched before the listener runs. |

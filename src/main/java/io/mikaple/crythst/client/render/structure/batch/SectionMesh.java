@@ -111,13 +111,36 @@ final class SectionMesh {
     static SectionMesh[] build(BlockState[] states, int sizeX, int sizeY, int sizeZ,
                                int originX, int originY, int originZ,
                                StructureVoxelView view) {
+        return build(states, sizeX, sizeY, sizeZ, originX, originY, originZ, view, null);
+    }
+
+    /**
+     * Builds all non-empty layer meshes for one section.
+     *
+     * @param enclosedOut optional one-element counter receiving the number of
+     *                    full solid blocks skipped by enclosed-block culling
+     */
+    static SectionMesh[] build(BlockState[] states, int sizeX, int sizeY, int sizeZ,
+                               int originX, int originY, int originZ,
+                               StructureVoxelView view, int[] enclosedOut) {
         final boolean anySpecial = !SpecialBlockRenderers.isEmpty();
         final BlockGeometry[] geometries = new BlockGeometry[states.length];
         final int[] vertexCounts = new int[3];
+        final int layerStride = sizeX * sizeZ;
         for (int index = 0; index < states.length; index++) {
             final BlockState state = states[index];
             if (state == null || state.isAir()
                     || (anySpecial && SpecialBlockRenderers.isRegistered(state.getBlock()))) {
+                continue;
+            }
+            final int x = index % sizeX;
+            final int z = (index / sizeX) % sizeZ;
+            final int y = index / layerStride;
+            if (SectionCulling.isFullyEnclosed(view, state,
+                    originX + x, originY + y, originZ + z)) {
+                if (enclosedOut != null) {
+                    enclosedOut[0]++;
+                }
                 continue;
             }
             final BlockGeometry geometry = BlockGeometryCache.get(state);
@@ -141,7 +164,6 @@ final class SectionMesh {
         }
 
         final int[] cursors = new int[3];
-        final int layerStride = sizeX * sizeZ;
         for (int index = 0; index < states.length; index++) {
             final BlockGeometry geometry = geometries[index];
             if (geometry == null) {
