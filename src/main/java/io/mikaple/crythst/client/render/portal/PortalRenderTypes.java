@@ -47,10 +47,13 @@ public final class PortalRenderTypes {
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_surface");
     public static final Identifier PORTAL_VIEW_PIPELINE =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_view_surface");
+    public static final Identifier PORTAL_DEBUG_BLIT_PIPELINE =
+            Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_debug_blit");
 
     private static final String PROCEDURAL_TYPE_NAME = "crythst_portal_surface";
 
     private static final Map<Identifier, RenderType> VIEW_TYPES = new ConcurrentHashMap<>();
+    private static final Map<Identifier, RenderType> DEBUG_BLIT_TYPES = new ConcurrentHashMap<>();
 
     private static volatile RenderType proceduralType;
     private static volatile boolean failed;
@@ -87,6 +90,21 @@ public final class PortalRenderTypes {
      */
     public static RenderType view(Identifier textureId) {
         return VIEW_TYPES.computeIfAbsent(textureId, PortalRenderTypes::createView);
+    }
+
+    /**
+     * Diagnostic full-screen blit of the captured texture (no depth test,
+     * no blending). Used to prove the texture is bound and sampled correctly
+     * independently of the portal quad UVs.
+     */
+    public static RenderType debugBlit(Identifier textureId) {
+        return DEBUG_BLIT_TYPES.computeIfAbsent(textureId, PortalRenderTypes::createDebugBlit);
+    }
+
+    /** Drops cached RenderTypes after a target texture view is replaced. */
+    public static void invalidate(Identifier textureId) {
+        VIEW_TYPES.remove(textureId);
+        DEBUG_BLIT_TYPES.remove(textureId);
     }
 
     /** True when the procedural pipeline could be created. */
@@ -134,6 +152,20 @@ public final class PortalRenderTypes {
                 .createRenderSetup();
         return CrythstRenderTypes.create("crythst_portal_view_" + textureId.getPath().replace('/', '_'),
                 setup);
+    }
+
+    private static RenderType createDebugBlit(Identifier textureId) {
+        final RenderPipeline pipeline = basePipeline(
+                PORTAL_DEBUG_BLIT_PIPELINE, PORTAL_SHADER, PORTAL_VIEW_SHADER)
+                .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
+                .withDepthStencilState(new DepthStencilState(CompareOp.ALWAYS_PASS, false))
+                .build();
+        final RenderSetup setup = RenderSetup.builder(pipeline)
+                .withTexture("Sampler0", textureId)
+                .setOutline(RenderSetup.OutlineProperty.NONE)
+                .createRenderSetup();
+        return CrythstRenderTypes.create(
+                "crythst_portal_debug_blit_" + textureId.getPath().replace('/', '_'), setup);
     }
 
     private static RenderSetup setup(RenderPipeline pipeline) {

@@ -10,9 +10,11 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 import org.joml.Vector3d;
 import org.joml.Vector4f;
@@ -42,6 +44,7 @@ final class PortalSurfaceRenderer {
     private static final float FALLBACK_BLUE = 0.86f;
     private static final float FALLBACK_ALPHA = 0.72f;
     private static final boolean FLIP_V = Boolean.getBoolean("crythst.portal.flipV");
+    private static final boolean DEBUG_BLIT = Boolean.getBoolean("crythst.portal.debugBlit");
     private static volatile boolean viewFailureLogged;
 
     private PortalSurfaceRenderer() {
@@ -76,9 +79,19 @@ final class PortalSurfaceRenderer {
         final Matrix4f viewProjection = new Matrix4f(worldProjection)
                 .mul(camera.viewRotationMatrix);
 
+        if (DEBUG_BLIT) {
+            renderDebugBlit(snapshots, dimension, viewProjection, collector);
+            return;
+        }
+
         final Map<RenderType, List<Polygon>> groups = new LinkedHashMap<>();
         final List<Polygon> colored = new ArrayList<>();
         final boolean shaderAvailable = PortalRenderTypes.available();
+        PortalSnapshot loggedPortal = null;
+        Identifier loggedTexture = null;
+        RenderType loggedType = null;
+        int loggedVertices = 0;
+        float[] loggedUv = new float[]{1.0f, 0.0f, 1.0f, 0.0f};
 
         for (PortalSnapshot snapshot : snapshots) {
             if (!snapshot.dimension().equals(dimension)) {
@@ -89,16 +102,28 @@ final class PortalSurfaceRenderer {
                     && PortalRenderManager.hasView(snapshot.id());
             final Matrix4f textureProjection = hasCapturedView
                     ? PortalRenderManager.captureViewProjection(snapshot.id()) : null;
+            final Vec3 textureCameraPos = hasCapturedView
+                    ? PortalRenderManager.captureCameraPos(snapshot.id()) : null;
             final Polygon polygon = buildPolygon(
-                    snapshot, camera, viewProjection, textureProjection);
+                    snapshot, camera, viewProjection, textureProjection, textureCameraPos);
             if (polygon == null) {
                 continue;
+            }
+            if (loggedPortal == null) {
+                loggedPortal = snapshot;
+                loggedTexture = hasCapturedView
+                        ? PortalRenderManager.textureId(snapshot.id()) : null;
+                loggedVertices = polygon.vertices().length;
+                loggedUv = uvRange(polygon.vertices());
             }
             if (!shaderAvailable) {
                 colored.add(polygon);
                 continue;
             }
             final RenderType type = chooseType(snapshot, dimension);
+            if (loggedPortal == snapshot) {
+                loggedType = type;
+            }
             if (type == null) {
                 colored.add(polygon);
             } else {
@@ -129,6 +154,86 @@ final class PortalSurfaceRenderer {
             collector.submitCustomGeometry(new PoseStack(), RenderTypes.debugFilledBox(),
                     (pose, consumer) -> emitFallback(colored, pose, consumer));
         }
+
+        if (loggedPortal != null) {
+            PortalRenderDiagnostics.surface(loggedPortal, loggedTexture, loggedType,
+                    loggedVertices, loggedUv[0], loggedUv[1], loggedUv[2], loggedUv[3],
+                    true, loggedType == null ? "coloured fallback" : "portal quad");
+        } else {
+            PortalRenderDiagnostics.surface(null, null, null, 0, 0, 0, 0, 0,
+                    false, "no visible portal (dimension/frustum/near-clip)");
+        }
+    }
+
+    private static float[] uvRange(Vertex[] vertices) {
+        float minU = Float.POSITIVE_INFINITY;
+        float maxU = Float.NEGATIVE_INFINITY;
+        float minV = Float.POSITIVE_INFINITY;
+        float maxV = Float.NEGATIVE_INFINITY;
+        for (Vertex vertex : vertices) {
+            minU = Math.min(minU, vertex.u());
+            maxU = Math.max(maxU, vertex.u());
+            minV = Math.min(minV, vertex.v());
+            maxV = Math.max(maxV, vertex.v());
+        }
+        return new float[]{minU, maxU, minV, maxV};
+    }
+
+    /**
+     * Full-screen diagnostic blit of the first captured portal texture. This
+     * bypasses the portal quad/UVs entirely and proves whether Sampler0 is
+     * bound to the live target view.
+     */
+    private static void renderDebugBlit(List<PortalSnapshot> snapshots, ResourceKey<Level> dimension,
+                                        Matrix4f viewProjection,
+                                        SubmitNodeCollector collector) {
+        for (PortalSnapshot snapshot : snapshots) {
+            if (!snapshot.dimension().equals(dimension)
+                    || !snapshot.viewableIn(dimension)
+                    || !PortalRenderManager.hasView(snapshot.id())) {
+                continue;
+            }
+            final var textureId = PortalRenderManager.textureId(snapshot.id());
+            if (textureId == null) {
+                continue;
+            }
+            final Matrix4f inverse = new Matrix4f(viewProjection);
+            if (Math.abs(inverse.determinant()) < 1.0e-12) {
+                continue;
+            }
+            inverse.invert();
+            final float[][] ndc = {
+                    {-1.0f, -1.0f}, {1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}};
+            final float[][] uv = {
+                    {0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+            final Vertex[] vertices = new Vertex[4];
+            boolean valid = true;
+            for (int i = 0; i < 4; i++) {
+                final Vector4f p = inverse.transform(
+                        new Vector4f(ndc[i][0], ndc[i][1], 0.0f, 1.0f));
+                if (Math.abs(p.w) < 1.0e-8f) {
+                    valid = false;
+                    break;
+                }
+                if (p.w < 0.0f) {
+                    p.mul(-1.0f);
+                }
+                vertices[i] = new Vertex(
+                        p.x / p.w, p.y / p.w, p.z / p.w, uv[i][0], uv[i][1]);
+            }
+            if (!valid) {
+                continue;
+            }
+            final Polygon polygon = new Polygon(vertices, vertices, 0.0);
+            final RenderType type = PortalRenderTypes.debugBlit(textureId);
+            collector.submitCustomGeometry(new PoseStack(), type,
+                    (pose, consumer) -> emitShader(List.of(polygon), pose, consumer));
+            PortalRenderDiagnostics.surface(snapshot, textureId, type,
+                    6, 0.0f, 1.0f, 0.0f, 1.0f, true, "debug fullscreen blit");
+            return;
+        }
+        PortalRenderDiagnostics.surface(null, null, null, 0, 0, 0, 0, 0,
+                false, "debug blit: no captured portal");
     }
 
     private static RenderType chooseType(PortalSnapshot snapshot, ResourceKey<Level> dimension) {
@@ -159,7 +264,8 @@ final class PortalSurfaceRenderer {
     }
 
     private static Polygon buildPolygon(PortalSnapshot snapshot, CameraRenderState camera,
-                                        Matrix4f viewProjection, Matrix4f textureProjection) {
+                                        Matrix4f viewProjection, Matrix4f textureProjection,
+                                        Vec3 textureCameraPos) {
         final var plane = snapshot.plane();
         final Vector3d origin = plane.origin();
         final double dx = camera.pos.x - origin.x;
@@ -187,8 +293,14 @@ final class PortalSurfaceRenderer {
             final float y = (float) (corner.y - camera.pos.y);
             final float z = (float) (corner.z - camera.pos.z);
             final Vector4f clip = viewProjection.transform(new Vector4f(x, y, z, 1.0f));
+            final float tx = textureCameraPos == null
+                    ? x : (float) (corner.x - textureCameraPos.x);
+            final float ty = textureCameraPos == null
+                    ? y : (float) (corner.y - textureCameraPos.y);
+            final float tz = textureCameraPos == null
+                    ? z : (float) (corner.z - textureCameraPos.z);
             final Vector4f textureClip = (textureProjection != null ? textureProjection : viewProjection)
-                    .transform(new Vector4f(x, y, z, 1.0f));
+                    .transform(new Vector4f(tx, ty, tz, 1.0f));
             final Vertex vertex = clip.w > CLIP_EPSILON
                     ? vertexFromClip(x, y, z, textureClip)
                     : new Vertex(x, y, z, 0.0f, 0.0f);

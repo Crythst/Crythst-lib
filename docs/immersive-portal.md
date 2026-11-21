@@ -402,7 +402,8 @@ PortalSurfaceRenderer (BEFORE_GIZMOS)
    跳过 vanilla 的无界 `addSectionsInFrustum` 路径。
 4. 用有界扫描（`PortalSectionVisibility`）为目标相机填充可见 section：
    按扩展环遍历已加载区块的 section，只保留 `cullFrustum.isVisible(...)` 的项；
-   半径上限 24 个 section，单次最多检查 65,536 个 section。
+   半径上限 24 个 section，单次最多检查 65,536 个 section，最终最多选取 4,096 个
+   section（按离目标相机由近到远的扩展环顺序），避免一次离屏渲染提交数万 section。
 5. `PortalOffscreenPass` 在捕获期间通过 `PortalGameRendererMixin` 把
    `GameRenderer.mainRenderTarget()` 重定向到该传送门自己的离屏 `TextureTarget`。
    `LevelRenderer.render` 直接画进这个带深度附件的目标，不再经过“先画主目标再 copy”
@@ -477,10 +478,10 @@ u = ndc.x * 0.5 + 0.5
 v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit 一致
 ```
 
-纹理在两次刷新之间是静态的，因此 UV 使用**捕获时的主相机 view-projection**
-（`PortalViewTarget.captureViewProjection`），而不是当前帧的矩阵。否则玩家移动时静态纹理
-会被按新视角重新采样，产生滑动/拉伸；当前实现让图像固定在传送门平面上，下一轮捕获
-（默认 10 Hz）再更新。几何近平面裁剪仍使用当前帧矩阵，两者分开处理。
+纹理在两次刷新之间是静态的，因此 UV 使用**捕获时的主相机位置 + view-projection**
+（`PortalViewTarget.captureCameraPos` / `captureViewProjection`），并用“顶点 - 捕获相机位置”
+作为输入；而不是把当前帧的相机相对位置喂给捕获矩阵。否则玩家移动时静态纹理会被按错误
+原点重新投影，产生滑动/拉伸。几何近平面裁剪仍使用当前帧相机位置与当前矩阵，两者分开处理。
 
 > 诊断开关：
 > - `-Dcrythst.portal.flipV=true` 翻转 v（确认后端纹理朝向）；
@@ -488,6 +489,8 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 > - `-Dcrythst.portal.forceProcedural=true` 保留捕获但强制使用程序化表面（A/B 对比）；
 > - `-Dcrythst.portal.capture.dump=true` 把第一次成功捕获的离屏纹理写入
 >   `screenshots/`，用于确认目标纹理本身是否有内容；
+> - `-Dcrythst.portal.debugBlit=true` 把第一个可用捕获纹理**全屏**绘制（绕过传送门
+>   四边形和 UV），用于区分“纹理/采样绑定问题”与“四边形 UV 问题”；
 > - `-Dcrythst.portal.capture.intervalMs=100` 调整基础捕获间隔（默认 100 ms；会根据
 >   实测 extract+render 成本在 100–250 ms 间自适应）；
 > - `-Dcrythst.portal.capture.scale=1.0` 调整离屏分辨率比例（默认 1.0，另受
@@ -504,6 +507,10 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
   通过 `TextureManager.register` 注册；视图变化时直接替换 wrapper 的 `textureView`，
   **不会触发资源重载**。
 - 每个传送门一个按纹理 id 缓存的 `RenderType`，渲染时按 RenderType 分组提交。
+  目标 resize 时会重新注册 `PortalViewTexture` 并使旧 RenderType 缓存失效，避免采样旧
+  colour view；`RenderSetup` 在每帧 `PreparedRenderType` 构建时解析当前纹理。
+- 诊断表面日志（最多 1 Hz）会报告 texture id、当前 texture view 尺寸、view 是否等于
+  target 当前 colour view、pipeline、顶点数和 UV 范围，可直接定位绑定/UV 问题。
 
 ### 递归、性能与回退
 
@@ -516,6 +523,9 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
   未捕获的帧继续使用上一张纹理。
 - 每次成功捕获输出一条（最多 1 Hz）`[portal timings]`：portal、分辨率、section 数、
   extract/render/total 毫秒、scale 和 interval，便于运行时判断预算。
+- 表面提交输出一条（最多 1 Hz）`Crythst portal surface:` 日志：是否提交、纹理 id、
+  texture view 尺寸、view 是否与 target 当前 color view 相同、pipeline、顶点数和 UV 范围。
+  这能直接区分“选择/纹理绑定”与“UV/裁剪”问题。
 - 可见性：主相机 `cullFrustum` 对入口平面 AABB 裁剪；跨维度链接不捕获（回退程序化）。
 - 回退：
   - 管线无法构建 → `RenderTypes.debugFilledBox()` 紫色四边形；

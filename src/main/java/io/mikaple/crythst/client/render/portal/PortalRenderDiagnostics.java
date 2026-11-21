@@ -4,6 +4,8 @@ import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.resources.Identifier;
 
 /**
  * Rate-limited, low-volume diagnostics for the portal view pipeline.
@@ -19,6 +21,7 @@ final class PortalRenderDiagnostics {
     private static boolean pathLogged;
     private static boolean dumped;
     private static long lastSkipLogNanos = -SKIP_LOG_INTERVAL_NANOS;
+    private static long lastSurfaceLogNanos = -SKIP_LOG_INTERVAL_NANOS;
 
     private PortalRenderDiagnostics() {
     }
@@ -70,6 +73,49 @@ final class PortalRenderDiagnostics {
                 String.format("%.2f", extractMs + renderMs),
                 String.format("%.2f", PortalCaptureSettings.SCALE),
                 intervalNanos / 1_000_000L);
+    }
+
+    /**
+     * One-line surface diagnostic (max 1/s): texture id, pipeline, vertex
+     * count, UV range and whether the quad was submitted.
+     */
+    static void surface(PortalSnapshot portal, Identifier textureId, RenderType type,
+                        int vertices, float minU, float maxU, float minV, float maxV,
+                        boolean submitted, String detail) {
+        final long now = System.nanoTime();
+        if (now - lastSurfaceLogNanos < SKIP_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastSurfaceLogNanos = now;
+
+        boolean textureViewOk = false;
+        int textureW = -1;
+        int textureH = -1;
+        String sampler = "<none>";
+        if (textureId != null) {
+            try {
+                final var texture = Minecraft.getInstance().getTextureManager().getTexture(textureId);
+                textureViewOk = texture.getTextureView() != null;
+                textureW = texture.getTextureView().getWidth(0);
+                textureH = texture.getTextureView().getHeight(0);
+                sampler = String.valueOf(texture.getSampler());
+            } catch (Throwable ignored) {
+                textureViewOk = false;
+            }
+        }
+        final String pipeline = type == null ? "<none>"
+                : String.valueOf(type.pipeline().getLocation());
+        final boolean viewMatches = portal != null
+                && PortalRenderManager.textureViewMatches(portal.id());
+        Crythst.LOGGER.info(
+                "Crythst portal surface: portal='{}' submitted={} detail={} texture={} "
+                        + "textureView={}x{} viewOk={} viewMatchesTarget={} sampler={} "
+                        + "pipeline={} vertices={} uv=[{},{}..{},{}]",
+                portal == null ? "<none>" : portal.name(), submitted, detail,
+                textureId == null ? "<procedural>" : textureId.toString(),
+                textureW, textureH, textureViewOk, viewMatches, sampler, pipeline, vertices,
+                String.format("%.3f", minU), String.format("%.3f", maxU),
+                String.format("%.3f", minV), String.format("%.3f", maxV));
     }
 
     static void dumpIfEnabled(PortalViewTarget target) {

@@ -16,7 +16,8 @@ import org.joml.Vector3f;
  * The virtual destination camera and the exact projection used by the main
  * pass for this frame.
  */
-record PortalViewCamera(Vec3 position, Quaternionf orientation, Matrix4f viewRotation,
+record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
+                        Quaternionf orientation, Matrix4f viewRotation,
                         Matrix4f projection, Matrix4f mainViewProjection,
                         Frustum frustum, float yaw, float pitch,
                         PortalTransform transform) {
@@ -70,8 +71,8 @@ record PortalViewCamera(Vec3 position, Quaternionf orientation, Matrix4f viewRot
         final Matrix4f mainViewProjection = new Matrix4f(projection)
                 .mul(main.viewRotationMatrix);
 
-        return new Result(new PortalViewCamera(portalPos, orientation, viewRotation,
-                projection, mainViewProjection, frustum, yawPitch[0], yawPitch[1],
-                transform), null);
+        return new Result(new PortalViewCamera(portalPos, main.pos, orientation,
+                viewRotation, projection, mainViewProjection, frustum,
+                yawPitch[0], yawPitch[1], transform), null);
     }
 }

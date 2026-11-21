@@ -23,6 +23,8 @@ import java.util.List;
 final class PortalSectionVisibility {
     static final int MAX_SCAN_RADIUS_SECTIONS = 24;
     static final int MAX_SCANNED_SECTIONS = 65_536;
+    /** Draw budget for one portal view; nearest rings are selected first. */
+    static final int MAX_VISIBLE_SECTIONS = 4096;
     private static final double NEARBY_DISTANCE_IN_BLOCKS = 32.0;
 
     private PortalSectionVisibility() {
@@ -83,6 +85,9 @@ final class PortalSectionVisibility {
                             nearby.add(section);
                         }
                         added++;
+                        if (added >= MAX_VISIBLE_SECTIONS) {
+                            return added;
+                        }
                     }
                 }
             }

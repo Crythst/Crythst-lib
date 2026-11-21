@@ -2,6 +2,7 @@ package io.mikaple.crythst.client.render.portal;
 
 import com.mojang.blaze3d.pipeline.TextureTarget;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.SkyRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.TextureManager;
@@ -30,6 +31,7 @@ final class PortalViewTarget {
     private float lastCameraYaw;
     private float lastCameraPitch;
     private final Matrix4f captureViewProjection = new Matrix4f();
+    private Vec3 captureCameraPos;
     private SkyRenderer skyRenderer;
 
     PortalViewTarget(UUID portalId, Identifier textureId,
@@ -77,6 +79,10 @@ final class PortalViewTarget {
         }
         target = replacement;
         texture.setTarget(replacement, sampler);
+        // Re-register the same wrapper so the manager cannot retain a stale
+        // texture entry across a target resize.
+        Minecraft.getInstance().getTextureManager().register(textureId, texture);
+        PortalRenderTypes.invalidate(textureId);
     }
 
     /**
@@ -94,12 +100,14 @@ final class PortalViewTarget {
         return skyRenderer;
     }
 
-    void markReady(CameraRenderState mainCamera, long now, Matrix4f viewProjection) {
+    void markReady(CameraRenderState mainCamera, long now, Matrix4f viewProjection,
+                   Vec3 captureCameraPosition) {
         ready = true;
         lastCaptureNanos = now;
         if (viewProjection != null) {
             captureViewProjection.set(viewProjection);
         }
+        captureCameraPos = captureCameraPosition;
         if (mainCamera != null) {
             lastCameraPos = mainCamera.pos;
             lastCameraYaw = mainCamera.yRot;
@@ -109,6 +117,10 @@ final class PortalViewTarget {
 
     Matrix4f captureViewProjection() {
         return new Matrix4f(captureViewProjection);
+    }
+
+    Vec3 captureCameraPos() {
+        return captureCameraPos;
     }
 
     void markFailed() {

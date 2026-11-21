@@ -14,6 +14,7 @@ import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -76,9 +77,29 @@ public final class PortalRenderManager {
      * for UVs so a static captured image stays fixed to the portal plane
      * instead of sliding with the current camera between refreshes.
      */
+    /** True when the registered texture wrapper currently exposes the target's live colour view. */
+    static boolean textureViewMatches(UUID portalId) {
+        final PortalViewTarget target = INSTANCE.registry.get(portalId);
+        if (target == null || target.target() == null || target.target().getColorTextureView() == null) {
+            return false;
+        }
+        try {
+            final var texture = Minecraft.getInstance().getTextureManager()
+                    .getTexture(target.textureId());
+            return texture.getTextureView() == target.target().getColorTextureView();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     static org.joml.Matrix4f captureViewProjection(UUID portalId) {
         final PortalViewTarget target = INSTANCE.registry.get(portalId);
         return target == null || !target.ready() ? null : target.captureViewProjection();
+    }
+
+    static Vec3 captureCameraPos(UUID portalId) {
+        final PortalViewTarget target = INSTANCE.registry.get(portalId);
+        return target == null || !target.ready() ? null : target.captureCameraPos();
     }
 
     public static RenderTarget renderTargetOverride() {
@@ -232,7 +253,8 @@ public final class PortalRenderManager {
                 final double renderMs = offscreen.render(
                         minecraft, levelRenderer, levelState, mainCamera, view,
                         extraction.camera(), target);
-                target.markReady(mainCamera, System.nanoTime(), view.mainViewProjection());
+                target.markReady(mainCamera, System.nanoTime(), view.mainViewProjection(),
+                        view.mainCapturePosition());
                 PortalRenderDiagnostics.firstCapture(portal, target, extraction.sectionCount());
                 PortalRenderDiagnostics.dumpIfEnabled(target);
                 timings.record(portal, target, extraction.sectionCount(),
