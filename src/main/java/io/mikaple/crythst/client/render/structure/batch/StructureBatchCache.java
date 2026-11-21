@@ -127,7 +127,10 @@ final class StructureBatchCache {
                 continue;
             }
 
-            final long required = section.countVertices();
+            final long required = section.pendingVertices >= 0L
+                    ? section.pendingVertices
+                    : section.countVertices();
+            section.pendingVertices = required;
             if (required == 0L) {
                 section.invalidate();
                 section.dirty = false;
@@ -418,6 +421,8 @@ final class StructureBatchCache {
         boolean built;
         boolean overBudget;
         long vertexCount;
+        /** Cached result of {@link #countVertices()} for a dirty section. */
+        long pendingVertices = -1L;
 
         double frameDistanceSq;
         double frameCenterX;
@@ -487,6 +492,7 @@ final class StructureBatchCache {
                 final int y = index / (sizeX * sizeZ);
                 states[index] = snapshot.stateAt(originX + x, originY + y, originZ + z);
             }
+            pendingVertices = -1L;
             invalidate();
             dirty = true;
             built = false;
@@ -524,6 +530,7 @@ final class StructureBatchCache {
                 CACHED_VERTICES.addAndGet(installed);
                 body.vertexCount += installed;
             }
+            pendingVertices = -1L;
             dirty = false;
             built = true;
             overBudget = false;
