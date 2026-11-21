@@ -14,10 +14,15 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
+import net.minecraft.client.renderer.state.GameRenderState;
+import net.minecraft.client.renderer.state.OptionsRenderState;
+import net.minecraft.client.renderer.state.WindowRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.BlockPos;
@@ -92,10 +97,12 @@ public final class PortalCapture {
 
     private static CrossFrameResourcePool resourcePool;
     private static FogRenderer fogRenderer;
+    private static GlobalSettingsUniform portalGlobalSettings;
     private static long lastCaptureNanos;
     private static boolean capturing;
     private static boolean registered;
     private static boolean failureLogged;
+    private static boolean firstCaptureLogged;
 
     private PortalCapture() {
     }
@@ -201,7 +208,7 @@ public final class PortalCapture {
         }
 
         ensureResources();
-        if (resourcePool == null || fogRenderer == null) {
+        if (resourcePool == null || fogRenderer == null || portalGlobalSettings == null) {
             return;
         }
 
@@ -247,6 +254,7 @@ public final class PortalCapture {
                 // Each capture consumes the lists; restore them so the next
                 // capture and the main pass still have the entities.
                 restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
+                updateGlobalSettings(context, portalCamera.pos);
 
                 final CameraRenderState previous = levelState.cameraRenderState;
                 boolean rendered = false;
@@ -268,6 +276,12 @@ public final class PortalCapture {
                 if (rendered) {
                     target.target.copyColorFrom(mainTarget);
                     captured.add(portal.id());
+                    if (!firstCaptureLogged) {
+                        firstCaptureLogged = true;
+                        Crythst.LOGGER.info(
+                                "Crythst captured destination view for portal '{}' ({}x{})",
+                                portal.name(), mainTarget.width, mainTarget.height);
+                    }
                 }
                 count++;
             }
@@ -275,6 +289,12 @@ public final class PortalCapture {
             restoreRenderStateLists(levelState, savedEntities, savedBlockEntities, savedBreaking);
             levelState.shouldUseMultiDrawIndirectForTerrain = savedMultiDraw;
             levelState.playerCompiledSectionCallback = savedCompiledSectionCallback;
+            // Restore the global camera UBO for the normal main pass. The next
+            // GameRenderer frame will overwrite it again; doing it here keeps
+            // the same frame consistent too.
+            if (portalGlobalSettings != null) {
+                updateGlobalSettings(context, mainCamera.pos);
+            }
             capturing = false;
             READY.clear();
             READY.addAll(captured);
@@ -363,6 +383,31 @@ public final class PortalCapture {
         if (fogRenderer == null) {
             fogRenderer = new FogRenderer();
         }
+        if (portalGlobalSettings == null) {
+            portalGlobalSettings = new GlobalSettingsUniform();
+        }
+    }
+
+    /**
+     * Rewrites the global camera UBO before a capture. The terrain vertex
+     * shader reconstructs world positions as
+     * {@code Position + (ChunkPosition - CameraBlockPos) + CameraOffset}, so
+     * the uniform must describe the portal camera rather than the main camera.
+     */
+    private static void updateGlobalSettings(LevelExtractionContext context, Vec3 cameraPos) {
+        final GameRenderState game = context.gameRenderer().gameRenderState();
+        final OptionsRenderState options = game.optionsRenderState;
+        final WindowRenderState window = game.windowRenderState;
+        final LevelRenderState levelState = context.levelState();
+        portalGlobalSettings.update(
+                window.width,
+                window.height,
+                options.glintStrength,
+                levelState.gameTime,
+                levelState.worldPartialTicks,
+                options.menuBackgroundBlurriness,
+                cameraPos,
+                options.textureFiltering == TextureFilteringMethod.RGSS);
     }
 
     private static ViewTarget ensureTarget(PortalSnapshot portal, RenderTarget mainTarget) {
@@ -431,6 +476,7 @@ public final class PortalCapture {
             if (live.contains(entry.getKey())) {
                 continue;
             }
+            Minecraft.getInstance().getTextureManager().release(entry.getValue().textureId);
             entry.getValue().close();
             iterator.remove();
         }
@@ -447,6 +493,10 @@ public final class PortalCapture {
         if (fogRenderer != null) {
             fogRenderer.close();
             fogRenderer = null;
+        }
+        if (portalGlobalSettings != null) {
+            portalGlobalSettings.close();
+            portalGlobalSettings = null;
         }
         if (resourcePool != null) {
             resourcePool.clear();

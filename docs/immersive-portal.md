@@ -303,6 +303,10 @@ PortalRenderer (BEFORE_GIZMOS)
 - `LevelRenderer.submitFeatures` 会清空 `entityRenderStates` / `blockEntityRenderStates` /
   `blockBreakingRenderStates`；捕获前后会保存并恢复这些列表，保证主 pass 仍能绘制实体与方块实体。
 - 捕获期间将 `shouldUseMultiDrawIndirectForTerrain` 置 false，走稳定的非 indirect 路径。
+- 地形顶点着色器使用 `Globals.CameraBlockPos/CameraOffset` 重建世界坐标；捕获前用传送门相机
+  位置重写一个私有 `GlobalSettingsUniform`，捕获结束后再用主相机位置恢复，否则目标视图会
+  整体偏移主相机与传送门相机之差。
+- 捕获 pass 不渲染天空（`shouldRenderSky=false`），只用雾色清屏。
 
 ### 传送门相机
 
@@ -368,7 +372,11 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh 的 NDC→UV 约定一�
   - 默认 10 Hz、最多 2 个最近传送门、160 格内；
   - 会触发一次额外的 `submitFeatures`（其他模组的 LevelRender 事件监听器也会被调用），
     虽然实体/方块实体列表会保存并恢复，但属于 v1 的性能/兼容性取舍；
+  - 地形/方块实体会按传送门相机重新裁剪和绘制；**实体渲染状态仍来自主相机的提取结果**，
+    如果出口附近在主相机可见范围之外，目标视图里可能缺少部分实体（需要第二次 extract 才能完全修正）；
   - 目标维度必须有已加载区块；未加载区域显示为雾色。
+- 捕获 pass 使用当前已绑定的 projection UBO（与主相机投影相同）；窗口/FOV 变化的单帧可能
+  有轻微不匹配。
 - 捕获 pass 不渲染天空（`shouldRenderSky=false`），开阔天空方向显示为雾色。
 - 跨维度链接：实体可用 `TeleportTransition` 穿越，但不会做目标维度离屏捕获（回退程序化）。
 - 没有传送门框架方块、点火方式、数据驱动定义、颜色/音效配置。

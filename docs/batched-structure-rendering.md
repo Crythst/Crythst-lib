@@ -181,6 +181,7 @@ baked quad, so no faces are dropped and no black/default quads are introduced.
 | Level/dimension change | All body caches are cleared when the dimension key changes. |
 | Structure removed / snapshot disappears | Body caches are pruned after `BODY_EXPIRY_NANOS` (2 s) without being seen. |
 | Renderer disabled | `setEnabled(false)` clears the resident vertex cache. |
+| Special renderer registered/replaced | `SpecialBlockRenderers.size()` change clears body caches so normal quads are removed and special cells are recollected. Replacing an already-special renderer needs no rebuild. |
 | Vertex cache budget | Sections that cannot fit are marked `overBudget` and drawn through the bounded per-block fallback; they are retried automatically once the cache falls below half the budget. |
 
 Snapshots are rebuilt on the server thread every 4 ticks and the snapshot
