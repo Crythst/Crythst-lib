@@ -1,7 +1,13 @@
 package io.mikaple.crythst.integration.fabric.client;
 
+import io.mikaple.crythst.client.network.ClientStructureCache;
+import io.mikaple.crythst.client.network.ClientStructureSnapshot;
+import io.mikaple.crythst.client.render.structure.selection.StructureSelectionMath;
 import io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureRay;
 import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.physics.structure.PhysicsStructure;
+import io.mikaple.crythst.physics.structure.StructureRenderState;
+import io.mikaple.crythst.physics.voxel.VoxelBox;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.Gizmos;
@@ -11,6 +17,8 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
+
+import java.util.List;
 
 /**
  * Draws a white block-selection box around the structure voxel under the
@@ -46,17 +54,62 @@ public final class StructureSelectionRenderer {
             }
         }
 
-        final Transform3d pose = hit.pose();
-        final double scale = hit.blockScale();
-        final Vector3d local = pose.inverseTransformPoint(hit.point());
-        final int x = (int) Math.floor(local.x / scale);
-        final int y = (int) Math.floor(local.y / scale);
-        final int z = (int) Math.floor(local.z / scale);
-        if (y < -1_000_000 || y > 1_000_000) {
+        final Vector3d ray = new Vector3d(
+                hit.point().x - eye.x, hit.point().y - eye.y, hit.point().z - eye.z);
+        final StructureSelectionMath.SolidCell solid = solidCell(hit, minecraft);
+        if (solid == null) {
             return;
         }
-        drawCube(pose, x * scale, y * scale, z * scale,
-                (x + 1) * scale, (y + 1) * scale, (z + 1) * scale);
+        final StructureSelectionMath.Cell cell = StructureSelectionMath.findCell(
+                hit.pose(), hit.point(), ray, hit.blockScale(), solid);
+        if (cell == null) {
+            return;
+        }
+
+        final Transform3d pose = hit.pose();
+        final double scale = hit.blockScale();
+        drawCube(pose, cell.x() * scale, cell.y() * scale, cell.z() * scale,
+                (cell.x() + 1) * scale, (cell.y() + 1) * scale, (cell.z() + 1) * scale);
+    }
+
+    /**
+     * Builds the structure-local solidity test for the hit body. Network
+     * snapshots are authoritative in multiplayer; in singleplayer the
+     * render-thread collider boxes are immutable and already merged.
+     */
+    private static StructureSelectionMath.SolidCell solidCell(ClientStructureRay.Hit hit,
+                                                              Minecraft minecraft) {
+        final float alpha = minecraft.getDeltaTracker()
+                .getGameTimeDeltaPartialTick(false);
+        for (PhysicsStructure structure : ClientPhysicsView.structures()) {
+            final StructureRenderState state = structure.renderState(alpha);
+            if (state.bodyId() != hit.bodyId()) {
+                continue;
+            }
+            final List<VoxelBox> boxes = state.collider().boxes();
+            return (x, y, z) -> {
+                for (VoxelBox box : boxes) {
+                    if (x >= box.minX() && x < box.minX() + box.sizeX()
+                            && y >= box.minY() && y < box.minY() + box.sizeY()
+                            && z >= box.minZ() && z < box.minZ() + box.sizeZ()) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+        }
+
+        final ClientStructureSnapshot network = ClientStructureCache.get(hit.bodyId());
+        if (network != null) {
+            return (x, y, z) -> {
+                try {
+                    return network.isSolid(x, y, z);
+                } catch (RuntimeException ignored) {
+                    return false;
+                }
+            };
+        }
+        return null;
     }
 
     private static void drawCube(Transform3d pose, double x0, double y0, double z0,
