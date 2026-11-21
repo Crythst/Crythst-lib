@@ -1,6 +1,6 @@
 package io.mikaple.crythst.mixin.client;
 
-import io.mikaple.crythst.client.render.portal.PortalCapture;
+import io.mikaple.crythst.client.render.portal.PortalRenderManager;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.extract.LevelExtractor;
@@ -26,6 +26,6 @@ public abstract class PortalCaptureMixin {
     @Inject(method = "extract", at = @At("HEAD"))
     private void crythst$capturePortalViews(DeltaTracker deltaTracker, Camera camera,
                                             float worldPartialTicks, CallbackInfo ci) {
-        PortalCapture.onExtractStart(camera, deltaTracker, worldPartialTicks);
+        PortalRenderManager.onExtractStart(camera, deltaTracker, worldPartialTicks);
     }
 }

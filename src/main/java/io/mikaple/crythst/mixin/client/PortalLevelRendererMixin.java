@@ -1,6 +1,6 @@
 package io.mikaple.crythst.mixin.client;
 
-import io.mikaple.crythst.client.render.portal.PortalCapture;
+import io.mikaple.crythst.client.render.portal.PortalRenderManager;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,7 +26,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class PortalLevelRendererMixin {
     @Inject(method = "repositionCamera", at = @At("HEAD"), cancellable = true)
     private void crythst$keepMainViewAreaForPortalCapture(CameraRenderState camera, CallbackInfo ci) {
-        if (PortalCapture.isCapturing()) {
+        if (PortalRenderManager.isCapturing()) {
             ci.cancel();
         }
     }

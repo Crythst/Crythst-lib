@@ -24,14 +24,25 @@
 | `integration/fabric/portal/PortalCommand.java` | `/crythst portal ...` 命令（合并进已有 `/crythst`） |
 | `client/render/portal/PortalClientCache.java` | 渲染线程只读的不可变快照缓存 |
 | `client/render/portal/PortalClientView.java` | 客户端 tick 从单机集成服务器刷新快照 |
-| `client/render/portal/PortalCapture.java` | `LevelExtractor.extract` 头部的目标场景重提取、离屏捕获与节流 |
+| `client/render/portal/PortalRenderManager.java` | 管线编排、候选选择、节流、入口 API |
+| `client/render/portal/PortalViewRegistry.java` / `PortalViewTarget.java` | 每传送门目标、纹理注册、尺寸/生命周期、可复用性 |
+| `client/render/portal/PortalViewCamera.java` | 链接变换、相机位姿、投影/视锥 |
+| `client/render/portal/PortalDestinationExtractor.java` | 作用域化目标端重提取、相机/状态恢复 |
+| `client/render/portal/PortalSectionVisibility.java` | 有界 section 选择与有预算编译 |
+| `client/render/portal/PortalOffscreenPass.java` | 隔离的 RenderPearl 离屏世界渲染 |
+| `client/render/portal/PortalSurfaceRenderer.java` | 四边形投影 UV、近平面裁剪、合成与回退 |
+| `client/render/portal/PortalProjection.java` | 与主 pass 完全一致的投影（bob/hurt/spin） |
+| `client/render/portal/PortalCaptureSettings.java` | 系统属性、分辨率/间隔/预算 |
+| `client/render/portal/PortalCaptureTimings.java` | 捕获节奏与自适应成本 |
+| `client/render/portal/PortalRenderDiagnostics.java` | 限流日志、timings、capture dump |
 | `client/render/portal/PortalTeleportFade.java` | 穿门 2 tick 轻微视觉过渡（HUD，不干扰移动） |
 | `mixin/client/PortalCaptureMixin.java` | 在主相机提取之前触发传送门捕获 |
 | `mixin/client/PortalCameraAccessor.java` | 临时设置/恢复真实 `Camera` 位姿与视锥 |
 | `mixin/client/PortalGameRendererMixin.java` | 捕获期间把 `mainRenderTarget()` 重定向到传送门离屏目标 |
 | `mixin/client/PortalLevelRendererMixin.java` | 捕获期间保持主 `ViewArea` 中心，避免 section mesh 被重置 |
+| `mixin/client/PortalLevelRendererAccessor.java` | 捕获期间换入 target-bound `SkyRenderer` |
 | `client/render/portal/PortalViewTexture.java` | 把离屏 `TextureTarget` 包装为 `TextureManager` 纹理 |
-| `client/render/portal/PortalRenderer.java` | `BEFORE_GIZMOS` 中的相机相对四边面渲染 + 回退色块 |
+| `client/render/portal/PortalRenderer.java` | 客户端入口 facade（注册管线/事件） |
 | `client/render/portal/PortalRenderTypes.java` | 程序化 / 目标视图管线与 RenderType |
 | `resources/assets/crythst/shaders/core/portal.vsh/.fsh` | 旋涡星空程序化表面（使用 `GameTime`） |
 | `resources/assets/crythst/shaders/core/portal_view.fsh` | 采样目标场景离屏纹理的投影表面 |
@@ -355,18 +366,18 @@ PortalClientView (client tick, 单机)
         ▼
 PortalClientCache (volatile immutable List<PortalSnapshot>)
         │
-        ├──► PortalCapture (LevelExtractor.extract HEAD, render thread)
-        │      1. 由主相机 + 链接变换构造传送门相机位姿
-        │      2. 临时把真实 Camera 指向目标端，嵌套 extract 重建全部渲染状态
-        │      3. 有界扫描重建传送门相机的 visibleSections
-        │      4. 捕获期间把 mainRenderTarget() 重定向到每传送门离屏 TextureTarget
-        │      5. LevelRenderer.render(...) 直接画进该目标
-        │      6. 恢复相机/视锥/可见 section/主相机渲染状态
-        │      7. 注册/更新 PortalViewTexture（TextureManager，不触发 reload）
+        ├──► PortalRenderManager (LevelExtractor.extract HEAD, render thread)
+        │      1. PortalViewRegistry/PortalViewTarget：选择/创建每传送门目标
+        │      2. PortalViewCamera：链接变换 + 主 pass 同款投影
+        │      3. PortalDestinationExtractor：作用域化重提取 + 有界 section
+        │      4. PortalOffscreenPass：隔离状态，重定向 mainRenderTarget()
+        │      5. LevelRenderer.render(...) 直接画进离屏 color+depth 目标
+        │      6. 恢复相机/视锥/可见 section/全局渲染状态
+        │      7. PortalCaptureTimings：节流、自适应成本、timings
         │
         ▼
-PortalRenderer (BEFORE_GIZMOS)
-        └── 用屏幕空间 UV 采样离屏纹理；无捕获时回退程序化表面
+PortalSurfaceRenderer (BEFORE_GIZMOS)
+        └── 四边形投影 UV + 近平面裁剪；采样离屏纹理或程序化回退
 ```
 
 - 渲染线程**不访问** `PortalManager` 或服务器对象；快照包含目标平面。
@@ -389,14 +400,15 @@ PortalRenderer (BEFORE_GIZMOS)
 3. 用 `PortalCameraAccessor` 临时把真实相机放到 `T(eye)`，并把一个显式视锥设为 captured。
    这样嵌套 `LevelExtractor.extract` 会为主相机之外的目标相机重新生成全部渲染状态，同时
    跳过 vanilla 的无界 `addSectionsInFrustum` 路径。
-4. 用有界扫描（`PortalSectionSelection`）为目标相机填充可见 section：
+4. 用有界扫描（`PortalSectionVisibility`）为目标相机填充可见 section：
    按扩展环遍历已加载区块的 section，只保留 `cullFrustum.isVisible(...)` 的项；
    半径上限 24 个 section，单次最多检查 65,536 个 section。
-5. 在捕获期间，`PortalGameRendererMixin` 把 `GameRenderer.mainRenderTarget()` 重定向到
-   该传送门自己的离屏 `TextureTarget`。`LevelRenderer.render` 直接画进这个带深度附件的
-   目标，不再经过“先画主目标再 copy”的排序敏感路径，因此纹理里确实是目标场景。
-6. 恢复相机、视锥、可见 section 和主相机渲染状态；外层未受影响的 `extract` 继续为主相机
-   完成正常提取，不需要再补一次主相机 extraction。
+5. `PortalOffscreenPass` 在捕获期间通过 `PortalGameRendererMixin` 把
+   `GameRenderer.mainRenderTarget()` 重定向到该传送门自己的离屏 `TextureTarget`。
+   `LevelRenderer.render` 直接画进这个带深度附件的目标，不再经过“先画主目标再 copy”
+   的排序敏感路径，因此纹理里确实是目标场景。
+6. `PortalDestinationExtractor.Scope` 恢复相机、视锥、可见 section、section dispatcher
+   相机位置和主相机渲染状态；外层未受影响的 `extract` 继续为主相机完成正常提取。
 
 ### 空白纹理/卡顿的真正原因（已修复）
 
@@ -411,7 +423,7 @@ PortalRenderer (BEFORE_GIZMOS)
 
 修复：
 
-- 捕获**不再移动共享 `ViewArea`**。`PortalSectionSelection` 直接在现有主相机 section
+- 捕获**不再移动共享 `ViewArea`**。`PortalSectionVisibility` 直接在现有主相机 section
   storage 中查询目标相机附近的 section；storage 之外的 section 返回 null 并跳过。
 - 新增 `PortalLevelRendererMixin`：捕获期间取消 `LevelRenderer.repositionCamera` 的
   `viewArea.repositionCamera`（只通过 `SectionRenderDispatcher.setCameraPosition` 更新
@@ -426,11 +438,11 @@ PortalRenderer (BEFORE_GIZMOS)
 
 关键细节：
 
-- **捕获期间完全不提交传送门表面**：`PortalRenderer.render` 在
-  `PortalCapture.isCapturing()` 时直接返回（纹理、程序化和彩色回退全部跳过）。目标纹理只
-  包含目标端世界，不会把目标传送门自己的程序化星空画进去，也不会采样正在写入的纹理。
-  主 pass 不受影响，未捕获的其它传送门仍可使用程序化表面。
-- 嵌套提取由 `PortalCapture.isCapturing()` 守卫，不会递归触发捕获。
+- **捕获期间完全不提交传送门表面**：`PortalSurfaceRenderer.render` 在
+  `PortalRenderManager.isCapturing()` 时直接返回（纹理、程序化和彩色回退全部跳过）。
+  目标纹理只包含目标端世界，不会把目标传送门自己的程序化星空画进去，也不会采样正在
+  写入的纹理。主 pass 不受影响，未捕获的其它传送门仍可使用程序化表面。
+- 嵌套提取由 `PortalRenderManager.isCapturing()` 守卫，不会递归触发捕获。
 - 传送门相机会先用 `PortalCameraSanity` 校验位置、四元数、view 旋转和透视投影；
   不合法时直接跳过捕获（限流的 DEBUG 日志）并回退程序化表面。
 - 如果目标端 section 为空、未加载、没有编译完成的 mesh 或不在视锥内，本次捕获直接跳过并
@@ -442,8 +454,9 @@ PortalRenderer (BEFORE_GIZMOS)
   间接绘制缓冲区每帧写两份，容量最多一次性增长后保持稳定。
 - 地形顶点着色器使用 `Globals.CameraBlockPos/CameraOffset` 重建世界坐标；捕获前用传送门相机
   位置重写私有 `GlobalSettingsUniform`，捕获结束后恢复捕获前的 global buffer。
-- 捕获 pass 不渲染天空（`shouldRenderSky=false`），避免共享 `SkyRenderer` 被重新绑定到离屏
-  目标；地形、雾色、实体、云和方块实体仍完整绘制。
+- 捕获 pass 使用**绑定到离屏 target 的独立 `SkyRenderer`**（`PortalViewTarget` 持有），
+  在捕获期间临时替换 `LevelRenderer.skyRenderer` 并恢复。共享主 target 的 SkyRenderer
+  不会被污染；目标端天空、地形、雾、实体、云和方块实体都会绘制。
 
 ### 传送门相机
 
@@ -456,13 +469,18 @@ viewRotationMatrix' = conjugate(q')
 projectionMatrix'  = 主相机投影（完全相同）
 ```
 
-目标场景用与主相机**完全相同的投影**渲染。因此入口平面上的任意屏幕点在目标渲染中位于
+目标场景用与主相机**完全相同的投影**渲染。因此入口平面上的任意点在目标渲染中位于
 同一屏幕位置；把入口四边面的裁剪空间坐标换算成 UV 即可得到正确的投影映射：
 
 ```text
 u = ndc.x * 0.5 + 0.5
 v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit 一致
 ```
+
+纹理在两次刷新之间是静态的，因此 UV 使用**捕获时的主相机 view-projection**
+（`PortalViewTarget.captureViewProjection`），而不是当前帧的矩阵。否则玩家移动时静态纹理
+会被按新视角重新采样，产生滑动/拉伸；当前实现让图像固定在传送门平面上，下一轮捕获
+（默认 10 Hz）再更新。几何近平面裁剪仍使用当前帧矩阵，两者分开处理。
 
 > 诊断开关：
 > - `-Dcrythst.portal.flipV=true` 翻转 v（确认后端纹理朝向）；
@@ -489,7 +507,7 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 
 ### 递归、性能与回退
 
-- **递归深度 1**：捕获 pass 中 `PortalCapture.isCapturing()` 为 true，所有传送门表面都不
+- **递归深度 1**：捕获 pass 中 `PortalRenderManager.isCapturing()` 为 true，所有传送门表面都不
   提交，因此目标纹理是纯世界画面且没有反馈循环。更深递归需要多张离屏纹理和多趟捕获，
   留给后续 TODO。
 - 捕获节流：默认基础间隔 **100 ms**（约 10 Hz），并根据实测成本自适应到最多 250 ms；
@@ -510,7 +528,7 @@ v = ndc.y * 0.5 + 0.5      // 与 vanilla screenquad.vsh / target-to-target blit
 - 使用相机 `cullFrustum` 对平面 AABB 做视锥裁剪；
 - 多个表面按 RenderType 分组、组内从远到近提交。
 
-**仍未实现**：递归深度 > 1、模板缓冲/平面反射、天空/洞口边缘的逐像素模板处理。
+**仍未实现**：递归深度 > 1、模板缓冲/平面反射、洞口边缘的逐像素模板处理。
 v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过平面时视角连续”，而不是最终形态。
 
 ---
@@ -535,11 +553,9 @@ v1 的目标是“表面确实显示目标端真实几何，并且眼睛跨过�
   - 目标维度必须有已加载区块；未加载区域显示为雾色。
 - 渲染只使用 RenderPearl/RenderTarget 抽象，不依赖 raw OpenGL 或 stencil；因此没有逐像素洞口
   模板裁剪，只有四边形几何遮罩。
-- 捕获 pass 使用传送门相机自己的 projection UBO（与主相机投影相同）；主 pass 会在
-  `GameRenderer.renderLevel` 中重新绑定投影。视图 bob 只作用于主 pass 的投影矩阵，
-  因此开启 bob 时入口表面可能有极轻微错位。
-- 捕获 pass 不渲染天空（`shouldRenderSky=false`）：`SkyRenderer` 缓存了构造时的目标，
-  强行切换会污染主目标，因此开阔天空方向显示为雾色。
+- 捕获 pass 使用与主 pass 完全相同的投影（含 view bob/hurt/portal spin）；主 pass 会在
+  `GameRenderer.renderLevel` 中重新绑定投影。
+- 目标端天空由独立的 target-bound `SkyRenderer` 绘制；跨维度链接才回退程序化表面。
 - 跨维度链接：实体可用 `TeleportTransition` 穿越，但不会做目标维度离屏捕获（回退程序化）。
 - 没有传送门框架方块、点火方式、数据驱动定义、颜色/音效配置。
 - **已持久化** UUID/名称/维度/平面/链接；但存档格式尚未做版本迁移（当前 `version: 1`）。

@@ -13,8 +13,10 @@
     "PortalCaptureMixin",
     "PortalGameRendererMixin",
     "PortalLevelExtractorAccessor",
+    "PortalLevelRendererAccessor",
     "PortalLevelRendererMixin",
     "StructureBlockOutlineMixin",
+    "StructurePickBlockMixin",
     "StructurePlacementMixin"
   ],
   "injectors": {

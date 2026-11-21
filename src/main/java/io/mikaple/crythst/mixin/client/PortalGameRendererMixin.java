@@ -1,7 +1,7 @@
 package io.mikaple.crythst.mixin.client;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import io.mikaple.crythst.client.render.portal.PortalCapture;
+import io.mikaple.crythst.client.render.portal.PortalRenderManager;
 import net.minecraft.client.renderer.GameRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -24,7 +24,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 public abstract class PortalGameRendererMixin {
     @Inject(method = "mainRenderTarget", at = @At("HEAD"), cancellable = true)
     private void crythst$usePortalTarget(CallbackInfoReturnable<RenderTarget> cir) {
-        final RenderTarget override = PortalCapture.renderTargetOverride();
+        final RenderTarget override = PortalRenderManager.renderTargetOverride();
         if (override != null) {
             cir.setReturnValue(override);
         }
