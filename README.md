@@ -293,7 +293,7 @@ localGravity.clearGravityOverride();
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 
 PlayerGravity.setFixed(player, new Vector3d(9.81, 0.0, 0.0)); // “下” = +X
-PlayerGravity.setLook(player);                                // “下” = 玩家视线方向
+PlayerGravity.setLook(player);                                // “下” = 采样时的视线方向（只采样一次）
 PlayerGravity.reset(player);                                  // 恢复原版向下
 ```
 

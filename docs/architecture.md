@@ -555,7 +555,7 @@ if (type != DYNAMIC) {
 
 - `LivingEntityTravelMixin` 在 `LivingEntity#travelInAir` 返回时注入；
 - 默认没有任何覆盖，Mixin 直接返回，原版重力行为不变；
-- `PlayerGravity` 以玩家 UUID 保存 `FIXED` 或 `LOOK` 模式；
+- `PlayerGravity` 以玩家 UUID 保存 `FIXED` 或 `LOOK` 模式；`LOOK` 在启用时采样一次视线方向并冻结，避免相机姿态反过来跟随鼠标形成反馈回路；
 - 有覆盖时，把 `(direction - (0,-1,0)) * gravity` 叠加到速度上：抵消原版向下的 Y 分量，再加入目标方向的 X/Y/Z 加速度；
 - 单人游戏中服务端 `ServerPlayer` 与客户端 `LocalPlayer` 共享同一 UUID 和静态表，所以客户端预测方向一致；
 - 专用服务器目前没有把方向同步给客户端，需要后续网络层。

@@ -912,7 +912,7 @@ boolean available = CrythstApi.isAvailable();
 ```java
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 
-PlayerGravity.setLook(player);                 // 视线方向 = 下
+PlayerGravity.setLook(player);                 // 采样当前视线方向 = 下（只采样一次）
 PlayerGravity.setFixed(player, new Vector3d(9.81, 0.0, 0.0)); // 下 = +X
 PlayerGravity.reset(player);                   // 回到世界重力/原版向下
 ```
