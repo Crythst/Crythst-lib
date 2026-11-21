@@ -5,7 +5,6 @@ import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureAction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureActionPayload;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.client.player.ClientPreAttackCallback;
 import net.minecraft.client.Minecraft;
@@ -25,12 +24,15 @@ import org.joml.Vector3d;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Optional client hook for clicks that vanilla never turns into a server packet.
+ * Optional client hook for clicks that vanilla never turns into a server
+ * packet.
  *
  * <p>Left clicks are intercepted by {@link ClientPreAttackCallback}. Right
- * clicks with a block item over a virtual (air) target are handled by a client
- * tick poll because Fabric has no equivalent pre-use callback; a real block
- * target is left to vanilla and the server-side {@code UseBlockCallback}.</p>
+ * clicks are intercepted by {@code StructurePlacementMixin} at the head of
+ * {@code MultiPlayerGameMode.useItemOn}, before 26.3's client prediction can
+ * run {@code BlockItem.place}; see {@link #requestStructurePlacement}. A real
+ * block target is left to vanilla and the server-side
+ * {@code UseBlockCallback}.</p>
  *
  * <p>All decisions compare the structure ray with a real-block clip using
  * {@link PlayerGravity#lookDirection} so gravity-rotated cameras behave
@@ -42,7 +44,6 @@ public final class ClientStructureInteraction {
 
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
 
-    private static boolean lastUseDown;
     private static int lastMineTick = Integer.MIN_VALUE / 2;
 
     private ClientStructureInteraction() {
@@ -56,7 +57,6 @@ public final class ClientStructureInteraction {
             return;
         }
         ClientPreAttackCallback.EVENT.register(ClientStructureInteraction::onPreAttack);
-        ClientTickEvents.END_CLIENT_TICK.register(ClientStructureInteraction::tickPlacement);
         // Register the vanilla-outline override here because the client
         // entrypoint already calls this method. It must run after vanilla has
         // extracted its own block outline.
@@ -115,32 +115,40 @@ public final class ClientStructureInteraction {
         return true;
     }
 
-    private static void tickPlacement(Minecraft client) {
-        final boolean down = client.options.keyUse.isDown();
-        final boolean pressed = down && !lastUseDown;
-        lastUseDown = down;
-        if (!pressed || client.player == null || client.gui.screen() != null) {
-            return;
-        }
-        final LocalPlayer player = client.player;
-        if (!CrythstFabric.config().structureBlockInteractionEnabled
+    /**
+     * Intercepts a vanilla use-on-block before 26.3's client prediction runs.
+     *
+     * <p>{@code MultiPlayerGameMode.useItemOn} evaluates a predictive action
+     * (including {@code BlockItem.place}) on the client before it sends
+     * {@code ServerboundUseItemOnPacket}. For a structure hit that would paint
+     * a real block for one tick and play a local place sound, and the server
+     * would later remove the predicted block, producing the ghost-block and
+     * double-sound bugs. The mixin calls this method at the head of
+     * {@code useItemOn}; returning {@code true} replaces the whole prediction
+     * with a single structure action payload.</p>
+     *
+     * <p>Only the main hand is handled: the placement payload is
+     * server-authoritative and always resolves the main-hand stack. Other
+     * hands keep vanilla behaviour.</p>
+     *
+     * @return whether the click was consumed as a structure placement
+     */
+    public static boolean requestStructurePlacement(LocalPlayer player, InteractionHand hand,
+                                                    BlockHitResult hitResult) {
+        if (hand != InteractionHand.MAIN_HAND
+                || player == null
+                || !(hitResult instanceof StructureBlockHitResult)
                 || player.isSpectator()
-                || !(player.getMainHandItem().getItem() instanceof BlockItem)) {
-            return;
+                || !CrythstFabric.config().structureBlockInteractionEnabled
+                || !(player.getMainHandItem().getItem() instanceof BlockItem)
+                || !player.level().getWorldBorder().isWithinBounds(hitResult.getBlockPos())
+                || !ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
+            return false;
         }
-        if (client.crosshairPickEntity != null) {
-            // Let vanilla handle an entity interaction in front of the structure.
-            return;
-        }
-        // Use the same hit Minecraft picked this frame. A real block in front
-        // of the structure means this is null, so vanilla keeps the click.
-        if (ClientStructureSelection.current(client) == null) {
-            return;
-        }
-        if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
-            return;
-        }
-        send(player, StructureAction.PLACE);
+        // Do not send ServerboundUseItemOnPacket. Only the authoritative
+        // structure action is sent; the server re-raycasts from the player's
+        // look vector and never runs BlockItem.place for this click.
+        return send(player, StructureAction.PLACE);
     }
 
     private static boolean send(LocalPlayer player, StructureAction action) {

@@ -1,0 +1,42 @@
+package io.mikaple.crythst.mixin.client;
+
+import io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInteraction;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.phys.BlockHitResult;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+/**
+ * Prevents 26.3's client-side prediction from placing a real block when the
+ * player right-clicks a physics structure voxel.
+ *
+ * <p>{@link MultiPlayerGameMode#useItemOn} runs its predictive action before
+ * sending {@code ServerboundUseItemOnPacket}. That action calls
+ * {@code BlockItem.place} on the {@code ClientLevel}, which paints a real block
+ * for one tick and plays a local place sound. The server then correctly refuses
+ * the vanilla placement via Fabric's {@code UseBlockCallback}, so the predicted
+ * block disappears, but the ghost and the duplicate sound remain.</p>
+ *
+ * <p>For a {@code StructureBlockHitResult} this injector consumes the click at
+ * the head of {@code useItemOn}, before prediction starts, and sends only the
+ * authoritative {@code crythst:structure_action} payload. Vanilla never sends
+ * a use-on-block packet and never runs {@code BlockItem.place} for this click.
+ * Returning {@code CONSUME} rather than {@code SUCCESS} avoids a second arm
+ * swing because {@link ClientStructureInteraction} already swings.</p>
+ */
+@Mixin(MultiPlayerGameMode.class)
+public abstract class StructurePlacementMixin {
+    @Inject(method = "useItemOn", at = @At("HEAD"), cancellable = true)
+    private void crythst$consumeStructurePlacement(LocalPlayer player, InteractionHand hand,
+                                                   BlockHitResult hitResult,
+                                                   CallbackInfoReturnable<InteractionResult> callback) {
+        if (ClientStructureInteraction.requestStructurePlacement(player, hand, hitResult)) {
+            callback.setReturnValue(InteractionResult.CONSUME);
+        }
+    }
+}

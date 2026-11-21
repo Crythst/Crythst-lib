@@ -14,7 +14,8 @@
     "PortalGameRendererMixin",
     "PortalLevelExtractorAccessor",
     "PortalLevelRendererMixin",
-    "StructureBlockOutlineMixin"
+    "StructureBlockOutlineMixin",
+    "StructurePlacementMixin"
   ],
   "injectors": {
     "defaultRequire": 1

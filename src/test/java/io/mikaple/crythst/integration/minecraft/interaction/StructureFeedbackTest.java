@@ -35,6 +35,13 @@ class StructureFeedbackTest {
     }
 
     @Test
+    void breakUsesVanillaDestroyBlockLevelEvent() {
+        // LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK; the client expands
+        // this into the full vanilla particle burst and break sound.
+        assertEquals(2001, StructureFeedback.BREAK_LEVEL_EVENT);
+    }
+
+    @Test
     void invalidScaleFallsBackToNormalVoxel() {
         assertEquals(StructureFeedback.breakParticleCount(1.0),
                 StructureFeedback.breakParticleCount(Double.NaN));

@@ -1,11 +1,14 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.RandomSource;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.LevelEvent;
 import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Vector3dc;
@@ -16,19 +19,25 @@ import org.joml.Vector3dc;
  * <p>Vanilla only emits block particles and positional sounds for blocks in
  * the real block grid. Structure voxels are simulated separately, so the
  * interaction layer has to emit the same feedback explicitly. Everything here
- * runs on the server: {@link ServerLevel#sendParticles} broadcasts particles to
- * tracking clients, and {@link ServerLevel#playSound} broadcasts a positional
- * sound packet. Nothing is played through a client-local code path.</p>
+ * runs on the server: {@link ServerLevel#levelEvent} and
+ * {@link ServerLevel#sendParticles} broadcast to tracking clients, and
+ * {@link ServerLevel#playSound} broadcasts a positional sound packet. Nothing
+ * is played through a client-local code path.</p>
  *
  * <p>Particle counts and spreads are pure functions of the structure's
  * {@code blockScale} so they can be unit tested without a live level.</p>
  */
 public final class StructureFeedback {
-    /** Vanilla block break volume; the client applies linear distance attenuation. */
-    public static final float BREAK_VOLUME = 1.0f;
+    /**
+     * Vanilla destroy-block event (id 2001). The client handles it by playing
+     * the state's break sound and running the same 4x4x4 destroy-block particle
+     * burst as a real block break. Using the level event instead of a hand-built
+     * burst keeps the particle count and block shape identical to vanilla.
+     */
+    public static final int BREAK_LEVEL_EVENT = LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK;
     /** Slightly quieter than a break, matching the vanilla place sound. */
     public static final float PLACE_VOLUME = 0.9f;
-    /** Outward velocity for break debris. */
+    /** Outward velocity for the fallback break debris. */
     public static final double BREAK_PARTICLE_SPEED = 0.12;
     /** Outward velocity for the small placement puff. */
     public static final double PLACE_PARTICLE_SPEED = 0.02;
@@ -76,8 +85,14 @@ public final class StructureFeedback {
     }
 
     /**
-     * Emits block-break debris and the block's break sound at a world-space
-     * point (normally the centre of the removed voxel).
+     * Emits the vanilla destroy-block event at a world-space point (normally
+     * the centre of the removed voxel).
+     *
+     * <p>Event 2001 makes every tracking client play the state's break sound
+     * and run the vanilla destroy-block particle burst (4x4x4 for a full cube).
+     * This is the same path vanilla uses for a real block, so the burst is not
+     * reduced by our own particle budget. The event already contains the
+     * positional sound, so no separate {@code playSound} call is made.</p>
      *
      * <p>Must be called on the server thread, before a structure body is
      * closed, although the point is passed by value so the order only matters
@@ -88,13 +103,24 @@ public final class StructureFeedback {
         if (level == null || center == null || state == null || state.isAir()) {
             return;
         }
+        final BlockPos pos = BlockPos.containing(center.x(), center.y(), center.z());
+        if (state.shouldSpawnTerrainParticles()) {
+            // 2001 broadcasts one ClientboundLevelEventPacket; the client
+            // resolves the state id and runs addDestroyBlockEffect plus the
+            // break sound at pos. Sent to all players within 64 blocks.
+            level.levelEvent(null, BREAK_LEVEL_EVENT, pos, Block.getId(state));
+            return;
+        }
+        // Fallback for states that opt out of vanilla terrain particles: still
+        // show a small state-coloured burst and play the positional break sound
+        // so the edit has visible/audible feedback.
         final double spread = particleSpread(blockScale);
         level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state),
                 center.x(), center.y(), center.z(),
                 breakParticleCount(blockScale),
                 spread, spread, spread,
                 BREAK_PARTICLE_SPEED);
-        play(level, center, state, true, BREAK_VOLUME, random);
+        play(level, center, state, true, 1.0f, random);
     }
 
     /**

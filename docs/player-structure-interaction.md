@@ -60,6 +60,8 @@ New server/integration files:
 - `.../interaction/StructureActionPayload.java`
 - `.../interaction/StructureInteractionEvents.java`
 - `.../interaction/StructureInteractionCommand.java`
+- `.../interaction/StructureFeedback.java` — shared server-side break/place
+  particles and positional sound
 - `.../interaction/StructureRayMath.java`
 - `.../interaction/StructurePlacementMath.java` — pure world-face / block-click
   geometry shared by placement diagnostics
@@ -73,6 +75,8 @@ New client helper files:
   vanilla outline render-state override
 - `.../mixin/client/ClientLevelClipMixin.java` — adds `clip(ClipContext)` to
   `ClientLevel`
+- `.../mixin/client/StructurePlacementMixin.java` — consumes structure
+  right-clicks before client-side prediction in `MultiPlayerGameMode.useItemOn`
 
 Edited support files:
 
@@ -83,7 +87,7 @@ Edited support files:
   edits do not fall back to stone on the next save.
 
 No core physics file, config file or `fabric.mod.json` was edited. The only
-mixin-config change is adding `ClientLevelClipMixin` to
+mixin-config changes are `ClientLevelClipMixin` and `StructurePlacementMixin` in
 `crythst-client.mixins.json` (and removing the retired post-pick hit mixin).
 
 ---
@@ -114,17 +118,21 @@ In `CrythstClient.onInitializeClient()`:
 io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInteraction.register();
 ```
 
-This registers `ClientPreAttackCallback`, an end-of-client-tick placement poll,
-and the vanilla outline override. `ClientLevelClipMixin` adds
-`ClientLevel.clip(ClipContext)`; vanilla picking, outline extraction and
-interaction now observe the same `StructureBlockHitResult` in
-`Minecraft.hitResult`. The pre-attack hook and placement poll read that hit
-through `ClientStructureSelection.current(...)`; they do not re-raycast a
-second target. A real block or entity in front means the current hit is not a
+This registers `ClientPreAttackCallback` and the vanilla outline override.
+`ClientLevelClipMixin` adds `ClientLevel.clip(ClipContext)`; vanilla picking,
+outline extraction and interaction now observe the same
+`StructureBlockHitResult` in `Minecraft.hitResult`. The pre-attack hook reads
+that hit through `ClientStructureSelection.current(...)`; it does not re-raycast
+a second target. A real block or entity in front means the current hit is not a
 structure hit and vanilla keeps the click. `SHOVEL_WATER` still falls back to
-the real fluid clip when no structure target is active. The placement poll
-sends `PLACE` only when the held item is a `BlockItem` and the current hit is
-the structure.
+the real fluid clip when no structure target is active.
+
+Right-click placement is intercepted by `StructurePlacementMixin` at the head
+of `MultiPlayerGameMode.useItemOn`, before 26.3's client prediction runs. When
+the hit is a `StructureBlockHitResult` the click is consumed, only the `PLACE`
+payload is sent, and vanilla never runs `BlockItem.place` on the client. This is
+what prevents the one-tick real-world ghost block and the duplicate local place
+sound. There is no end-of-tick placement poll anymore.
 
 The old custom white-box renderer is disabled. The event registration is:
 
@@ -248,8 +256,14 @@ and immutable for the lifetime of the hit.
    the voxel back.
 6. Applies `-look * 400 * miningImpulseScale` at the ray hit point through
    `PhysicsStructure.applyImpulseAt`.
-7. Plays the stored state's break sound when a state exists and notifies
-   registered `BlockChangeListener`s.
+7. Emits the vanilla destroy-block event at the removed voxel's world centre:
+   `ServerLevel.levelEvent(null, LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK,
+   BlockPos.containing(centre), Block.getId(state))` (id 2001). The client
+   expands this into the vanilla destroy-block particle burst (4×4×4 for a full
+   cube) plus the state's break sound. States that opt out of terrain particles
+   use a small `sendParticles(...)` fallback. The event is emitted before the
+   refresh pass can split/close the body.
+8. Notifies registered `BlockChangeListener`s.
 
 ### 4.2 Placement behaviour
 
@@ -280,11 +294,22 @@ and immutable for the lifetime of the hit.
 8. Stores the state in the stateful volume or `StructureBlockStates`.
 9. Reindexes and refreshes the auxiliary block-ticking level.
 10. Applies a small reaction impulse (`400 * 0.3 * miningImpulseScale`).
-11. Plays the state's place sound and notifies listeners.
+11. Emits the state's place sound once and a small particle puff at the new
+    voxel centre, then notifies listeners.
 
-`beginPlacement(player)` collapses duplicate right-click paths (vanilla
+`StructurePlacementMixin` consumes structure right-clicks at the head of
+`MultiPlayerGameMode.useItemOn`, so the client performs no predictive
+`BlockItem.place` and sends no `ServerboundUseItemOnPacket`. On the server,
+Fabric's `UseBlockCallback`/`UseItemCallback` run at the head of
+`ServerPlayerGameMode.useItemOn`/`useItem`, before vanilla's `BlockItem.place`,
+so every entry path (vanilla use packet, right-click air, or `PLACE` payload)
+either cancels vanilla placement or goes straight through
+`StructureInteraction.placeBlock`. Only one real placement and one place sound
+are produced.
+
+`beginPlacement(player)` still collapses duplicate right-click paths (vanilla
 `UseBlockCallback`/`UseItemCallback` plus the client `PLACE` payload) within two
-server ticks. This is what prevents one physical click from placing two blocks.
+server ticks.
 
 ### 4.3 Shovel + water
 
