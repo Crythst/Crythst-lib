@@ -3,6 +3,7 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
+import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
@@ -47,7 +48,7 @@ public final class StructureInteractionCommand {
             throws CommandSyntaxException {
         final CommandSourceStack source = context.getSource();
         final ServerPlayer player = source.getPlayerOrException();
-        final StructureHit hit = StructureInteraction.raycast(player);
+        final StructureBlockHitResult hit = StructureInteraction.raycast(player);
         if (hit == null) {
             source.sendFailure(Component.literal(
                     "Crythst interaction: no structure under the crosshair within "
@@ -61,7 +62,7 @@ public final class StructureInteractionCommand {
                 "Crythst interaction: body=#" + structure.body().id()
                         + " type=" + structure.body().type()
                         + " voxel=(" + hit.voxelX() + "," + hit.voxelY() + "," + hit.voxelZ() + ")"
-                        + " face=" + hit.face()
+                        + " face=" + hit.localFace()
                         + " distance=" + String.format("%.2f", hit.distance())
                         + " volume=" + volume.getClass().getSimpleName()
                         + " bounds=" + volume.bounds()
@@ -75,7 +76,7 @@ public final class StructureInteractionCommand {
             throws CommandSyntaxException {
         final CommandSourceStack source = context.getSource();
         final ServerPlayer player = source.getPlayerOrException();
-        final StructureHit hit = StructureInteraction.raycast(player);
+        final StructureBlockHitResult hit = StructureInteraction.raycast(player);
         if (hit == null) {
             source.sendFailure(Component.literal("Crythst: no physics structure in reach"));
             return 0;
@@ -104,7 +105,7 @@ public final class StructureInteractionCommand {
                     "Crythst: hold a block item in the main hand to place into a structure"));
             return 0;
         }
-        final StructureHit hit = StructureInteraction.raycast(player);
+        final StructureBlockHitResult hit = StructureInteraction.raycast(player);
         if (hit == null) {
             source.sendFailure(Component.literal("Crythst: no physics structure in reach"));
             return 0;

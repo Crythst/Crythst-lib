@@ -3,12 +3,12 @@
 This document describes the first-version interaction layer for blocks that live
 inside a Crythst `PhysicsStructure` instead of Minecraft's block grid.
 
-Status: **server-authoritative core + real client hit result**. The common and
-client registration lines are already present in the current tree. One client
-mixin replaces `Minecraft.hitResult` after `Minecraft.pick` so the outline,
-crosshair and click paths all target the same structure voxel; Fabric's
-interaction callbacks and one custom action payload remain the authoritative
-server path.
+Status: **server-authoritative core + real vanilla clip**. `ClientLevel`
+overrides `clip(ClipContext)` through `ClientLevelClipMixin`, so
+`Minecraft.pick`, the vanilla outline extractor and every click path read one
+`StructureBlockHitResult`. Fabric's interaction callbacks and one custom action
+payload remain the authoritative server path; the server re-runs the same
+structure raycast against `LevelPhysics`.
 
 ---
 
@@ -20,16 +20,16 @@ server path.
 | Breaking applies a reaction impulse to the body | `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)` |
 | Right-click a structure block to place a block | `StructureInteraction.placeBlock(...)` via `UseBlockCallback`, `UseItemCallback`, and the `PLACE` payload for virtual-air targets |
 | Player-facing orientation on placement | server-built `BlockPlaceContext` + `Block#getStateForPlacement`, so stairs/slabs/logs/pillars/fences/trapdoors use yaw, pitch, clicked face and click position |
-| Selection outline | vanilla `BlockOutlineRenderState` supplied by `LevelExtractionEvents.AFTER_BLOCK_OUTLINE_EXTRACTION`; no custom white box |
-| Real selection target | `StructureHitResultMixin` installs a synthetic `BlockHitResult` in `Minecraft.hitResult` when a structure wins against the real block |
+| Selection outline | vanilla outline state built from the same `StructureBlockHitResult`; no custom white box |
+| Real selection target | `ClientLevel.clip(ClipContext)` merges the nearest structure hit into the vanilla clip result; `Minecraft.hitResult` is authoritative without a post-pick override |
 | Shovel + left-click water applies player recoil | `StructureInteraction.shovelWater(...)` via the client `SHOVEL_WATER` payload |
 | Default behaviour unchanged | Every hook returns `PASS` unless a structure is actually in front of a real block / the ray is water and a shovel is held |
 | Restored structures can be edited | `RestoredStructureVolume.setBlock(...)` plus the interaction adapter |
 | Building on an outer face | the volume is expanded by one cell into a new mutable volume |
 
-The synthetic hit is client-only. The existing Fabric callbacks already run on
-the server at the correct `START_DESTROY_BLOCK` / `useItemOn` / `useItem` points,
-and the server re-raycasts before changing physics state.
+The structure hit is client-side prediction only. The existing Fabric callbacks
+already run on the server at the correct `START_DESTROY_BLOCK` / `useItemOn` /
+`useItem` points, and the server re-raycasts before changing physics state.
 
 ### 1.1 The click-count trap
 
@@ -46,27 +46,33 @@ payload to the next tick and drops quick clicks entirely. The current code uses
 
 New server/integration files:
 
-- `src/main/java/io/mikaple/crythst/integration/minecraft/interaction/StructureInteraction.java`
-- `.../interaction/StructureHit.java`
+- `src/main/java/io/mikaple/crythst/integration/minecraft/selection/StructureSelection.java`
+  — merged vanilla + structure clip and authoritative server raycast
+- `.../selection/StructureRaycaster.java` — shared voxel DDA
+- `.../selection/StructureBlockHitResult.java` — vanilla `BlockHitResult`
+  carrying body id, pose, voxel, local face, block scale and block state
+- `.../selection/StructureVoxelView.java` — server / integrated / network view
+  abstraction
+- `.../selection/PhysicsStructureView.java`
+- `.../interaction/StructureInteraction.java`
 - `.../interaction/StructureBlockStates.java`
 - `.../interaction/StructureAction.java`
 - `.../interaction/StructureActionPayload.java`
 - `.../interaction/StructureInteractionEvents.java`
 - `.../interaction/StructureInteractionCommand.java`
 - `.../interaction/StructureRayMath.java`
-- `.../interaction/StructurePlacementMath.java` — pure synthetic-click / world
-  face geometry shared by placement and the client hit
+- `.../interaction/StructurePlacementMath.java` — pure world-face / block-click
+  geometry shared by placement diagnostics
 
 New client helper files:
 
+- `.../interaction/client/ClientStructureSelection.java` — integrated render
+  snapshots + multiplayer `ClientStructureCache` as one candidate list
 - `.../interaction/client/ClientStructureInteraction.java`
-- `.../interaction/client/ClientStructureRay.java`
-- `.../interaction/client/ClientStructureTargeting.java` — installs the real
-  `Minecraft.hitResult`
 - `.../client/render/structure/selection/StructureSelectionOutline.java` —
   vanilla outline render-state override
-- `.../mixin/client/StructureHitResultMixin.java` — tail of
-  `Minecraft.pick(float)`
+- `.../mixin/client/ClientLevelClipMixin.java` — adds `clip(ClipContext)` to
+  `ClientLevel`
 
 Edited support files:
 
@@ -77,8 +83,8 @@ Edited support files:
   edits do not fall back to stone on the next save.
 
 No core physics file, config file or `fabric.mod.json` was edited. The only
-mixin-config change is adding `StructureHitResultMixin` to
-`crythst-client.mixins.json`.
+mixin-config change is adding `ClientLevelClipMixin` to
+`crythst-client.mixins.json` (and removing the retired post-pick hit mixin).
 
 ---
 
@@ -109,15 +115,16 @@ io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInter
 ```
 
 This registers `ClientPreAttackCallback`, an end-of-client-tick placement poll,
-and the vanilla outline override. `StructureHitResultMixin` runs after
-`Minecraft.pick(float)` and replaces `Minecraft.hitResult` with a synthetic
-`BlockHitResult` for the structure voxel when the structure is strictly closer
-than the real block/entity. The pre-attack hook and placement poll read that
-same hit through `ClientStructureTargeting.activeHit(...)`; they do not
-re-raycast a second target. A real block in front means `activeHit` is null and
-vanilla keeps the click. `SHOVEL_WATER` still falls back to the real fluid clip
-when no structure target is active. The placement poll sends `PLACE` only when
-the held item is a `BlockItem` and the active hit is the structure.
+and the vanilla outline override. `ClientLevelClipMixin` adds
+`ClientLevel.clip(ClipContext)`; vanilla picking, outline extraction and
+interaction now observe the same `StructureBlockHitResult` in
+`Minecraft.hitResult`. The pre-attack hook and placement poll read that hit
+through `ClientStructureSelection.current(...)`; they do not re-raycast a
+second target. A real block or entity in front means the current hit is not a
+structure hit and vanilla keeps the click. `SHOVEL_WATER` still falls back to
+the real fluid clip when no structure target is active. The placement poll
+sends `PLACE` only when the held item is a `BlockItem` and the current hit is
+the structure.
 
 The old custom white-box renderer is disabled. The event registration is:
 
@@ -166,8 +173,8 @@ gravity applies this is the plain vanilla look vector.
 
 ```java
 // Raycast the player's eye/look against all live PhysicsStructure bodies.
-StructureHit hit = StructureInteraction.raycast(ServerPlayer player);
-StructureHit hit = StructureInteraction.raycast(ServerPlayer player, double reach);
+StructureBlockHitResult hit = StructureInteraction.raycast(ServerPlayer player);
+StructureBlockHitResult hit = StructureInteraction.raycast(ServerPlayer player, double reach);
 
 // Break the hit voxel. Applies the mining reaction impulse.
 StructureInteraction.BreakResult br = StructureInteraction.breakBlock(player, hit);
@@ -201,23 +208,30 @@ boolean handled = StructureInteraction.handleAction(player, StructureAction.MINE
 boolean firstPlacementThisClick = StructureInteraction.beginPlacement(player);
 ```
 
-Useful pieces of `StructureHit`:
+Useful pieces of `StructureBlockHitResult`:
 
 ```java
-hit.structure();      // PhysicsStructure
-hit.rayHit();         // RayHit (body, point, normal, distance)
-hit.voxelX();         // resolved structure-local voxel
+hit.structure();        // backing PhysicsStructure, or null for a client snapshot
+hit.bodyId();           // physics body / synced snapshot id
+hit.structurePose();    // structure pose used by the raycast
+hit.voxelX();           // resolved structure-local voxel
 hit.voxelY();
 hit.voxelZ();
-hit.face();           // structure-local cardinal direction
-hit.worldFace();      // transformed world-space cardinal face
-hit.clickResult();    // synthetic vanilla BlockHitResult for placement state
-hit.adjacentX();      // voxel + face step (placement target)
+hit.localFace();        // structure-local cardinal direction
+hit.worldFace();        // transformed world-space cardinal face
+hit.blockScale();       // metres per voxel
+hit.blockState();       // state of the hit voxel
+hit.getBlockPos();      // real world BlockPos containing the hit
+hit.getLocation();      // world-space hit point
+hit.adjacentX();        // voxel + local-face step (placement target)
 hit.adjacentY();
 hit.adjacentZ();
-hit.point();          // world-space hit point
-hit.distance();       // world-space distance
+hit.distance();         // world-space distance from the ray origin
 ```
+
+The outline renderer can consume the same object directly: `bodyId()`,
+`structurePose()`, `voxelX/Y/Z`, `blockScale()` and `blockState()` are public
+and immutable for the lifetime of the hit.
 
 ### 4.1 Break behaviour
 
@@ -244,8 +258,8 @@ hit.distance();       // world-space distance
    space. The same face is transformed to world space for the placement
    context, so a rotated structure still places into the visually adjacent
    cell.
-3. The server builds a `BlockPlaceContext` from the player's main hand, a
-   synthetic `BlockHitResult` at the structure hit (inside `false`) and the
+3. The server builds a `BlockPlaceContext` from the player's main hand, the
+   `StructureBlockHitResult` returned by the authoritative raycast and the
    player's current look vector. It calls
    `Block#getStateForPlacement(context)` — the same hook
    `BlockItem.getPlacementState` delegates to — and falls back to the default
@@ -368,8 +382,8 @@ so vanilla reach attributes and modifiers still apply.
 
 ## 8. Limitations / what is still missing for full client-authoritative mining
 
-1. **Multiplayer depends on structure sync.** `ClientStructureRay` first uses
-   singleplayer `ClientPhysicsView` snapshots, then falls back to
+1. **Multiplayer depends on structure sync.** `ClientStructureSelection` first
+   uses singleplayer `ClientPhysicsView` snapshots, then falls back to
    `ClientStructureCache`. The latter is fed by `StructureSync`; if sync is
    disabled or the structure exceeds the sync limits, the client cannot see the
    virtual blocks. The network snapshot factory currently records non
@@ -398,18 +412,18 @@ so vanilla reach attributes and modifiers still apply.
    the structure API is out of scope.
 7. **No right-click interaction dispatch.** `interactBlock` only returns the
    stored state. Container/block-use logic is not forwarded.
-8. **Occlusion uses a small tolerance.** The client installs the synthetic hit
-   only when the structure is strictly closer than the real block/entity. The
-   server compares the physics ray with the client's reported hit (or a
-   server-side `ClipContext`) using a 0.02-block tolerance to absorb independent
+8. **Occlusion uses a small tolerance.** `ClientLevel.clip` installs the
+   structure hit only when it is strictly closer than the real block/fluid hit.
+   The server re-raycasts from the player's eye and compares against a
+   server-side `ClipContext` using a 0.02-block tolerance to absorb independent
    ray quantisation. Entities are not considered by the server payload path.
 9. **Water recoil does not push a structure body.** It applies to the player
    only. A future version could apply the opposite impulse to a body if the
    water is inside/adjacent to a structure.
 10. **The client `PLACE` path is a tick poll, not a vanilla callback.** It uses
     an edge-detected `keyUse` poll because Fabric exposes no pre-use-client
-    callback. Because the real hit result is now synthetic, vanilla also sends
-    `useOn` for the virtual position; `beginPlacement` collapses the duplicate.
+    callback. Because the hit result carries a real world `BlockPos`, vanilla
+    also sends `useOn`; `beginPlacement` collapses the duplicate.
 11. **Arbitrarily rotated outlines are enclosing boxes.** The vanilla
     `VoxelShape` used by `BlockOutlineRenderState` is axis-aligned. An
     axis-aligned identity pose at `blockScale == 1` gets the exact block-state
@@ -426,7 +440,7 @@ so vanilla reach attributes and modifiers still apply.
    appearances in multiplayer.
 2. Extend the real-hit path with a break-progress record attached to the
    selected voxel (body id + voxel + face are already available on
-   `ClientStructureRay.Hit`).
+   `StructureBlockHitResult`).
 3. Send a validated `START/STOP/ABORT` payload with body id + voxel + sequence;
    the server re-checks reach, occupancy and ownership before editing.
 4. Run vanilla hardness/tool-speed logic against the synced state, then emit
@@ -440,7 +454,10 @@ so vanilla reach attributes and modifiers still apply.
   client input problems.
 - `/crythstinteraction mine|place|water` exercise the server API directly.
 - `StructureRayMathTest` unit-tests the pure slab ray/AABB math and entry
-  normals used by the client raycast.
+  normals used by the voxel traversal.
+- `StructureRaycasterTest` drives the shared structure DDA: nearest cell,
+  entry faces, negative coordinates, `blockScale`, rotated poses, reach, and
+  the real-block-wins rule of `StructureSelection.clip`.
 - `StructurePlacementMathTest` verifies world-space face transforms
   (including a 90-degree yaw), the synthetic click staying inside the clicked
   voxel, stair/slab click fractions, pillar axis source and the exact-grid

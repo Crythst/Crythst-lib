@@ -5,11 +5,13 @@
   "compatibilityLevel": "JAVA_25",
   "client": [
     "CameraGravityMixin",
+    "ClientLevelClipMixin",
+    "LevelRendererOutlineInvoker",
     "PortalCameraAccessor",
     "PortalCaptureMixin",
     "PortalGameRendererMixin",
     "PortalLevelExtractorAccessor",
-    "StructureHitResultMixin"
+    "StructureBlockOutlineMixin"
   ],
   "injectors": {
     "defaultRequire": 1

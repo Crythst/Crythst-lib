@@ -6,18 +6,15 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
+import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
-import io.mikaple.crythst.physics.query.BodyFilter;
-import io.mikaple.crythst.physics.query.RayHit;
-import io.mikaple.crythst.physics.query.RayQuery;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
-import io.mikaple.crythst.physics.world.PhysicsWorld;
-import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.server.level.ServerLevel;
@@ -40,7 +37,6 @@ import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.ItemTags;
-import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
@@ -168,13 +164,14 @@ public final class StructureInteraction {
     }
 
     /**
-     * Raycasts the player's look vector against every live structure body.
+     * Raycasts the player's look vector against every live structure using the
+     * same {@link StructureSelection} algorithm as the client clip.
      *
      * @return the nearest structure hit, or {@code null}
      */
-    public static StructureHit raycast(ServerPlayer player, double reach) {
+    public static StructureBlockHitResult raycast(ServerPlayer player, double reach) {
         final CrythstConfig config = MinecraftPhysics.config();
-        if (!config.structureBlockInteractionEnabled || reach <= 0.0) {
+        if (config == null || !config.structureBlockInteractionEnabled || reach <= 0.0) {
             return null;
         }
         final LevelPhysics physics = MinecraftPhysics.getIfPresent((ServerLevel) player.level());
@@ -183,28 +180,14 @@ public final class StructureInteraction {
         }
         final Vec3 eye = player.getEyePosition();
         final Vector3d direction = PlayerGravity.lookDirection(player);
-        final Vector3d from = new Vector3d(eye.x, eye.y, eye.z);
         if (direction.lengthSquared() < 1.0e-12) {
             return null;
         }
-        final PhysicsWorld world = physics.world();
-        final BodyFilter filter = body -> body.userData() instanceof PhysicsStructure structure
-                && !structure.closed();
-        final List<RayHit> hits = world.raycast(RayQuery.fromDirection(from, direction, reach)
-                .withFilter(filter));
-        for (RayHit hit : hits) {
-            if (!(hit.body().userData() instanceof PhysicsStructure structure) || structure.closed()) {
-                continue;
-            }
-            final StructureHit resolved = resolve(structure, hit);
-            if (resolved != null) {
-                return resolved;
-            }
-        }
-        return null;
+        return StructureSelection.raycast(StructureSelection.serverViews(player.level()),
+                eye, direction, reach);
     }
 
-    public static StructureHit raycast(ServerPlayer player) {
+    public static StructureBlockHitResult raycast(ServerPlayer player) {
         return raycast(player, player.blockInteractionRange());
     }
 
@@ -243,8 +226,10 @@ public final class StructureInteraction {
      * collider, refreshes the auxiliary block-ticking level and applies a
      * reaction impulse opposite to the player's look direction.
      */
-    public static BreakResult breakBlock(ServerPlayer player, StructureHit hit) {
-        if (!MinecraftPhysics.config().structureBlockInteractionEnabled || hit == null) {
+    public static BreakResult breakBlock(ServerPlayer player, StructureBlockHitResult hit) {
+        if (MinecraftPhysics.config() == null
+                || !MinecraftPhysics.config().structureBlockInteractionEnabled
+                || hit == null || hit.structure() == null) {
             return BreakResult.FAILED;
         }
         final PhysicsStructure structure = hit.structure();
@@ -313,10 +298,10 @@ public final class StructureInteraction {
         // refresh pass also performs that split and returns the bodies that now
         // represent the structure.
         final List<PhysicsStructure> remaining = physics.refreshStructure(structure, volume);
-        final PhysicsStructure reactionTarget = nearestStructure(remaining, hit.point());
+        final PhysicsStructure reactionTarget = nearestStructure(remaining, hit.worldHit());
 
         if (reactionTarget != null) {
-            applyImpulse(player, reactionTarget, hit.point(), -MINING_IMPULSE * scale(
+            applyImpulse(player, reactionTarget, hit.worldHit(), -MINING_IMPULSE * scale(
                     MinecraftPhysics.config().miningImpulseScale));
         }
         notifyListeners(player, reactionTarget != null ? reactionTarget : structure,
@@ -347,14 +332,13 @@ public final class StructureInteraction {
      * @return the resolved state, or {@code null} when the stack is not a block
      *         item or resolves to air
      */
-    public static BlockState placementState(Player player, ItemStack stack, StructureHit hit) {
+    public static BlockState placementState(Player player, ItemStack stack, StructureBlockHitResult hit) {
         if (player == null || stack == null || hit == null
                 || !(stack.getItem() instanceof BlockItem blockItem)) {
             return null;
         }
         final BlockState placed = blockItem.getBlock().getStateForPlacement(
-                new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack,
-                        hit.clickResult()));
+                new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack, hit));
         final BlockState resolved = placed != null
                 ? placed
                 : blockItem.getBlock().defaultBlockState();
@@ -375,7 +359,7 @@ public final class StructureInteraction {
      * @param stack the stack in the player's main hand; only its item and
      *              components are read
      */
-    public static PlaceResult placeBlock(ServerPlayer player, StructureHit hit, ItemStack stack) {
+    public static PlaceResult placeBlock(ServerPlayer player, StructureBlockHitResult hit, ItemStack stack) {
         final BlockState state = placementState(player, stack, hit);
         return state == null ? PlaceResult.FAILED : placeBlock(player, hit, state);
     }
@@ -390,9 +374,10 @@ public final class StructureInteraction {
      * first outside placement. A small reaction impulse is applied, mirroring
      * the mining response.</p>
      */
-    public static PlaceResult placeBlock(ServerPlayer player, StructureHit hit, BlockState state) {
-        if (!MinecraftPhysics.config().structureBlockInteractionEnabled
-                || hit == null || state == null || state.isAir()) {
+    public static PlaceResult placeBlock(ServerPlayer player, StructureBlockHitResult hit, BlockState state) {
+        if (MinecraftPhysics.config() == null
+                || !MinecraftPhysics.config().structureBlockInteractionEnabled
+                || hit == null || hit.structure() == null || state == null || state.isAir()) {
             return PlaceResult.FAILED;
         }
         final PhysicsStructure structure = hit.structure();
@@ -462,7 +447,7 @@ public final class StructureInteraction {
         }
         physics.refreshStructure(structure, targetVolume);
 
-        applyImpulse(player, structure, hit.point(), -MINING_IMPULSE * PLACE_IMPULSE_FRACTION * scale(
+        applyImpulse(player, structure, hit.worldHit(), -MINING_IMPULSE * PLACE_IMPULSE_FRACTION * scale(
                 MinecraftPhysics.config().miningImpulseScale));
         StructureFeedback.placeBlock(level, feedbackCenter, state, blockScale,
                 level.getRandom());
@@ -496,8 +481,8 @@ public final class StructureInteraction {
      * @return the side-table state at the hit voxel, or {@code null}. No
      *         mutation or vanilla block-use dispatch is performed yet.
      */
-    public static BlockState interactBlock(ServerPlayer player, StructureHit hit) {
-        if (hit == null || hit.structure().closed()) {
+    public static BlockState interactBlock(ServerPlayer player, StructureBlockHitResult hit) {
+        if (hit == null || hit.structure() == null || hit.structure().closed()) {
             return null;
         }
         return stateAt(hit.structure().volume(), hit.structure(),
@@ -563,7 +548,7 @@ public final class StructureInteraction {
         }
         return switch (action) {
             case MINE -> {
-                final StructureHit hit = raycast(player);
+                final StructureBlockHitResult hit = raycast(player);
                 yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
                         && breakBlock(player, hit).success();
             }
@@ -572,7 +557,7 @@ public final class StructureInteraction {
                 if (!(stack.getItem() instanceof BlockItem blockItem)) {
                     yield false;
                 }
-                final StructureHit hit = raycast(player);
+                final StructureBlockHitResult hit = raycast(player);
                 if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)
                         || !beginPlacement(player)) {
                     yield false;
@@ -592,7 +577,7 @@ public final class StructureInteraction {
      * the client reported. This prevents intercepting a real block that is
      * closer than a structure behind it.
      */
-    public static boolean isStructureInFront(StructureHit hit, Vec3 vanillaPoint, ServerPlayer player) {
+    public static boolean isStructureInFront(StructureBlockHitResult hit, Vec3 vanillaPoint, ServerPlayer player) {
         if (hit == null || vanillaPoint == null) {
             return false;
         }
@@ -604,7 +589,7 @@ public final class StructureInteraction {
      * Server-side occlusion check used by item-use placement. It clips against
      * real blocks so a structure behind a wall cannot be edited through it.
      */
-    public static boolean isStructureInFrontOfRealBlocks(ServerPlayer player, StructureHit hit) {
+    public static boolean isStructureInFrontOfRealBlocks(ServerPlayer player, StructureBlockHitResult hit) {
         if (hit == null) {
             return false;
         }
@@ -613,82 +598,11 @@ public final class StructureInteraction {
         final double reach = player.blockInteractionRange();
         final Vec3 end = eye.add(look.x * reach, look.y * reach, look.z * reach);
         final BlockHitResult blockHit = player.level().clip(new ClipContext(
-                eye, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
+                eye, end, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
         if (blockHit.getType() == HitResult.Type.MISS) {
             return true;
         }
         return isStructureInFront(hit, blockHit.getLocation(), player);
-    }
-
-    private static StructureHit resolve(PhysicsStructure structure, RayHit rayHit) {
-        final VoxelVolume volume = structure.volume();
-        // Step a tiny amount inside the surface before quantising. Without
-        // this, a hit exactly on a +X/+Y/+Z face rounds into the empty cell on
-        // the other side of the face.
-        final double inset = Math.max(1.0e-6, structure.blockScale() * 1.0e-4);
-        final Vector3d inside = new Vector3d(rayHit.point())
-                .fma(-inset, rayHit.normal());
-        final Vector3d voxel = structure.worldToVoxel(new Vector3d(), inside);
-        final int baseX = (int) Math.round(voxel.x);
-        final int baseY = (int) Math.round(voxel.y);
-        final int baseZ = (int) Math.round(voxel.z);
-        final Direction face = localFace(structure, rayHit.normal());
-        final IntBounds3 bounds = volume.bounds();
-
-        if (bounds.contains(baseX, baseY, baseZ) && volume.isSolid(baseX, baseY, baseZ)) {
-            return new StructureHit(structure, rayHit, baseX, baseY, baseZ, face);
-        }
-
-        int bestX = baseX;
-        int bestY = baseY;
-        int bestZ = baseZ;
-        double bestDistance = Double.POSITIVE_INFINITY;
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    final int x = baseX + dx;
-                    final int y = baseY + dy;
-                    final int z = baseZ + dz;
-                    if (!bounds.contains(x, y, z) || !volume.isSolid(x, y, z)) {
-                        continue;
-                    }
-                    final double distance = voxel.distanceSquared(x, y, z);
-                    if (distance < bestDistance) {
-                        bestDistance = distance;
-                        bestX = x;
-                        bestY = y;
-                        bestZ = z;
-                    }
-                }
-            }
-        }
-        if (bestDistance == Double.POSITIVE_INFINITY) {
-            return null;
-        }
-        return new StructureHit(structure, rayHit, bestX, bestY, bestZ, face);
-    }
-
-    /**
-     * Converts the world-space surface normal into a structure-local cardinal
-     * direction. Placement uses {@code voxel + face}, so a tilted structure
-     * still gets the visually adjacent cell.
-     */
-    private static Direction localFace(PhysicsStructure structure, Vector3dc worldNormal) {
-        final Quaterniond inverse = new Quaterniond(structure.body().transform().rotation()).conjugate();
-        final Vector3d local = new Vector3d(worldNormal).rotate(inverse);
-        final double ax = Math.abs(local.x);
-        final double ay = Math.abs(local.y);
-        final double az = Math.abs(local.z);
-        if (ax < 1.0e-9 && ay < 1.0e-9 && az < 1.0e-9) {
-            return Direction.UP;
-        }
-        if (ax >= ay && ax >= az) {
-            return local.x >= 0.0 ? Direction.EAST : Direction.WEST;
-        }
-        if (ay >= ax && ay >= az) {
-            return local.y >= 0.0 ? Direction.UP : Direction.DOWN;
-        }
-        return local.z >= 0.0 ? Direction.SOUTH : Direction.NORTH;
     }
 
     private static void applyImpulse(ServerPlayer player, PhysicsStructure structure,

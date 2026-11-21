@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
@@ -16,7 +17,6 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
-import net.minecraft.world.phys.Vec3;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -73,10 +73,9 @@ public final class StructureInteractionEvents {
                 || !MinecraftPhysics.config().structureBlockInteractionEnabled) {
             return InteractionResult.PASS;
         }
-        final StructureHit hit = StructureInteraction.raycast(serverPlayer,
+        final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
-        if (hit == null || !StructureInteraction.isStructureInFront(hit,
-                Vec3.atCenterOf(pos), serverPlayer)) {
+        if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
         }
         StructureInteraction.breakBlock(serverPlayer, hit);
@@ -101,10 +100,9 @@ public final class StructureInteractionEvents {
         if (!(stack.getItem() instanceof BlockItem blockItem)) {
             return InteractionResult.PASS;
         }
-        final StructureHit hit = StructureInteraction.raycast(serverPlayer,
+        final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
-        if (hit == null || !StructureInteraction.isStructureInFront(hit,
-                hitResult.getLocation(), serverPlayer)) {
+        if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
         }
         if (!StructureInteraction.beginPlacement(serverPlayer)) {
@@ -137,7 +135,7 @@ public final class StructureInteractionEvents {
         if (!(stack.getItem() instanceof BlockItem blockItem)) {
             return InteractionResult.PASS;
         }
-        final StructureHit hit = StructureInteraction.raycast(serverPlayer,
+        final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;

@@ -4,6 +4,7 @@ import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureAction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureActionPayload;
+import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.client.player.ClientPreAttackCallback;
@@ -71,9 +72,10 @@ public final class ClientStructureInteraction {
         final double reach = player.blockInteractionRange();
         final Vec3 eye = player.getEyePosition();
         // This is exactly the hit Minecraft shows and uses for interactions.
-        // It is only non-null when the structure won the real-block comparison
-        // in ClientStructureTargeting.
-        final ClientStructureRay.Hit structureHit = ClientStructureTargeting.activeHit(client);
+        // ClientLevel.clip returns it, so a real block or entity that is closer
+        // has already replaced it and the crosshair target is never a second,
+        // differently-quantised ray.
+        final StructureBlockHitResult structureHit = ClientStructureSelection.current(client);
         final boolean holdingShovel = player.getMainHandItem().is(ItemTags.SHOVELS);
 
         BlockHitResult waterHit = null;
@@ -132,7 +134,7 @@ public final class ClientStructureInteraction {
         }
         // Use the same hit Minecraft picked this frame. A real block in front
         // of the structure means this is null, so vanilla keeps the click.
-        if (ClientStructureTargeting.activeHit(client) == null) {
+        if (ClientStructureSelection.current(client) == null) {
             return;
         }
         if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {

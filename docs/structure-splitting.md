@@ -89,7 +89,7 @@ apply the mining impulse to each split), call `splitIfNeeded` there after
 before `PhysicsStructure.reindex`, which rejects empty volumes:
 
 ```java
-// breakBlock(ServerPlayer, StructureHit), after removing the voxel and before reindex:
+// breakBlock(ServerPlayer, StructureBlockHitResult), after removing the voxel and before reindex:
 if (StructureSplitter.removeIfMassless(physics, structure, volume)) {
     return new BreakResult(true, true, previousState);
 }
