@@ -196,19 +196,19 @@ public final class PlayerObbCollision {
         final Quaterniond rotation = pose.rotation();
         final VoxelColliderData collider = structure.collider();
         final double scale = structure.blockScale();
-        final Vector3d centerOfMass = new Vector3d(collider.centerOfMass()).mul(scale);
 
         Vector3d best = null;
         double bestLength = Double.POSITIVE_INFINITY;
 
         for (VoxelBox voxel : collider.boxes()) {
-            // Structure-local metres relative to the centre of mass, matching
-            // PhysicsStructure#blockCenter and VoxelColliderData#localBounds.
+            // structure.pose() maps unshifted voxel coordinates. Do not
+            // subtract the centre of mass again: that is a body-pose local
+            // convention and would shift every box by -R*COM.
             final Vector3d localCenter = new Vector3d(
                     voxel.minX() + voxel.sizeX() * 0.5,
                     voxel.minY() + voxel.sizeY() * 0.5,
                     voxel.minZ() + voxel.sizeZ() * 0.5
-            ).mul(scale).sub(centerOfMass);
+            ).mul(scale);
             final Vector3d worldCenter = pose.transformPoint(localCenter);
             final Vector3d halfExtents = new Vector3d(
                     voxel.sizeX(), voxel.sizeY(), voxel.sizeZ()
