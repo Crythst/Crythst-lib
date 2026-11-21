@@ -120,9 +120,12 @@ public final class PlayerObbCollision {
             );
         }
 
-        if (player instanceof ServerPlayer serverPlayer && serverPlayer.connection != null) {
-            // The server is authoritative. Send the corrected position instead
-            // of letting the vanilla tracker interpolate through geometry.
+        // Small corrections are already applied by the client's own tick
+        // predictor. A teleport packet wipes delta movement, which makes
+        // sneaking/walking feel glued, so only large corrections (a real
+        // penetration or a desync) are forced from the server.
+        if (player instanceof ServerPlayer serverPlayer && serverPlayer.connection != null
+                && total.lengthSquared() > 0.5 * 0.5) {
             serverPlayer.connection.teleport(
                     serverPlayer.getX(),
                     serverPlayer.getY(),

@@ -3,6 +3,7 @@ package io.mikaple.crythst.mixin.client;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.fabric.CrythstFabric;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.portal.PortalTransform;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
@@ -10,7 +11,10 @@ import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
 import org.joml.Quaterniond;
+import org.joml.Vector3d;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import org.joml.Vector3fc;
@@ -57,21 +61,37 @@ public abstract class CameraGravityMixin {
         state.orientation.set(new Quaternionf(gravity).mul(state.orientation));
         crythst$logGravityCamera(gravity, state);
 
+        // Third-person offset is computed by vanilla in the world-up frame.
+        // Rotate the offset from the eye into the gravity frame; first-person
+        // offsets are ~zero and therefore unchanged. State-only mutation keeps
+        // repeated extractor calls (portal captures) from applying Q twice.
+        final Player player = Minecraft.getInstance().player;
+        if (player != null && state.pos != null) {
+            final Vec3 eye = player.getEyePosition(state.cameraEntityPartialTicks);
+            final Vector3d offset = new Vector3d(
+                    state.pos.x - eye.x, state.pos.y - eye.y, state.pos.z - eye.z);
+            offset.rotate(new Quaterniond(gravity.x, gravity.y, gravity.z, gravity.w));
+            state.pos = new Vec3(eye.x + offset.x, eye.y + offset.y, eye.z + offset.z);
+            state.blockPos = BlockPos.containing(state.pos);
+        }
+
+        // Update the yaw/pitch exposed to entity/particle extraction so they
+        // match the rotated view rather than the vanilla world-up frame.
+        final Vector3f forward = state.orientation.transform(new Vector3f(0.0f, 0.0f, -1.0f));
+        final float[] yawPitch = PortalTransform.yawPitch(
+                new Vector3d(forward.x, forward.y, forward.z));
+        state.yRot = yawPitch[0];
+        state.xRot = yawPitch[1];
+
         // Mirror Camera.getViewRotationMatrix(): rotation matrix of the
         // conjugate orientation.
         final Quaternionf conjugate = state.orientation.conjugate(new Quaternionf());
         state.viewRotationMatrix.rotation(conjugate);
 
-        // Rebuild the culling frustum against the rotated view so that the
-        // rendered scene is culled with the same orientation it is drawn with.
+        // Rebuild the culling frustum against the rotated view and position.
         if (state.cullFrustum != null) {
-            // Keep the frustum's own camera position: it is the current camera
-            // for normal frames and a frozen snapshot when the frustum was
-            // captured earlier.
             final Frustum frustum = new Frustum(state.viewRotationMatrix, state.projectionMatrix);
-            frustum.prepare(state.cullFrustum.getCamX(),
-                    state.cullFrustum.getCamY(),
-                    state.cullFrustum.getCamZ());
+            frustum.prepare(state.pos.x, state.pos.y, state.pos.z);
             state.cullFrustum.set(frustum);
         }
     }
