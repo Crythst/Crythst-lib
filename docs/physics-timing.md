@@ -151,17 +151,12 @@ steps=3 fixedAlpha=0.000 poseDelta=0.0184m poseAngle=0.0012rad
 stepJitter=0.00 poseJitter=0.00003m | render pose = timestamped, one-tick delay
 ```
 
-The server-side command only knows about tick-to-tick pose deltas. To see the
-actual rendered frame deltas, append the batched renderer's rate-limited
-counter. The shared command file is owned elsewhere, so add this snippet there:
-
-```java
-// CrythstCommand#timing, after physics.timingText()
-source.sendSuccess(() -> Component.literal(
-        physics.timingText() + " | "
-                + io.mikaple.crythst.client.render.structure.batch
-                        .BatchedStructureRenderer.poseDiagnosticsText()), false);
-```
+The server-side command only knows about tick-to-tick pose deltas. The current
+`/crythst timing` implementation also appends the batched renderer's
+rate-limited counter. It resolves
+`BatchedStructureRenderer.poseDiagnosticsText()` reflectively, so the command
+still works on a dedicated server (where the client class is absent), and adds
+the text only when that class is available.
 
 `BatchedStructureRenderer.poseDiagnosticsText()` reports the maximum
 frame-to-frame structure pose delta over the last two seconds and the number of

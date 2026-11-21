@@ -132,6 +132,12 @@ behind a wall correction.
 | Client, singleplayer | `ClientPhysicsView.structures()` | newest published pose via `renderStateAt(now + timelineDelay)` |
 | Client, multiplayer | `ClientStructureCache.snapshots()` | last synced snapshot pose + merged boxes rebuilt from solid cells |
 
+Each source passes the structure-origin pose and the collider's **unshifted**
+merged boxes, matching the renderer's `structurePose * (voxel * blockScale)`
+convention. The solver never subtracts the centre of mass from those boxes. The
+Bullet body itself is COM-centred, which is why `PhysicsStructure.pose()` hides
+that offset before publishing the structure pose.
+
 The client classes are loaded through a holder that is only reached after
 `FabricLoader.getEnvironmentType() == CLIENT`, so a dedicated server never
 loads them.
@@ -163,28 +169,27 @@ The following paths are no longer active:
   `/crythst entitydebug` inspector.
 - `EntityPhysicsCollisionManager`'s per-tick `ServerPlayer.connection.teleport`
   correction and prediction deferral — deleted.
-- `ClientPlayerStructureCollision.register()` — no-op; the END_CLIENT_TICK
-  correction is gone.
+- `ClientPlayerStructureCollision` — removed entirely, along with its
+  END_CLIENT_TICK correction and prediction deferral. There is no no-op shim to
+  call.
 - `EntityStructureRidingManager` no longer teleports players for a moving
   platform. It adds the platform's per-tick anchor delta to the player's
   velocity instead (inherited velocity only); non-player carry still uses
   `Entity.setPos`.
 
-The entrypoints still contain the historical calls; remove them when the
-shared files are next edited:
+The current entrypoints no longer call the no-op methods. `PhysicsTicker` only
+keeps the entity filter, because the movement-integrated path consults it:
 
 ```java
 // PhysicsTicker.register()
-EntityPhysicsCollisionManager.register();                     // now a no-op
-EntityPhysicsCollisionManager.setEntityFilter(...);           // still needed
-
-// CrythstClient.onInitializeClient()
-io.mikaple.crythst.integration.minecraft.entity.client
-        .ClientPlayerStructureCollision.register();           // now a no-op
+EntityPhysicsCollisionManager.setEntityFilter(
+        entity -> !CreateCompat.shouldStayOnStructure(entity));
 ```
 
-`setEntityFilter` is still required by `PhysicsTicker`: it excludes Create
-contraption entities from the new movement path as well.
+The no-op `register()` / `onEndServerTick` methods remain only for source
+compatibility. `setEntityFilter` is still required: it excludes Create
+contraption entities from the movement path as well as from the diagnostic
+inspector.
 
 ## Edge cases
 
@@ -244,8 +249,20 @@ box and the MTV the resolver would choose.
 
 - **Entity AABB only.** Living entities are treated as axis-aligned boxes, not
   capsules or oriented boxes. This matches vanilla's own shape approximation.
+- **Only Crythst movement hooks see structures.** Structure voxels are not in
+  the vanilla chunk collision data, so `Level.getBlockCollisions`, pathfinding,
+  vanilla placement checks and unrelated mods that call vanilla collision do not
+  see them. Ordinary entity movement is covered because this pass replaces the
+  `Entity.move`/`collide` call; `PlayerObbCollision` is a separate
+  non-default-gravity pass and is documented in
+  [player-obb-collision.md](player-obb-collision.md).
 - **No structure reaction.** By design, an entity cannot push, rotate or wake a
   structure.
+- **Remote pose can be one tick behind.** Singleplayer client collision uses
+  the newest published pose from the local timeline; multiplayer collision uses
+  the last synced snapshot pose (not the delayed render/selection pose). On a
+  fast-moving remote structure, the collision surface and the rendered surface
+  can therefore differ by roughly one sync interval.
 - **No edge back-off on structures.** Vanilla's sneak-edge protection only
   queries world blocks, so a player can walk off a structure edge.
 - **No structure block sounds/events.** Contacts do not generate footstep or

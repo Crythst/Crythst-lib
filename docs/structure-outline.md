@@ -40,6 +40,12 @@ outline colours, `appropriateLineWidth`, translucent/after-terrain handling and
 the high-contrast branch (`secondaryBlockOutline` + `linesDepthBias`). The
 injection then cancels the default axis-aligned submission.
 
+Because the *pose matrix* is applied to the unchanged block-local shape, an
+arbitrary structure rotation or `blockScale` is exact: line vertices are
+transformed by the same rotation and scale as the rendered voxel. Only the line
+width itself stays in screen space and does not scale with `blockScale`, which
+matches vanilla's behaviour for a scaled block.
+
 ## Contract for the selection layer
 
 `StructureOutlineTarget` is the only thing the outline needs:
@@ -68,5 +74,12 @@ mixin and pose maths do not need to change.
   approximate inside a moving structure.
 - A real block or entity that wins the crosshair comparison suppresses the
   structure outline; that decision is made once in the selection layer.
-- The mixin cancels vanilla's `BEFORE_BLOCK_OUTLINE` event for structure voxels
-  because the oriented submission replaces the default one.
+- The mixin cancels vanilla's default `LevelRenderer#submitBlockOutline` call
+  for the published structure state because the oriented submission replaces
+  it. Real-block outlines still run through the original method.
+- In multiplayer the outline follows the same interpolated pose used for
+  selection. A structure whose block-state snapshot is missing on the client
+  falls back to a full-cube shape (`Shapes.block()`); structure sync must be
+  active for the correct state shape and neighbours.
+- The outline is visual only. It does not add the structure to vanilla block
+  collision, pathfinding or block-placement checks.

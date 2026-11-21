@@ -6,9 +6,9 @@ modelled after sable's "Option C" idea (`RENDER-NOTES.md` §2,
 `SubLevelBatchedTerrainRenderer`): avoid one submit node per block, group whole
 sections by render layer, and apply the structure transform in the batch pose.
 
-The implementation lives entirely in a new package and does not modify
-`RealStructureBlockRenderer`, `StructureBlockSnapshots`, `CrythstClient`, the
-Fabric integration, mixins or config.
+It is the renderer registered by the current client entrypoint. It shares the
+server snapshot producer with `RealStructureBlockRenderer` and also renders
+multiplayer structures from `ClientStructureCache`.
 
 ## Files
 

@@ -25,6 +25,13 @@ With default gravity (`PlayerGravity` returns nothing, or a world gravity of
 exactly `(0,-1,0)`) the entire pass is skipped, so vanilla behaviour is
 unchanged.
 
+This pass is **not** the general entity/structure collision path. Ordinary
+entities, including players under default gravity, collide with structures
+inside vanilla `Entity.move` through `EntityStructureCollision` (see
+[entity-physics-collision.md](entity-physics-collision.md)). `PlayerObbCollision`
+only adds the tilted-box correction that vanilla's Y-up movement cannot express
+when gravity is non-default.
+
 ## Files
 
 | File | Purpose |
@@ -119,6 +126,14 @@ The player OBB is then tested against each oriented voxel box. The structure
 boxes are physics-collider boxes, not individual block states, so a merged box
 is treated as one solid rectangular obstacle.
 
+> Convention note: the main movement collision and the structure renderer use
+> `structure.pose()` with **unshifted** voxel coordinates. This older OBB pass
+> currently also subtracts the centre of mass from each local box centre, which
+> can offset its structure approximation relative to the rendered surface when
+> the centre of mass is not at the structure origin. The terrain part of the
+> pass is unaffected. This is a code-level convention mismatch to fix; do not
+> copy this formula into new collision code.
+
 ## Correction loop
 
 `PlayerObbCollision.tick` runs at most three iterations per player tick:
@@ -186,19 +201,23 @@ vanilla movement:
    ticks to resolve.
 3. **Server correction may rubber-band.** The server teleports the client to the
    corrected position. A client whose local prediction differs (especially
-   around structures, which the client does not simulate) can snap back.
+   around structures, which this particular pass only queries on the server)
+   can snap back.
 4. **Structures use merged collider boxes.** Slabs, stairs, fences and other
    non-full blocks inside a structure are approximated by the merged voxel
    boxes produced by `VoxelColliderBuilder`; they are not re-read per block.
-5. **Client does not see physics structures.** `MinecraftPhysics` is
-   server-owned, so client prediction covers terrain only. Structure contacts
-   are resolved server-side and synchronized by teleport.
+5. **This pass only queries structures on the server.** `PlayerObbCollision`
+   has no client structure source of its own, so its client-side prediction
+   covers terrain only. The separate `Entity.move` collision path *does* run on
+   the client against local or network snapshots; this limitation applies only
+   to the non-default-gravity OBB post-correction.
 6. **Velocity handling is a projection, not a full contact solver.** Only the
    inward component is removed; there is no friction, restitution or
    character-controller stepping along the tilted surface.
 7. **No entity, fluid or world-border OBB tests.** Terrain uses
-   `getBlockCollisions`, which includes block/border collisions; entity
-   collision is handled by the other collision workstream.
+   `getBlockCollisions`, which includes block/border collisions; ordinary
+   entity/player structure collision is handled by `EntityStructureCollision`
+   inside `Entity.move`, not by this pass.
 8. **Passengers, spectators, sleeping and dead players are skipped.** Their
    vanilla handling is left untouched.
 
@@ -211,8 +230,9 @@ vanilla movement:
    - slide along the contact plane instead of only pushing out afterwards.
 2. Add a proper character controller step: ground detection along `-up`,
    step-up height, slope limit, and velocity projection including friction.
-3. Move the client's physics world access behind a network snapshot so
-   structures can be predicted locally as well as corrected on the server.
+3. Give this OBB pass the same client structure source already used by
+   `EntityStructureCollision` (`ClientPhysicsView` / `ClientStructureCache`) so
+   tilted-gravity structure contacts can be predicted locally too.
 4. Replace `connection.teleport` corrections with a small reconciliation
    protocol (server correction delta + client replay) to avoid rubber-banding.
 5. Extend the pass to entity collisions and fluid volumes once the entity

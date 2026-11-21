@@ -52,10 +52,12 @@ Vector3d look = PlayerGravity.lookDirection(player);      // q * vanilla look
 
 ### Collision box
 
-The collision code must build the player OBB with `PlayerGravity.up(player)` as
-its local `+Y` (equivalently, `PlayerGravity.direction(player)` as local
-down). `up()` never returns `null`, so the default path naturally produces the
-vanilla axis-aligned box.
+The non-default-gravity collision pass builds the player OBB with
+`PlayerGravity.up(player)` as its local `+Y` (equivalently,
+`PlayerGravity.direction(player)` as local down). `up()` never returns `null`,
+so the default path naturally produces the vanilla axis-aligned box. See
+[player-obb-collision.md](player-obb-collision.md) for that post-move pass; it
+is separate from the movement-integrated `EntityStructureCollision` path.
 
 ## Camera math
 

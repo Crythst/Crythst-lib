@@ -230,17 +230,17 @@ contraption riding a minecart is not picked up automatically; the Create layer's
    and for anything whose vehicle chain reaches a contraption (seats, players,
    nested contraptions, minecarts).
 
-2. **Collision filter.** `EntityPhysicsCollisionManager` currently excludes
-   passengers but not contraption vehicles. The owner of the filter should
-   compose:
+2. **Collision filter.** `PhysicsTicker.register()` already installs:
 
    ```java
    EntityPhysicsCollisionManager.setEntityFilter(
            entity -> !CreateCompat.shouldStayOnStructure(entity));
    ```
 
-   If another filter already exists, compose with `&&` in the component that
-   installed it; the manager has no getter for the previous predicate.
+   That filter feeds `StructureCollisionSettings`, which the
+   `Entity.move`-integrated collision path also consults. If another filter
+   already exists, compose with `&&` in the component that installed it; there
+   is no getter for the previous predicate.
 
 3. **Tick placement.** Call the bridge after the physics world has advanced:
 
@@ -280,9 +280,10 @@ contraption riding a minecart is not picked up automatically; the Create layer's
 
 7. **Client sync.** The server calls the vanilla `Entity#setPos` path, so
    ordinary entity tracking replicates the contraption position. No custom
-   packet is needed for v1. If the riding manager already has a snapshot/packet
-   path, include `structureId + localTransform` and sample
-   `PhysicsStructure.interpolatedPose(alpha)` for smooth client interpolation.
+   packet is needed for v1. If a custom path is added later, sample the
+   timestamped render pose (`PhysicsStructure#renderStateAt(nowNanos)` or
+   `#interpolatedPoseAt(nowNanos)`) rather than the legacy tick-alpha
+   `interpolatedPose(alpha)`.
 
 8. **Control hand-off.** `CreateCompat.setControllingPlayer(entity, player)` and
    `controllingPlayer(entity)` wrap the public Create API. Do not call private

@@ -746,10 +746,10 @@ for (PhysicsStructure structure : structures) {
     structure.syncRenderPose();
 }
 
-// 客户端/渲染线程
-double alpha = world.interpolationAlpha();
+// 客户端/渲染线程：所有结构在同一帧时间采样
+long frameNanos = System.nanoTime();
 for (PhysicsStructure structure : renderStructures) {
-    StructureRenderState state = structure.renderState(alpha);
+    StructureRenderState state = structure.renderStateAt(frameNanos);
     Transform3d pose = state.pose();
     VoxelColliderData collider = state.collider();
     Vector3d comOffset = state.centerOfMassOffset();
@@ -759,9 +759,12 @@ for (PhysicsStructure structure : renderStructures) {
 }
 ```
 
-- `renderState(alpha)` 是渲染线程安全的：它只读取不可变 collider 和 volatile 插值姿态；
+- `renderStateAt(frameNanos)` 是渲染线程安全的：它只读取不可变 collider 和 timestamped
+  `PoseTimeline` 采样；`renderState(alpha)` 仍保留以兼容旧代码，但已忽略 `alpha`；
 - 不要从渲染线程调用 `structure.body()`、`structure.pose()`、`structure.obb()` 等会接触 Bullet 的方法；
-- `InterpolatedPose#push` 每次产生新快照；`reset` 用于传送，避免跨越大距离插值。
+- `syncRenderPose()` 每个服务端 tick 调用一次，把同一姿态同时推入旧 `InterpolatedPose`（兼容/诊断）
+  和 `PoseTimeline`（实际渲染）；`reset`/`teleport` 用于传送，避免跨越大距离插值；
+- 网络结构用 `ClientStructureCache#interpolatedPose(bodyId, frameNanos)`，不要直接读原始 `pose()`。
 
 ---
 
@@ -813,13 +816,15 @@ config.allowSleep = true;
 config.deterministic = true;
 config.maxFrameSeconds = 0.25;
 config.rebaseDistance = 2048.0;
-config.debug = true;
+config.debug = false; // historical flag; F3+F6 entries control the overlays
 config.defaultBlockMass = 1000.0;
 config.defaultFriction = 0.7;
 config.defaultRestitution = 0.0;
 ```
 
-> `fixedTimeStep`、`maxSubSteps`、`solverIterations`、`allowSleep`、`deterministic` 在 `LevelPhysics` 构造时读取；已经创建的维度不会自动应用这些改动，需要重新加载世界或重建 `LevelPhysics`。`serverTickTiming`、`debug`、`maxFrameSeconds`、`rebaseDistance` 等则在每次 tick 时动态读取。`serverTickTiming` 默认开启：每个服务端 tick 只推进一个 tick 的游戏时间，使 20 TPS + 1/60 s 稳定为每 tick 3 个固定步，渲染插值才不会因墙钟抖动而颤抖。详见 `docs/physics-timing.md`。
+> `fixedTimeStep`、`maxSubSteps`、`solverIterations`、`allowSleep`、`deterministic` 在 `LevelPhysics` 构造时读取；已经创建的维度不会自动应用这些改动，需要重新加载世界或重建 `LevelPhysics`。`serverTickTiming`、`maxFrameSeconds`、`rebaseDistance` 等则在每次 tick 时动态读取。`serverTickTiming` 默认开启：每个服务端 tick 只推进一个 tick 的游戏时间，使 20 TPS + 1/60 s 稳定为每 tick 3 个固定步。渲染姿态使用 timestamped `PoseTimeline`（约一 tick 延迟），不再依赖客户端 partial tick。详见 `docs/physics-timing.md`。
+>
+> `debug` 是历史开关：当前 F3+F6 调试层由 `crythst:physics*` 条目独立控制，`/crythst debug` 只翻转该字段，不会打开或关闭这些条目。
 
 ### 12.2 每维度世界
 
@@ -850,7 +855,10 @@ physics.paused();
 | `/crythst gravity <x> <y> <z>` | 设置世界重力 |
 | `/crythst demo` | 生成演示结构 |
 | `/crythst clear` | 删除所有结构 |
-| `/crythst debug` | 切换调试叠层（运行时） |
+| `/crythst timing` | 固定步长、姿态抖动和渲染姿态诊断 |
+| `/crythst align` | 打印 body/structure/COM 与渲染坐标约定检查 |
+| `/crythst entitydebug` | 打印附近实体的结构碰撞诊断 |
+| `/crythst debug` | 翻转历史 `config.debug` 字段；F3+F6 调试层不受它控制 |
 
 ---
 
@@ -888,18 +896,18 @@ boolean available = CrythstApi.isAvailable();
 | `A dynamic body must have positive mass` | `BodyHandle#setMass(0)` 用在动态刚体 | 用正质量，或先切换到静态/运动学 |
 | `IndexOutOfBoundsException`（体素） | 访问了 `bounds` 之外的坐标 | 检查 `IntBounds3` 的开区间边界 |
 | `Voxel volume is too large to colliderise` | 超过 `maxCells`（默认 400 万） | 缩小体积或提高 `VoxelColliderOptions#maxCells` |
-| 渲染线程崩溃/数据竞争 | 从渲染线程调用 `BodyHandle` / `PhysicsStructure` 的可变方法 | 只使用 `renderState` / `BodySnapshot` / `PhysicsDebugSnapshot` |
+| 渲染线程崩溃/数据竞争 | 从渲染线程调用 `BodyHandle` / `PhysicsStructure` 的可变方法 | 只使用 `renderStateAt` / `BodySnapshot` / `PhysicsDebugSnapshot` |
 | 结构删除后仍出现在调试列表 | 直接 `structure.close()` 而没有通知 `LevelPhysics` | 用 `levelPhysics.removeStructure(structure)` |
 | 重定位后世界锚定约束偏移 | `rebaseOrigin` 不重写 joint 的世界锚点 | 重定位后重建这类约束 |
-| 楼梯/台阶变成整块 | `BlockVoxelVolume` 只判断碰撞形状是否为空，按整格处理 | 自定义 `VoxelVolume` 或接受整块近似 |
+| 楼梯/台阶变成整块 | 结构体素默认按整格生成合并盒 | 用 `BlockStructureCollisionShape` / `BlockStructureDynamicCollider` 提供精确形状，或自定义 `VoxelVolume` |
 | 扫掠抛 `sweep requires a convex shape` | 传入了 `CompoundShape` 等非凸形状 | 用 `BoxShape` / `SphereShape` / `CapsuleShape` / `CylinderShape` / `ConvexHullShape` |
-| 调试线框不显示 | 多人环境，或 `debug` 关闭 | 单人世界执行 `/crythst debug` |
+| 调试线框不显示 | 多人环境没有本地 `ClientPhysicsView`，或 F3+F6 中对应 `crythst:physics*` 条目仍是 NEVER | 在单人世界按 F3+F6 启用条目；`/crythst debug` 不再控制这些条目 |
 | `PhysicsException: Bundled native library is missing` | 平台/ABI 不在支持范围 | 参考 [platforms.md](platforms.md)，用 `-Dcrythst.bullet.nativePath` |
 
 
 ---
 
-## 10. 玩家重力方向
+## 15. 玩家重力方向
 
 ```java
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
@@ -921,7 +929,7 @@ PlayerGravity.reset(player);                   // 回到世界重力/原版向�
 
 ---
 
-## 11. 世界地形碰撞
+## 16. 世界地形碰撞
 
 地形碰撞默认开启，由 `LevelPhysics` 自动管理，一般不需要手动调用。需要强制刷新或方块编辑后立即重建时：
 

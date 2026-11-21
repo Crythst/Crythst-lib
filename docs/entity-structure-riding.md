@@ -10,10 +10,12 @@ carried by, a Crythst physics structure. It is implemented by:
 - `io.mikaple.crythst.integration.minecraft.entity.riding.EntityStructureAttachment`
   (read-only attachment snapshot).
 
-It is deliberately separate from
-`EntityPhysicsCollisionManager`. The collision pass stops entities from entering
-a structure; this pass keeps entities that are already on top of one attached to
-it when the structure translates or rotates.
+It is deliberately separate from the movement-integrated structure collision
+in `EntityStructureCollision`, which runs inside vanilla `Entity.move`. That
+pass stops entities from entering a structure; this pass keeps entities that
+are already on top of one attached to it when the structure translates or
+rotates. The old post-tick `EntityPhysicsCollisionManager` is a diagnostic-only
+no-op.
 
 ## One-way rule
 
@@ -31,10 +33,11 @@ one-way collision rule; see
 
 ## Tick placement and wiring
 
-The pass must run **after** the physics tick and **after** the collision pass.
-In the current integration it is registered immediately after
-`EntityPhysicsCollisionManager.register()` inside `PhysicsTicker.register()`.
-An equivalent external wiring is:
+The pass must run **after** the physics tick. It does not need to run after a
+separate collision pass because ordinary structure collision now runs inside
+vanilla entity movement; by the time this manager carries an entity, its own
+movement for the tick has already been resolved. In the current integration it
+is registered by `PhysicsTicker.register()`. An equivalent external wiring is:
 
 ```java
 PhysicsTicker.register();
@@ -49,13 +52,15 @@ Calling it more than once is harmless.
 
 The effective event order is:
 
-1. `MinecraftPhysics::tick` advances the physics world.
-2. `EntityPhysicsCollisionManager` resolves entity/structure penetration.
+1. Vanilla entity ticks, including `Entity.move` and the structure collision
+   inside it.
+2. `MinecraftPhysics::tick` advances the physics world at
+   `END_SERVER_TICK` and publishes the new poses.
 3. `EntityStructureRidingManager` applies the structure's pose delta and
    re-anchors attachments.
 
-Because riding runs last, a collision correction that happened earlier in the
-same tick is adopted into the new local point instead of being applied twice.
+Because riding runs last, the entity's own movement and collision result for
+the tick are adopted into the new local point instead of being applied twice.
 
 ## Automatic support detection
 
@@ -77,9 +82,9 @@ if the centre is off the surface, at least three of the four foot corners must
 agree. The footprint is taken from the vanilla entity bounding box, so this is
 an AABB approximation rather than an oriented per-limb shape.
 
-The structure's pose already includes its centre-of-mass offset. Collider boxes
-are therefore compared in the same local metres as `PhysicsStructure.pose()`;
-no second centre-of-mass subtraction is applied.
+Collider boxes are expressed in unshifted structure-local metres, the same
+frame as `PhysicsStructure.pose()` (the body pose already accounts for the
+centre of mass). No second centre-of-mass subtraction is applied.
 
 When a support is found, the manager stores:
 
@@ -119,10 +124,13 @@ While attached, the pass:
   while the manager is already holding the entity on the surface,
 - applies the structure's yaw delta to the entity yaw when `rotateYaw` is
   enabled (default `true`),
-- syncs `ServerPlayer` through `connection.teleport(...)`; other entities use
-  `Entity.setPos(...)`.
+- for a `ServerPlayer`, adds the platform's per-tick anchor delta to the
+  player's velocity instead of writing a position. Vanilla movement then
+  carries the player, and the client stays authoritative over its own position.
+  Non-player entities use `Entity.setPos(...)`.
 
-No impulse, force or transform is ever applied to the structure body.
+No impulse, force, contact teleport or transform is ever applied to the
+structure body.
 
 ## Explicit binding API
 
@@ -143,10 +151,12 @@ EntityStructureRidingManager.unbind(entity);
 boolean bound = EntityStructureRidingManager.isBound(entity);
 ```
 
-An explicit binding is a **hard lock**: each tick the entity is placed at
-`pose.transformPoint(localPoint)`, and its yaw is held relative to the structure
-when `rotateYaw` is enabled. This is useful for seats, contraption anchors, or an
-entity that is not detected by the support probe.
+An explicit binding is a **hard lock** for non-player entities: each tick they
+are placed at `pose.transformPoint(localPoint)`, and yaw is held relative to the
+structure when `rotateYaw` is enabled. For a `ServerPlayer` the anchor delta is
+added to velocity instead, preserving client movement authority. Explicit
+bindings are useful for seats, contraption anchors, or an entity that is not
+detected by the support probe.
 
 An attachment is removed when:
 
@@ -202,12 +212,13 @@ often anchored at their centre rather than their feet.
 
 ## Collision interaction and double movement
 
-`EntityPhysicsCollisionManager` runs first. If it translated an entity out of a
-structure, this pass sees that position, adds only the structure's pose delta,
-and re-anchors. The collision correction therefore does not fight the carry
-pass. If the correction moved the entity far away, the `maxAttachmentDistance`
-check drops the attachment and the automatic probe can re-attach on a later tick
-if the entity lands on the structure again.
+Ordinary structure collision runs earlier, inside vanilla `Entity.move`, so the
+entity's position already contains its own walking, gravity and collision
+result. This pass adds only the structure's pose delta and re-anchors. The two
+paths therefore do not fight each other. If the movement solver ended up far
+from the expected anchor, the `maxAttachmentDistance` check drops the
+attachment and the automatic probe can re-attach on a later tick if the entity
+lands on the structure again.
 
 The manager does not add an impulse or a reaction force to the structure, and it
 does not transfer entity mass or velocity into the rigid body.
@@ -273,12 +284,15 @@ server-thread `HashMap` keyed by entity UUID.
 
 ## Limitations
 
-- **Server-authoritative only.** Entities are moved on the server. Players are
-  corrected with `connection.teleport`; clients still predict vanilla movement
-  and cannot predict structure motion.
-- **No client-side prediction.** A fast-moving or rotating structure can look
-  one tick behind on a client. The client receives ordinary entity position
-  updates; no custom interpolation or packet is added.
+- **Server-authoritative carry.** Attachments are detected and carried on the
+  server. Players inherit the platform delta as velocity and are not
+  contact-teleported; non-player entities are moved with `Entity.setPos`.
+  Clients still predict their own vanilla movement and do not run this support
+  probe themselves.
+- **No client-side carry prediction.** A fast-moving or rotating structure can
+  make a carried entity look one tick behind on a client. The client receives
+  ordinary entity position updates; no custom carry packet or carry
+  interpolation is added.
 - **Vanilla interpolation.** Carried entities keep vanilla old/current position
   interpolation. With a rotating platform the visual position can lag slightly
   between ticks, especially for fast yaw changes. `xOld`/`yOld`/`zOld` are not

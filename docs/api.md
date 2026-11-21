@@ -211,8 +211,8 @@ CrythstEvents.registerStructureContainerReady(event -> { ... });
 
 `tickIndex` starts at zero for each level world and increases after every
 post-step callback. `timeStepSeconds` is the actual fixed step passed to the
-backend (typically `1/config` seconds). This matches Sable's per-substep
-semantics rather than a once-per-game-tick callback.
+backend (typically `1/config` seconds). Events fire per **fixed substep**, not
+once per game tick, so several callbacks can run inside one server tick.
 
 Listeners run in registration order; failures are logged and isolated.
 
@@ -232,7 +232,7 @@ The original engine methods (`engine()`, `createWorld(...)`,
 `backendDescription()`) remain available for callers that need the raw physics
 engine.
 
-## 6. v1 coverage vs Sable
+## 6. v1 coverage and gaps
 
 Covered in v1:
 

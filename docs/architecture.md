@@ -31,7 +31,7 @@ io.mikaple.crythst.config
 io.mikaple.crythst.integration.minecraft（每维度 LevelPhysics）
             ▲
             │
-io.mikaple.crythst.integration.fabric（服务端入口、命令、客户端 gizmo）
+io.mikaple.crythst.integration.fabric（服务端入口、命令、客户端渲染/调试/交互）
 ```
 
 ### 包依赖方向
@@ -100,21 +100,22 @@ BulletPhysicsWorld.step(...) / Bullet 原生空间
 
 | 数据 | 发布方式 | 读取方 |
 | --- | --- | --- |
-| 结构姿态 | `InterpolatedPose` 内部的 `volatile Snapshot(previous, current)` | `PhysicsStructure#interpolatedPose` / `renderState` |
+| 结构姿态 | `PoseTimeline` 内部的 volatile `State(previous, current, timestamps)`；旧 `InterpolatedPose` 保留用于兼容/诊断 | `PhysicsStructure#interpolatedPoseAt` / `renderStateAt` |
 | 结构列表 | `LevelPhysics#renderStructures()` 返回 `volatile List<PhysicsStructure>` | `ClientPhysicsView` |
 | 结构碰撞数据 | `VoxelColliderData` 不可变对象，字段 `volatile` 替换 | `StructureRenderState#collider()` |
 | 调试快照 | `LevelPhysics#renderDebugSnapshot()` 的 `volatile` 字段 | `ClientPhysicsView#debug()` |
-| 调试接触点 | `PhysicsDebugSnapshot#contacts()` 中的不可变 `ContactEvent` 列表 | `PhysicsGizmoRenderer` |
+| 调试接触点 | `PhysicsDebugSnapshot#contacts()` 中的不可变 `ContactEvent` 列表；只有显式开启 `setDebugContactCapture(true)` 才填充 | `PhysicsGizmoRenderer#emitContacts` |
 | 刚体快照 | `BodySnapshot` 不可变 record | 命令、调试、网络层 |
 
-`InterpolatedPose` 用一条 volatile 引用交换整个 `Snapshot` record，避免“读到一半”的撕裂问题：
+`PoseTimeline` 用一条 volatile 引用交换整个不可变 `State` record，避免“读到一半”的撕裂问题：
 
 ```java
-private record Snapshot(Transform3d previous, Transform3d current) {}
-private volatile Snapshot snapshot = new Snapshot(Transform3d.IDENTITY, Transform3d.IDENTITY);
+private record State(Transform3d previous, Transform3d current,
+                     long previousNanos, long currentNanos, ...) {}
+private volatile State state = EMPTY;
 ```
 
-服务端每次 `push(pose)` 产生新的不可变 record；客户端 `sample(alpha)` 只读取局部引用，然后做位置 `lerp` 和旋转 `slerp`。
+服务端每个 tick 调用一次 `syncRenderPose()`，把同一姿态连同 `System.nanoTime()` 推入时间线。渲染线程用 `sample(nowNanos)` 在 `now - 一个平滑后的发布间隔` 处采样，只做位置 `lerp` 和旋转 `slerp`，不预测未来。多人结构把收到姿态的时间写入同一个 `PoseTimeline`，因此本地和网络结构共用同一套采样规则。
 
 ### 2.3 回调线程
 
@@ -171,8 +172,8 @@ for (PhysicsStructure structure : structures) {
 
 原因：
 
-- 渲染器用 Minecraft 的 tick partial tick（`DeltaTracker#getGameTimeDeltaPartialTick`）在两次服务端 tick 姿态之间插值；
-- 如果物理步数由墙钟决定，`END_SERVER_TICK` 的调度抖动会让同一 tick 跑 2/3/4 个 1/60 步，而渲染 alpha 仍按固定 50 ms 扫过，于是速度忽快忽慢，看起来就是抖动/颤抖；
+- 渲染器**不再**用 Minecraft 的 tick partial tick 在两次服务端 tick 姿态之间插值：服务端 tick 与客户端 tick 没有相位锁定，会在某个客户端 tick 内突然换到下一对姿态。现在 `PoseTimeline` 按帧时间采样 `now - 一个平滑后的发布间隔`，本地和网络结构都约延迟一个 tick；
+- 如果物理步数由墙钟决定，`END_SERVER_TICK` 的调度抖动会让同一 tick 跑 2/3/4 个 1/60 步，即使姿态时间线正确，模拟速度本身也会忽快忽慢；
 - 按固定 tick 时间推进后，20 TPS + 1/60 s 固定步长稳定得到每 tick 3 步；1/120 s 则稳定 6 步（`maxSubSteps` 会自动预留至少 6+1 步）；
 - **不要**在 `world.advance` 内部每个 substep 都 `syncRenderPose`：substep 是在 tick 内成批执行的，插值缓冲应该保存 tick 边界姿态，而不是最后一个 substep 的姿态；
 - `serverTickTiming = false` 可恢复旧的墙钟追赶模式，仅用于 A/B 测试；
@@ -539,14 +540,16 @@ if (type != DYNAMIC) {
 
 `LevelPhysics` 持有一个 `TerrainCollision`：
 
-- 收集所有非地形刚体的 AABB，加 `worldCollisionRadius`，并沿重力方向增加 `worldCollisionLookahead` 的预读范围；
-- 以 16×16×16 section 为键懒加载；每个 section 用 `VoxelColliderBuilder` 合并成静态复合刚体；
+- 收集所有非地形刚体的 AABB，按当前速度和 `worldCollisionLookahead` 扩展运动预取范围；
+- 以 16×16×16 section 为键懒加载；每个 section 使用方块的真实碰撞形状（楼梯、台阶、栅栏等保留精确盒）并贪心合并成静态复合刚体；
+- 刚体进入新 section 时立即补齐；`worldCollisionRefreshTicks` 是校验/重试上限；
 - 地形刚体使用 `TerrainBody` 作为 userData，调试渲染会跳过它们；
-- `LevelChunkTerrainMixin` 在 `LevelChunk#setBlockState` 返回后使对应 section 失效，下次刷新重建；
-- 缓存上限由 `worldCollisionMaxSections` 控制，刷新间隔由 `worldCollisionRefreshTicks` 控制；
-- 当前把所有带碰撞形状的方块近似为整格，楼梯/台阶/栅栏等不是精确形状。
+- `LevelChunkTerrainMixin` 在方块变化后使对应 section（以及跨 section 边界的相邻 section）失效，先构建替换体再移除旧体，避免一 tick 空洞；
+- 缓存上限由 `worldCollisionMaxSections` 控制，`worldCollisionRadius` 仍作为基本范围。
 
-## 9. 玩家重力方向
+实现细节、软上限和当前限制以 [terrain-collision.md](terrain-collision.md) 为准（该文档由地形碰撞负责人维护）。
+
+## 10. 玩家重力方向
 
 玩家重力使用一个极小的 Mixin：
 
@@ -559,9 +562,9 @@ if (type != DYNAMIC) {
 
 默认方向始终是原版向下 `(0,-1,0)`；`PlayerGravity.reset` 可移除覆盖。
 
-## 9. 结构生命周期
+## 11. 结构生命周期
 
-### 9.1 创建
+### 11.1 创建
 
 ```java
 VoxelColliderData collider = VoxelColliderBuilder.build(volume, options);
@@ -581,20 +584,20 @@ PhysicsStructure structure = new PhysicsStructure(world, definition);
    - 动态刚体质量 = `collider.mass() * massScale`；
 7. `world.createBody(...)`；
 8. `body.setUserData(this)`，让接触/调试代码可以从刚体找回结构；
-9. `renderPose.reset(pose())` 初始化插值缓冲。
+9. `renderPose.reset(pose())` 与 `renderTimeline.reset(pose(), now)` 初始化两个渲染缓冲。
 
-### 9.2 运行时姿态
+### 11.2 运行时姿态
 
 - `pose()`：当前结构姿态（结构局部原点，不是质心）；
-- `setPose(Transform3d)`：设置结构姿态并唤醒刚体，同时把姿态 `push` 到渲染缓冲；
-- `teleport(Transform3d)`：设置姿态、清速度、清力、唤醒，并 `reset` 渲染缓冲（不插值跨越传送）；
-- `syncRenderPose()`：把当前 `pose()` 推入 `InterpolatedPose`；每个服务端 tick 调用一次（不是每个固定 substep）；
-- `interpolatedPose(alpha)`：取插值姿态；
-- `renderState(alpha)`：返回不可变的 `StructureRenderState`，包含 body id、插值姿态、collider、质心偏移、blockScale。
+- `setPose(Transform3d)`：设置结构姿态并唤醒刚体，同时 `reset` 旧插值缓冲和 `PoseTimeline`（直接设置视为不连续）；
+- `teleport(Transform3d)`：设置姿态、清速度、清力、唤醒，并 `reset` 两个渲染缓冲（不插值跨越传送）；
+- `syncRenderPose()`：把当前 `pose()` 连同 `System.nanoTime()` 推入 `PoseTimeline`，并同步推入旧 `InterpolatedPose`；每个服务端 tick 调用一次（不是每个固定 substep）；
+- `interpolatedPoseAt(nowNanos)` / `renderStateAt(nowNanos)`：按帧时间采样 timestamped 时间线；
+- `interpolatedPose(alpha)` / `renderState(alpha)`：旧 API；`renderState(alpha)` 现在忽略 `alpha` 并调用 `renderStateAt(System.nanoTime())`。
 
 `StructureRenderState` 的所有重字段都共享不可变数据；它只把姿态采样出来，因此可以安全地跨线程交给渲染器。
 
-### 9.3 方块编辑与重建
+### 11.3 方块编辑与重建
 
 ```java
 structure.reindex(newVolume);
@@ -612,7 +615,7 @@ structure.reindex(newVolume);
 
 如果新体积没有实心方块，会抛 `IllegalArgumentException`，旧 collider 不会被替换。
 
-### 9.4 关闭
+### 11.4 关闭
 
 - `PhysicsStructure#close()` 幂等，调用 `world.removeBody(body)`；
 - `PhysicsStructure#closed()` 返回是否已关闭；
@@ -621,7 +624,7 @@ structure.reindex(newVolume);
 - `MinecraftPhysics#unload(ServerLevel)` 在维度卸载时移除并关闭对应 `LevelPhysics`；
 - `MinecraftPhysics#closeAll()` 在服务器停止时关闭所有维度。
 
-### 9.5 类型与材质
+### 11.5 类型与材质
 
 - `structure.setKinematic(true/false)` 在 `KINEMATIC` 和 `DYNAMIC` 之间切换；
 - `structure.setMaterial(material)` 更新摩擦/弹性/滚动阻力等；
@@ -630,15 +633,18 @@ structure.reindex(newVolume);
 
 ---
 
-## 10. 调试渲染路径
+## 12. 选择、碰撞与调试渲染
 
-### 10.1 服务端：生成快照
+### 12.1 服务端：姿态与调试快照
 
-`CrythstConfig#debug` 为 `true` 时，`LevelPhysics` 会在推进物理前后做两件事：
+`LevelPhysics.tick()` 每个服务端 tick 推进物理，然后：
 
 ```java
-world.setDebugContactCapture(true);              // 保留最近一步的接触流形
-renderDebugSnapshot = world.debugSnapshot();     // 生成不可变快照
+for (PhysicsStructure structure : structures) {
+    structure.syncRenderPose();               // PoseTimeline + legacy InterpolatedPose
+}
+renderDebugSnapshot = world.debugSnapshot();  // 不可变快照，每 tick 发布
+timing.record(...);
 ```
 
 `BulletPhysicsWorld#debugSnapshot()` 返回 `PhysicsDebugSnapshot`：
@@ -649,8 +655,8 @@ renderDebugSnapshot = world.debugSnapshot();     // 生成不可变快照
 | `origin` | 当前物理原点 |
 | `gravity` / `up` | 世界重力与上方向 |
 | `stats` | 最近一步的 `StepStats` |
-| `bodies` | 每个刚体的 `BodyDebugInfo`（id、类型、pose、OBB、AABB、active） |
-| `contacts` | 最近一步保留的 `ContactEvent` 列表；仅在 `setDebugContactCapture(true)` 时填充 |
+| `bodies` | 每个刚体的 `BodyDebugInfo`（id、类型、pose、OBB、AABB、active、terrain） |
+| `contacts` | 最近一步保留的 `ContactEvent` 列表；仅在显式 `setDebugContactCapture(true)` 时填充 |
 
 快照与结构列表都通过 `volatile` 字段发布：
 
@@ -659,74 +665,106 @@ private volatile List<PhysicsStructure> renderStructures = List.of();
 private volatile PhysicsDebugSnapshot renderDebugSnapshot;
 ```
 
-### 10.2 客户端：拉取 + gizmo 绘制
+注意：当前集成没有自动调用 `setDebugContactCapture(true)`，所以快照的 `contacts` 通常为空。`crythst:physics_contacts` 层仍会绘制物理原点、重力/上方向轴，但一般没有接触点，除非调用方显式开启了采集。
 
-客户端入口是 `io.mikaple.crythst.integration.fabric.client.CrythstClient`，在 `fabric.mod.json` 的 `client` entrypoint 中注册：
+### 12.2 选择与瞄准
 
-```java
-ClientTickEvents.END_CLIENT_TICK.register(ClientPhysicsView::tick);
-LevelRenderEvents.BEFORE_GIZMOS.register(PhysicsGizmoRenderer::render);
-```
+完整命中字段、合并规则和点击路径见 [selection-targeting.md](selection-targeting.md)。
 
-数据流：
+客户端选择只有一条路径：
 
 ```
-ClientTickEvents.END_CLIENT_TICK
+Minecraft.pick / 原版 outline / 交互
         │
         ▼
-ClientPhysicsView.tick(Minecraft)
-        │  client.getSingleplayerServer()
-        │  server.getLevel(client.level.dimension())
-        │  MinecraftPhysics.getIfPresent(level)
-        ▼
-STRUCTURES = physics.renderStructures();
-DEBUG      = physics.renderDebugSnapshot();
+ClientLevel.clip(ClipContext)            // ClientLevelClipMixin
         │
         ▼
-LevelRenderEvents.BEFORE_GIZMOS
-        │
+StructureSelection.clip(...)             // 原版 clip + 最近结构 hit 合并
+        │  ClientStructureSelection.views()
+        │    ├─ 单人：ClientPhysicsView 的 PhysicsStructure
+        │    └─ 多人：ClientStructureCache 快照 + PoseTimeline
         ▼
-PhysicsGizmoRenderer.render(LevelRenderContext)
-        │  alpha = Minecraft.getDeltaTracker().getGameTimeDeltaPartialTick(false)
-        │  structure.renderState(alpha)
-        ▼
-Gizmos / GizmoStyle
+StructureBlockHitResult extends BlockHitResult
 ```
 
-`PhysicsGizmoRenderer` 绘制：
+`StructureBlockHitResult` 同时携带 body id、结构姿态、结构局部体素 x/y/z、局部/世界命中面、`blockScale`、`BlockState`、世界命中点和相邻放置体素。真实方块/流体命中更近时始终优先，结构只在与原版命中比较时严格更近才胜出（`1e-4` 浮点容差）。
 
-- 每个结构的每个合并 `VoxelBox`：按 `blockScale` 和 `centerOfMassOffset` 还原到结构局部米制坐标，再用插值姿态变换成世界空间 OBB；
-- 结构整体 OBB（青色）；
-- 结构质心（黄色点）；
-- 非结构刚体的 OBB 和 AABB；
-- 物理原点（橙色点）、`up` 方向（绿色箭头）、重力方向（品红箭头）；
-- 调试接触点（红色点）和接触法线（橙色箭头），来自 `PhysicsDebugSnapshot#contacts()`。
+因此 `Minecraft.hitResult`、原版轮廓提取、挖掘/放置/拾取都读取同一个命中，不再有第二套结构射线。服务端在 `StructureInteraction.raycast(player)` 中从服务端眼睛和 `PlayerGravity.lookDirection(player)` 重新做权威射线，并用真实方块 clip 做遮挡检查。
 
-使用的 vanilla API：
+轮廓由 `StructureSelectionOutline` 发布 `BlockOutlineRenderState`，`StructureBlockOutlineMixin` 识别同一对象后把结构 pose 和 `blockScale` 应用到原版 `submitHitOutline`。任意旋转/缩放下局部 shape 的顶点会随 pose 精确变换；线型、颜色和屏幕空间线宽保持原版。
 
-- `net.minecraft.gizmos.Gizmos`：`point`、`arrow`、`line`、`rect`、`cuboid`；
-- `net.minecraft.gizmos.GizmoStyle`：`stroke(...)`、`fill(...)`；
-- `net.minecraft.world.phys.AABB` / `Vec3` 作为渲染端类型。
+### 12.3 实体碰撞
 
-### 10.3 为什么只支持单人
+结构碰撞不再有 post-tick 管理器和接触传送：
 
-`ClientPhysicsView` 只在 `Minecraft#getSingleplayerServer()` 非空时读取数据：
+```
+Entity.move(MoverType, Vec3)
+        │
+        ▼
+EntityStructureCollisionMixin (Redirect)
+        │
+        ▼
+EntityStructureCollision.resolveMovement(...)
+        │  StructureCollisionSources.forEntity(entity)
+        │    ├─ 服务端/集成服务器：LevelPhysics.structures()
+        │    ├─ 单人客户端：ClientPhysicsView + renderStateAt(now + delay)
+        │    └─ 多人客户端：ClientStructureCache 最新同步姿态
+        ▼
+StructureMotionSolver.solve(...)
+        │  宽阶段 AABB → 子步进 → MTV 多 pass → 支撑/台阶 → 速度投影
+        ▼
+vanilla Entity.collide(structure-clear motion)
+        │
+        ▼
+vanilla Entity.move 执行最终移动、台阶、落地和碰撞标记
+```
 
-- 单人游戏中，客户端和集成服务器在同一个 JVM，服务端的 `MinecraftPhysics.LEVELS` 可以直接访问；
-- 多人游戏中，客户端没有本地 `LevelPhysics`，物理世界在远端服务器；当前还没有网络同步层，因此 `ClientPhysicsView` 会清空缓存，`PhysicsGizmoRenderer` 不绘制任何东西。
+结果：
 
-这也是路线图中“多人同步”要解决的问题。
+- 实体被结构挡住、沿墙滑动、落在结构上，并与原版 `onGround` / 碰撞标记一致；
+- 不发送 `ServerPlayer.connection.teleport`，不再逐 tick 传送玩家；
+- 服务端和客户端运行同一求解器，客户端姿态来自本地时间线或网络快照；
+- 结构从不被实体推动，求解器只读结构姿态和碰撞盒。
 
-### 10.4 调试开关
+移动平台搭乘由 `EntityStructureRidingManager` 在物理 tick 之后处理：玩家继承平台每 tick 位移到速度，非玩家实体使用 `setPos`。详见 [entity-physics-collision.md](entity-physics-collision.md) 和 [entity-structure-riding.md](entity-structure-riding.md)。
 
-- `/crythst debug` 切换 `CrythstFabric.config().debug`；
-- 关闭时 `PhysicsGizmoRenderer.render` 直接返回；
-- `LevelPhysics` 只在 `debug == true` 时更新 `renderDebugSnapshot`；
-- 该开关是运行时状态，不会自动写回 `config/crythst.json`。
+### 12.4 调试渲染：F3 + F6
+
+每个条目的绘制内容和限制见 [debug-rendering.md](debug-rendering.md)。
+
+`DebugScreenEntriesMixin` 把 Crythst 条目注册进原版调试条目表。所有 `physics*` 条目都是 `RENDERER` 类别且不加入任何默认 profile，因此默认 `NEVER`；`crythst:physics` 是总开关，打开后启用下面全部层。
+
+| 条目 | 默认 | 绘制内容 |
+| --- | --- | --- |
+| `crythst:physics` | NEVER | 总开关，启用所有物理层 |
+| `crythst:physics_colliders` | NEVER | 每个结构的合并 `VoxelBox`（按材质着色）和自定义 fractional collider parts |
+| `crythst:physics_bounds` | NEVER | 结构整体 OBB、世界 AABB 和 body id/active 标签 |
+| `crythst:physics_dynamics` | NEVER | 质心、结构原点、原点→质心连线、结构局部前/上/右轴 |
+| `crythst:physics_contacts` | NEVER | 物理原点、重力/上方向箭头、接触点/法线（若已开启采集） |
+| `crythst:physics_bodies` | NEVER | 非结构、非地形、非静态的 loose body OBB |
+| `crythst:structure_target` | IN_OVERLAY | F3 文本：命中的 body id、结构局部体素、方块状态、结构姿态/缩放、世界命中和面 |
+
+`DebugRendererMixin` 只在 `crythst:physics` 条目启用时把 `CrythstPhysicsDebugRenderer` 加入原版 debug renderer 列表；它再按各子条目调用 `PhysicsGizmoRenderer.emitColliders/emitBounds/emitDynamics/emitContacts` 和 `LooseBodyRenderer.emit`。所有姿态通过 `renderStateAt(frameNanos)` 采样同一个 `PoseTimeline`。
+
+### 12.5 单人/多人边界
+
+`ClientPhysicsView` 只在 `Minecraft#getSingleplayerServer()` 非空时读取本地 `LevelPhysics`：
+
+- 单人：结构渲染、选择、碰撞和 `crythst:physics*` 调试层都可以读取同一进程内的服务端快照；
+- 多人：结构渲染、选择、实体碰撞读取 `ClientStructureCache` 网络快照；`crythst:physics*` 调试层没有本地物理世界，因此不绘制；
+- `crythst:structure_target` 是纯客户端文本，多人只要同步了结构命中也能显示。
+
+### 12.6 调试命令
+
+- `/crythst timing`：固定步长、步数、抖动、姿态 delta，并在客户端类可用时追加 `BatchedStructureRenderer.poseDiagnosticsText()`；
+- `/crythst align`：打印 body = structure + R*COM、碰撞 = body*(voxel-COM)、渲染 = structure*voxel 的一致性检查；
+- `/crythst entitydebug`：只读的实体/结构碰撞诊断；
+- `/crythst debug`：翻转历史 `CrythstConfig#debug` 字段。当前 F3+F6 调试层不受它控制，`config.debug` 也不参与快照生成。
 
 ---
 
-## 11. 性能与扩展点
+## 13. 性能与扩展点
 
 - **Broadphase**：`WorldSettings#broadphase()` 支持 `DBVT`（默认）、`AXIS_SWEEP_3`、`SIMPLE`；
 - **求解器迭代**：`solverIterations` 默认 10；

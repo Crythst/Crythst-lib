@@ -197,15 +197,19 @@ Vector3d centerOfMassOffset();        // metres
 
 Arrays returned by `palette()` / `cells()` are copies. Pose updates share the
 internal volume arrays, so they are O(1) rather than copying a whole grid.
+`pose()` is the newest received wire pose; renderers should normally call
+`ClientStructureCache#interpolatedPose(bodyId, frameNanos)` instead, which
+samples the per-body `PoseTimeline` used by local structures as well.
 
 ### Renderer example
 
 ```java
-final long revision = ClientStructureCache.revision();
+final long frameNanos = System.nanoTime();
 for (ClientStructureSnapshot structure : ClientStructureCache.snapshots()) {
-    final Transform3d pose = structure.pose();
+    // Sample the timestamped timeline, not the raw wire pose.
+    final Transform3d pose = ClientStructureCache.interpolatedPose(
+            structure.bodyId(), frameNanos);
     final double scale = structure.blockScale();
-    final Vector3d comOffset = structure.centerOfMassOffset();
     final IntBounds3 bounds = structure.bounds();
 
     for (int y = bounds.minY(); y < bounds.maxY(); y++) {
@@ -215,10 +219,12 @@ for (ClientStructureSnapshot structure : ClientStructureCache.snapshots()) {
                 if (state.isAir()) {
                     continue;
                 }
+                // The wire pose is the structure-origin pose: voxels are
+                // unshifted. Do not subtract the centre of mass again.
                 final Vector3d local = new Vector3d(
                         (x + 0.5) * scale,
                         (y + 0.5) * scale,
-                        (z + 0.5) * scale).sub(comOffset);
+                        (z + 0.5) * scale);
                 final Vector3d world = pose.transformPoint(local);
                 // draw state at `world`
             }
@@ -227,10 +233,11 @@ for (ClientStructureSnapshot structure : ClientStructureCache.snapshots()) {
 }
 ```
 
-The cache is not an interpolation layer. Pose updates arrive once per server
-tick for moving structures; renderers that need smoother motion should smooth
-locally (for example lerp the last two received poses) or reuse the existing
-`InterpolatedPose` machinery where available.
+Pose updates arrive once per server tick for moving structures. The client
+feeds each received pose into the per-body `PoseTimeline`, which delays the
+newest pose by one smoothed receive interval and never extrapolates. Local and
+network structures therefore use the same timestamped sampler; teleports and
+full resyncs snap instead of interpolating across a discontinuity.
 
 ## Registration
 
@@ -292,10 +299,12 @@ whether the client is on the same session/dimension as the server.
   block state only. Their NBT is not sent. Adding a BE map will bump
   `PROTOCOL_VERSION`.
 - **Mutable volume states come from the interaction side table.**
-  `MutableVoxelVolume` only exposes solidity, so `StructureSnapshotFactory`
-  consults `StructureBlockStates` first and falls back to `Blocks.STONE` for
-  cells without a recorded state. This matches the singleplayer
-  `StructureBlockSnapshots` producer.
+  `MutableVoxelVolume` only exposes solidity, so after the `BlockVoxelVolume`
+  case `StructureSnapshotFactory` reads `StructureBlockStates` and falls back to
+  `Blocks.STONE` for cells without a recorded state. Persistence mirrors
+  `RestoredStructureVolume` states into that side table, so restored structures
+  keep their appearance; a custom `StatefulVoxelVolume` that is neither a
+  `BlockVoxelVolume` nor mirrored falls back to stone.
 - **Volume-change detection uses object identity.** `PhysicsStructure.reindex`
   now installs the replacement volume and rebuilds the collider, both of which
   the diff observes. Mutating a volume in place *without* reindexing is still
@@ -309,6 +318,11 @@ whether the client is on the same session/dimension as the server.
 - **Structure pose already includes the COM offset.** The client batch renderer
   maps unshifted voxel coordinates through the wire structure pose; subtracting
   the wire COM a second time would double-shift the geometry.
+- **Rendering and collision sample different network poses.** Rendering and
+  selection use the delayed `PoseTimeline` sample, while the client movement
+  collision source uses `ClientStructureSnapshot.pose()` directly. On a
+  fast-moving remote structure the collision surface can be one sync interval
+  ahead of the rendered outline.
 - **Clients without Crythst are skipped.** `ServerPlayNetworking.canSend` gates
   all sends, so a vanilla/other client is unaffected.
 - **The C2S request is not rate-limited.** A malicious client could spam

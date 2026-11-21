@@ -8,7 +8,8 @@ overrides `clip(ClipContext)` through `ClientLevelClipMixin`, so
 `Minecraft.pick`, the vanilla outline extractor and every click path read one
 `StructureBlockHitResult`. Fabric's interaction callbacks and one custom action
 payload remain the authoritative server path; the server re-runs the same
-structure raycast against `LevelPhysics`.
+structure raycast against `LevelPhysics`. The hit type, merge rule and outline
+hand-off are described in [selection-targeting.md](selection-targeting.md).
 
 ---
 
@@ -91,11 +92,11 @@ Edited support files:
   now reads explicit states from `StatefulVoxelVolume` (restored structures), so
   edits do not fall back to stone on the next save.
 
-No core physics file, config file or `fabric.mod.json` was edited. The mixin
-config entries are `StructurePickBlockMixin` and `StructurePlacementMixin` in
-`crythst-client.mixins.json`, and `ServerGamePacketListenerImplInvoker` in
-`crythst.mixins.json` (plus the pre-existing `ClientLevelClipMixin`, with the
-retired post-pick hit mixin removed).
+The relevant client mixin entries are `StructurePickBlockMixin`,
+`StructurePlacementMixin`, `StructureBlockOutlineMixin` and
+`ClientLevelClipMixin` in `crythst-client.mixins.json`;
+`ServerGamePacketListenerImplInvoker` is in `crythst.mixins.json`. The retired
+post-pick hit mixin is gone.
 
 ---
 
@@ -146,17 +147,19 @@ Middle-click is intercepted by `StructurePickBlockMixin` at the head of
 `PICK_WITH_DATA` and cancels vanilla, so no
 `ServerboundPickItemFromBlockPacket` is sent for an air position.
 
-The old custom white-box renderer is disabled. The event registration is:
+The old custom white-box renderer and its `StructureSelectionRenderer` class are
+gone. The outline is the vanilla extraction/submission path:
 
 ```java
 LevelExtractionEvents.AFTER_BLOCK_OUTLINE_EXTRACTION.register(
         StructureSelectionOutline::afterBlockOutlineExtraction);
 ```
 
-It is called from `ClientStructureInteraction.register();`, so no extra
-entrypoint line is needed. The existing
-`LevelRenderEvents.BEFORE_GIZMOS.register(StructureSelectionRenderer::render);`
-line is now a no-op and may be deleted later.
+`StructureSelectionOutline.register()` is called from
+`ClientStructureInteraction.register();`, so no extra entrypoint line is
+needed. `StructureBlockOutlineMixin` replaces only the submission of the state
+that `StructureSelectionOutline` published; real-block outlines are untouched.
+See [structure-outline.md](structure-outline.md) for the pose maths.
 
 ### 3.3 Commands
 
@@ -452,9 +455,11 @@ so vanilla reach attributes and modifiers still apply.
    uses singleplayer `ClientPhysicsView` snapshots, then falls back to
    `ClientStructureCache`. The latter is fed by `StructureSync`; if sync is
    disabled or the structure exceeds the sync limits, the client cannot see the
-   virtual blocks. The network snapshot factory currently records non
-   `BlockVoxelVolume` cells as stone, so block appearance (not occupancy) is
-   approximate for mutable/restored structures.
+   virtual blocks. `StructureSnapshotFactory` reads `BlockVoxelVolume` states
+   first and the `StructureBlockStates` side table second. Persistence mirrors
+   restored states into that side table, so restored structures keep their
+   appearance; a custom `StatefulVoxelVolume` that is not mirrored and is not a
+   `BlockVoxelVolume` still falls back to stone in the network palette.
 2. **No vanilla-style mining progress.** A click breaks one voxel immediately.
    Tool speed, hardness, break animation, `START/STOP/ABORT_DESTROY_BLOCK`
    progress and cooldowns are not modelled. Hold-to-mine repeats every 5 client
@@ -486,24 +491,25 @@ so vanilla reach attributes and modifiers still apply.
 9. **Water recoil does not push a structure body.** It applies to the player
    only. A future version could apply the opposite impulse to a body if the
    water is inside/adjacent to a structure.
-10. **The client `PLACE` path is a tick poll, not a vanilla callback.** It uses
-    an edge-detected `keyUse` poll because Fabric exposes no pre-use-client
-    callback. Because the hit result carries a real world `BlockPos`, vanilla
-    also sends `useOn`; `beginPlacement` collapses the duplicate.
-11. **Arbitrarily rotated outlines are enclosing boxes.** The vanilla
-    `VoxelShape` used by `BlockOutlineRenderState` is axis-aligned. An
-    axis-aligned identity pose at `blockScale == 1` gets the exact block-state
-    shape; scaled or 90-degree-rotated structures get the transformed union of
-    the state shape's boxes, which is exact for grid-aligned rotations. For an
-    arbitrary rotation each transformed box is represented by its world AABB, so
-    the outline over-approximates the rendered voxel. The line style, colour and
-    width are always vanilla.
+10. **Placement is main-hand only.** `StructurePlacementMixin` consumes the
+    main-hand `MultiPlayerGameMode.useItemOn` call before client prediction and
+    sends only the `PLACE` payload. Off-hand placement keeps vanilla behaviour
+    and therefore does not edit a structure. Only block items are handled.
+11. **The outline pose is exact, but it is still a selection overlay.** The
+    block-local `VoxelShape` is transformed by the structure pose and
+    `blockScale`, so arbitrary rotations and scales are not converted to an
+    enclosing AABB. The line style, colour and screen-space width are vanilla.
+    The remaining limitation is synchronization: in multiplayer the outline
+    uses the client's interpolated structure pose and block-state snapshot, so
+    it can lag a fast-moving server body by the sync/render interval. If the
+    client has no snapshot for the body, the shape falls back to a full cube.
 
 ### Suggested next step for full client-authoritative mining
 
-1. Extend the network snapshot factory to read `StatefulVoxelVolume` and
-   `StructureBlockStates`, so mutable/restored structures keep real block
-   appearances in multiplayer.
+1. Extend the network snapshot factory to read `StatefulVoxelVolume` directly
+   (not only `BlockVoxelVolume` plus `StructureBlockStates`), so every custom
+   stateful volume keeps real block appearances in multiplayer without relying
+   on the side-table mirror.
 2. Extend the real-hit path with a break-progress record attached to the
    selected voxel (body id + voxel + face are already available on
    `StructureBlockHitResult`).

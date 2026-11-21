@@ -36,9 +36,10 @@ List<PhysicsStructure> splitIfNeeded(LevelPhysics physics, PhysicsStructure orig
 * `boxes()` – greedy-merged `VoxelBox` list for diagnostics;
 * `cellCount()`.
 
-Components themselves are returned in the same deterministic scan order. Diagonal
-or corner contact does **not** connect two cells; only the six axis-aligned
-neighbours do.
+Components themselves are returned in the same deterministic scan order.
+Connectivity is **26-neighbour**: face, edge and corner contact all keep two
+solid cells in the same body. A body only splits when a component is separated
+by at least one empty cell in every surrounding direction.
 
 The flood fill is limited to `StructureSplitter.MAX_CELLS` (the default voxel
 collider limit, currently 4,000,000 cells including air). Larger volumes throw an
@@ -46,79 +47,43 @@ collider limit, currently 4,000,000 cells including air). Larger volumes throw a
 
 ## Wiring
 
-No file outside the split package is required, but the splitter only runs when it
-is called. The cleanest hook is `LevelPhysics.refreshStructure`, which every
-volume change already passes through.
-
-Replace the body of `LevelPhysics.refreshStructure(PhysicsStructure, VoxelVolume)`
-with this shape (keep the existing auxiliary-level refresh, but do not return
-early just because `subLevel` is disabled):
+The splitter is already wired into `LevelPhysics.refreshStructure`:
 
 ```java
-public void refreshStructure(PhysicsStructure structure, VoxelVolume volume) {
-    if (closed) {
-        return;
-    }
-    if (subLevel != null) {
-        try {
-            subLevel.removeStructure(structure);
-            subLevel.addStructure(structure, volume);
-        } catch (Throwable t) {
-            Crythst.LOGGER.warn("Could not refresh structure body #{} in the auxiliary void level",
-                    structure.body().id(), t);
-        }
-    }
-    // NEW: remove an empty/zero-mass body, then split disconnected islands.
-    StructureSplitter.splitIfNeeded(this, structure, volume);
+public List<PhysicsStructure> refreshStructure(PhysicsStructure structure, VoxelVolume volume) {
+    // ... refresh the auxiliary void level ...
+    return StructureSplitter.splitIfNeeded(this, structure, volume);
 }
 ```
 
-`splitIfNeeded` first checks `isMassless`, so an explicit separate call to
-`removeIfMassless` is optional there. If you prefer the removal check before the
-auxiliary refresh, use:
+For a non-empty remaining volume, every interaction edit calls
+`structure.reindex(volume)` and then
+`physics.refreshStructure(structure, volume)`. A last voxel / zero-mass volume
+is detected before reindex (which rejects empty volumes) and removed with
+`removeIfMassless`. The refresh therefore automatically:
 
-```java
-if (StructureSplitter.removeIfMassless(this, structure, volume)) {
-    return;
-}
-```
+* removes a body whose remaining total mass is zero;
+* splits the remaining cells into one body per 26-neighbour component;
+* returns the bodies that now represent the edited structure.
 
-If the interaction layer should react to the returned bodies (for example to
-apply the mining impulse to each split), call `splitIfNeeded` there after
-`reindex`/`refreshStructure` and branch on the result. A massless check must run
-before `PhysicsStructure.reindex`, which rejects empty volumes:
-
-```java
-// breakBlock(ServerPlayer, StructureBlockHitResult), after removing the voxel and before reindex:
-if (StructureSplitter.removeIfMassless(physics, structure, volume)) {
-    return new BreakResult(true, true, previousState);
-}
-structure.reindex(volume);
-physics.refreshStructure(structure, volume);
-```
-
-In the interaction layer (`StructureInteraction.breakBlock` / `placeBlock`), the
-usual sequence is already:
-
-```java
-structure.reindex(volume);
-physics.refreshStructure(structure, volume);
-```
-
-With the hook above, no extra interaction change is required. The only caveat is
-that after `splitIfNeeded` returns more than the original singleton, the passed
-`structure` is closed; callers that apply a reaction impulse afterwards should
-skip closed structures or apply the impulse to the returned splits:
+The return value matters when the original was split or removed. The original
+`structure` is closed in that case, so callers must not keep using it:
 
 ```java
 final List<PhysicsStructure> bodies =
-        StructureSplitter.splitIfNeeded(physics, structure, volume);
+        levelPhysics.refreshStructure(structure, volume);
 if (bodies.size() == 1 && bodies.get(0) == structure) {
-    // still one body: apply impulse normally
+    // still one body
 } else if (!bodies.isEmpty()) {
-    // original was split or removed; target the returned bodies if needed
+    // original was split; reaction impulse targets the nearest split
 }
 ```
+
+`StructureInteraction.breakBlock` already handles this: it captures the feedback
+point before the edit, emits break feedback before the refresh, and applies the
+mining impulse to the split body whose centre is nearest the hit point.
+`removeIfMassless` and `splitIfNeeded` are public so other callers can use the
+same policy explicitly.
 
 ## What is preserved
 

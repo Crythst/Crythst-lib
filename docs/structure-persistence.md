@@ -7,8 +7,7 @@ from the live physics/render code.
 
 ## Wiring
 
-Add one line to `CrythstFabric.onInitialize()` (next to
-`PhysicsTicker.register()`):
+`CrythstFabric.onInitialize()` already calls:
 
 ```java
 StructurePersistence.register();
@@ -93,13 +92,18 @@ the full form. `MutableVoxelVolume` has no block-entity source.
 
 On load, each record is decoded with the level's block registry
 (`Registries.BLOCK`) and rebuilt with `LevelPhysics.createStructure(...)`. The
-saved pose is applied again with `PhysicsStructure.teleport(...)` to reset the
-render interpolation buffer. The collider is rebuilt from the saved cells, so
-mass, inertia and centre of mass are those of the snapshot.
+saved pose is applied again with `PhysicsStructure.teleport(...)` to reset both
+render buffers (legacy `InterpolatedPose` and `PoseTimeline`). The collider is
+rebuilt from the saved cells, so mass, inertia and centre of mass are those of
+the snapshot.
 
-Restored volumes are fresh `MutableVoxelVolume` instances. This keeps them
-editable by the existing interaction layer. Their block states are copied into
-`StructureBlockStates` for every solid cell (stone when the snapshot had none).
+Restored volumes are `RestoredStructureVolume` instances backed by the saved
+snapshot. The volume itself is `StatefulVoxelVolume`, so exact block states are
+available before the auxiliary ticking level copies the structure, and the
+interaction layer can edit it directly. Building on an outer face expands it
+into a new `MutableVoxelVolume` (see the growth section below). Block states are
+also mirrored into `StructureBlockStates` for compatibility with code that only
+reads the side table.
 
 Duplicate protection:
 
@@ -146,14 +150,14 @@ Removal:
 
 ### Block states and ticking
 
-* Real states come from `BlockVoxelVolume` or `StructureBlockStates`. A plain
-  `VoxelVolume`/`MutableVoxelVolume` with an empty side table is restored as
-  stone.
-* `EmptyPhysicsLevel` only special-cases `BlockVoxelVolume`. A restored structure
-  uses a `MutableVoxelVolume`, so its auxiliary void-level copy is made of stone
-  even when the saved snapshot contained real states. Gameplay logic that needs
-  the original state should read `StructureBlockStates` (restored by this
-  module) rather than the void-level blocks.
+* Real states come from a `StatefulVoxelVolume` (`BlockVoxelVolume`,
+  `RestoredStructureVolume`) or the `StructureBlockStates` side table. A plain
+  `MutableVoxelVolume` with an empty side table has no state and is treated as
+  stone by consumers that need one.
+* `EmptyPhysicsLevel` reads `StatefulVoxelVolume.blockState` first, so a restored
+  structure's auxiliary void-level copy keeps the saved states. Logic that only
+  has the side table still sees the same states through
+  `StructureBlockStates`.
 
 ### Parameter fidelity
 
@@ -165,18 +169,27 @@ auto-discovering a structure. Those values are serialized from then on, but they
 cannot be recovered from a structure that existed before the first capture.
 `userData` is deliberately never serialized.
 
-### No player-placed volume growth
+### Player-placed volume growth
 
-The snapshot keeps the original bounds. Restored structures cannot grow beyond
-those bounds; the interaction layer's placement still requires the target cell to
-already be inside the volume. To support growth, the volume bounds and the
-persisted snapshot would need a versioned expansion format.
+The interaction layer can build on an outer face. It copies the structure into a
+new `MutableVoxelVolume` whose bounds are expanded by one cell, reindexes the
+body and refreshes the level. The next save captures the expanded volume and its
+new bounds, so growth survives a reload.
+
+The limitation is efficiency, not support: every outward placement copies the
+whole grid and changes the volume identity, which makes the sync layer send a
+fresh snapshot.
 
 ### Multiplayer
 
-There is no network synchronization for structures or block states yet. The
-persistence layer is server-authoritative and singleplayer-first; remote clients
-still rely on the existing client-side approximation/rendering path.
+Structure snapshots, pose updates and removals are synchronized by
+`StructureSync` / `ClientStructureCache` (see
+[multiplayer-sync.md](multiplayer-sync.md)). Block-state palettes are part of
+the snapshot, so edited `MutableVoxelVolume` states reach clients when
+`StructureBlockStates` has them.
+
+Block-entity NBT is still not sent over the network: a remote client sees the
+block state, not the block-entity payload stored in the save file.
 
 ### Save cost
 
