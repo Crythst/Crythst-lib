@@ -5,7 +5,6 @@ import io.mikaple.crythst.physics.body.BodyType;
 import io.mikaple.crythst.physics.debug.BodyDebugInfo;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.GizmoStyle;
 import net.minecraft.gizmos.Gizmos;
@@ -26,7 +25,7 @@ public final class LooseBodyRenderer {
     private LooseBodyRenderer() {
     }
 
-    public static void render(LevelRenderContext context) {
+    public static void emit(float alpha) {
         final Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.level == null) {
             return;
@@ -35,8 +34,6 @@ public final class LooseBodyRenderer {
         if (debug == null) {
             return;
         }
-        final float alpha = minecraft.getDeltaTracker()
-                .getGameTimeDeltaPartialTick(false);
         final Set<Long> structureIds = new HashSet<>();
         for (PhysicsStructure structure : ClientPhysicsView.structures()) {
             structureIds.add(structure.renderState(alpha).bodyId());

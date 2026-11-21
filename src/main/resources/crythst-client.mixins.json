@@ -6,11 +6,14 @@
   "client": [
     "CameraGravityMixin",
     "ClientLevelClipMixin",
+    "DebugRendererMixin",
+    "DebugScreenEntriesMixin",
     "LevelRendererOutlineInvoker",
     "PortalCameraAccessor",
     "PortalCaptureMixin",
     "PortalGameRendererMixin",
     "PortalLevelExtractorAccessor",
+    "PortalLevelRendererMixin",
     "StructureBlockOutlineMixin"
   ],
   "injectors": {

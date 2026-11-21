@@ -1,37 +1,32 @@
 package io.mikaple.crythst.integration.fabric.client;
 
-import io.mikaple.crythst.integration.fabric.CrythstFabric;
+import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.OrientedBox;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.collision.ContactEvent;
 import io.mikaple.crythst.physics.collision.ContactPoint;
+import io.mikaple.crythst.physics.debug.BodyDebugInfo;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
-import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.gizmos.GizmoStyle;
 import net.minecraft.gizmos.Gizmos;
+import net.minecraft.gizmos.TextGizmo;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Debug-only gizmo renderer used to validate the physics integration.
- *
- * <p>The renderer visualises the merged voxel boxes of every physics structure
- * as tilted {@link OrientedBox}es, their overall bounds, their centre of mass,
- * and the raw {@link PhysicsDebugSnapshot} exported by the physics world. It is
- * intended for singleplayer debugging only and is disabled unless
- * {@code debug} is enabled in the Crythst config.</p>
- *
- * <p>This renderer is an independent implementation written against the Crythst
- * data model and the vanilla gizmo API. It intentionally does not copy or reuse
- * any Sable rendering code.</p>
+ * Gizmo drawing for physics structures, split into independently toggleable
+ * debug layers (colliders, bounds, dynamics, contacts). The layers are wired to
+ * vanilla F3 + F6 debug entries by {@link CrythstPhysicsDebugRenderer}.
  */
 public final class PhysicsGizmoRenderer {
     private static final int COLOR_CYAN = 0xFF00FFFF;
@@ -43,6 +38,9 @@ public final class PhysicsGizmoRenderer {
     private static final int COLOR_ORIGIN = 0xFFFFC400;
     private static final int COLOR_CONTACT = 0xFFFF3030;
     private static final int COLOR_CONTACT_NORMAL = 0xFFFFAA00;
+    private static final int COLOR_AABB = 0xFF40E0D0;
+    private static final int COLOR_OUTLINE = 0xFF00FFFF;
+    private static final int COLOR_LABEL = 0xFFE6E6E6;
 
     private static final int COLOR_ICE = 0xFF7FDBFF;
     private static final int COLOR_WOOD = 0xFF8B5A2B;
@@ -52,71 +50,109 @@ public final class PhysicsGizmoRenderer {
     private PhysicsGizmoRenderer() {
     }
 
-    /**
-     * Draws the current physics debug view. Invoked from
-     * {@code LevelRenderEvents.BEFORE_GIZMOS}, while the gizmo collector is
-     * active.
-     */
-    public static void render(LevelRenderContext context) {
-        if (Minecraft.getInstance().level == null || !CrythstFabric.config().debug) {
+    /** Per-voxel merged collision boxes, coloured by physics material. */
+    public static void emitColliders(float alpha) {
+        if (Minecraft.getInstance().level == null) {
             return;
         }
-
-        final float alpha = Minecraft.getInstance().getDeltaTracker()
-                .getGameTimeDeltaPartialTick(false);
-        final List<PhysicsStructure> structures = ClientPhysicsView.structures();
-
-        for (PhysicsStructure structure : structures) {
+        for (PhysicsStructure structure : ClientPhysicsView.structures()) {
             final StructureRenderState state = structure.renderState(alpha);
-            drawStructure(state);
-        }
-
-        final PhysicsDebugSnapshot debug = ClientPhysicsView.debug();
-        if (debug != null) {
-            drawDebugSnapshot(debug);
+            final Transform3d pose = state.pose();
+            final double blockScale = state.blockScale();
+            for (VoxelBox box : state.collider().boxes()) {
+                final Vector3d localCenter = new Vector3d(
+                        (box.minX() + box.sizeX() * 0.5) * blockScale,
+                        (box.minY() + box.sizeY() * 0.5) * blockScale,
+                        (box.minZ() + box.sizeZ() * 0.5) * blockScale
+                );
+                final Vector3d center = pose.transformPoint(localCenter);
+                final Vector3d halfExtents = new Vector3d(
+                        box.sizeX() * blockScale * 0.5,
+                        box.sizeY() * blockScale * 0.5,
+                        box.sizeZ() * blockScale * 0.5
+                );
+                final int rgb = colorFor(box.material());
+                drawOrientedBox(new OrientedBox(center, halfExtents, pose.rotation()),
+                        0xFF000000 | rgb, 0x18000000 | rgb, 1.0f);
+            }
+            // Fractional collision parts are the exact Bullet geometry; the
+            // coarse merged boxes above are only the occupancy hint.
+            for (io.mikaple.crythst.physics.voxel.VoxelCellPart part
+                    : state.collider().customParts()) {
+                final Vector3d center = pose.transformPoint(part.center().mul(blockScale));
+                final Vector3d halfExtents = new Vector3d(
+                        part.sizeX() * blockScale * 0.5,
+                        part.sizeY() * blockScale * 0.5,
+                        part.sizeZ() * blockScale * 0.5);
+                drawOrientedBox(new OrientedBox(center, halfExtents, pose.rotation()),
+                        COLOR_YELLOW, 0, 1.5f);
+            }
         }
     }
 
-    /**
-     * Draws every merged voxel box in structure-local metres, transformed by the
-     * interpolated structure pose.
-     */
-    private static void drawStructure(StructureRenderState state) {
-        final Transform3d pose = state.pose();
-        final Vector3d centerOfMassOffset = state.centerOfMassOffset();
-        final double blockScale = state.blockScale();
-
-        for (VoxelBox box : state.collider().boxes()) {
-            // The structure pose already includes the centre-of-mass offset;
-            // collider boxes are unshifted voxel coordinates here.
-            final Vector3d localCenter = new Vector3d(
-                    (box.minX() + box.sizeX() * 0.5) * blockScale,
-                    (box.minY() + box.sizeY() * 0.5) * blockScale,
-                    (box.minZ() + box.sizeZ() * 0.5) * blockScale
-            );
-            final Vector3d center = pose.transformPoint(localCenter);
-            final Vector3d halfExtents = new Vector3d(
-                    box.sizeX() * blockScale * 0.5,
-                    box.sizeY() * blockScale * 0.5,
-                    box.sizeZ() * blockScale * 0.5
-            );
-            final int rgb = colorFor(box.material());
-            drawOrientedBox(new OrientedBox(center, halfExtents, pose.rotation()),
-                    0xFF000000 | rgb, 0x18000000 | rgb, 1.0f);
+    /** Outer collider OBB plus the axis-aligned world AABB and a body label. */
+    public static void emitBounds(float alpha) {
+        if (Minecraft.getInstance().level == null) {
+            return;
         }
+        for (PhysicsStructure structure : ClientPhysicsView.structures()) {
+            final StructureRenderState state = structure.renderState(alpha);
+            drawOrientedBox(state.bounds(), COLOR_OUTLINE, FILL_CYAN, 2.5f);
 
-        drawOrientedBox(state.bounds(), COLOR_CYAN, FILL_CYAN, 2.0f);
+            final Aabb aabb = state.aabb();
+            Gizmos.cuboid(new net.minecraft.world.phys.AABB(
+                            aabb.min().x, aabb.min().y, aabb.min().z,
+                            aabb.max().x, aabb.max().y, aabb.max().z),
+                    GizmoStyle.stroke(COLOR_AABB, 1.5f));
 
-        final Vector3d centerOfMass = pose.transformPoint(centerOfMassOffset);
-        Gizmos.point(toVec3(centerOfMass), COLOR_YELLOW, 0.25f);
+            final Vector3d centre = new Vector3d(
+                    (aabb.min().x + aabb.max().x) * 0.5,
+                    aabb.max().y + 0.35,
+                    (aabb.min().z + aabb.max().z) * 0.5);
+            final BodyDebugInfo info = bodyInfo(state.bodyId());
+            final String suffix = info == null ? "" : (info.active() ? " active" : " sleeping");
+            Gizmos.billboardText("crythst #" + state.bodyId() + suffix,
+                    toVec3(centre),
+                    TextGizmo.Style.forColorAndCentered(COLOR_LABEL).withScale(0.55f));
+        }
     }
 
-    /**
-     * Draws the world origin, gravity/up axes and contact points. Loose bodies
-     * are drawn by {@link LooseBodyRenderer}, which stays active even when the
-     * debug overlay is off, so they are deliberately not duplicated here.
-     */
-    private static void drawDebugSnapshot(PhysicsDebugSnapshot debug) {
+    /** Centre of mass, structure origin and pose axes. */
+    public static void emitDynamics(float alpha) {
+        if (Minecraft.getInstance().level == null) {
+            return;
+        }
+        for (PhysicsStructure structure : ClientPhysicsView.structures()) {
+            final StructureRenderState state = structure.renderState(alpha);
+            final Transform3d pose = state.pose();
+            final Vector3d origin = pose.position();
+            final Vector3d centerOfMass = pose.transformPoint(state.centerOfMassOffset());
+
+            Gizmos.point(toVec3(origin), COLOR_ORIGIN, 0.22f);
+            Gizmos.point(toVec3(centerOfMass), COLOR_YELLOW, 0.28f);
+            Gizmos.line(toVec3(origin), toVec3(centerOfMass), COLOR_YELLOW, 1.5f);
+
+            final double localHeight = state.collider().localBounds().max().y
+                    - state.collider().localBounds().min().y;
+            final double axisLength = Math.max(0.6, Math.min(2.5,
+                    localHeight * state.blockScale() * 0.35));
+            final Vector3d forward = new Vector3d(0, 0, -1).rotate(pose.rotation());
+            final Vector3d up = new Vector3d(0, 1, 0).rotate(pose.rotation());
+            final Vector3d right = new Vector3d(1, 0, 0).rotate(pose.rotation());
+            Gizmos.arrow(toVec3(origin), toVec3(new Vector3d(origin).fma(axisLength, forward)),
+                    COLOR_GREEN, 1.5f);
+            Gizmos.arrow(toVec3(origin), toVec3(new Vector3d(origin).fma(axisLength, up)),
+                    COLOR_CYAN, 1.5f);
+            Gizmos.arrow(toVec3(origin), toVec3(new Vector3d(origin).fma(axisLength, right)),
+                    COLOR_MAGENTA, 1.5f);
+        }
+    }
+
+    /** Physics origin, gravity/up axes and contact points/normals. */
+    public static void emitContacts(PhysicsDebugSnapshot debug) {
+        if (debug == null) {
+            return;
+        }
         final Vector3d origin = debug.origin();
         final Vec3 originPoint = toVec3(origin);
         Gizmos.point(originPoint, COLOR_ORIGIN, 0.35f);
@@ -147,10 +183,19 @@ public final class PhysicsGizmoRenderer {
         }
     }
 
-    /**
-     * Draws the twelve edges and, when {@code argbFill} is translucent, the six
-     * faces of an oriented box.
-     */
+    private static BodyDebugInfo bodyInfo(long bodyId) {
+        final PhysicsDebugSnapshot debug = ClientPhysicsView.debug();
+        if (debug == null) {
+            return null;
+        }
+        for (BodyDebugInfo body : debug.bodies()) {
+            if (body.id() == bodyId) {
+                return body;
+            }
+        }
+        return null;
+    }
+
     private static void drawOrientedBox(OrientedBox obb, int argbEdge, int argbFill, float width) {
         final List<Vector3d> corners = obb.corners();
         final Vec3[] points = new Vec3[8];
