@@ -211,9 +211,7 @@ public final class LevelPhysics implements AutoCloseable {
         for (PhysicsStructure structure : structures) {
             structure.syncRenderPose();
         }
-        if (config.debug) {
-            renderDebugSnapshot = world.debugSnapshot();
-        }
+        renderDebugSnapshot = world.debugSnapshot();
         maybeRebase();
         // Block logic advances with the simulated world. Ticking here means one
         // random-tick pass per server tick, not one per Bullet sub-step.
@@ -233,9 +231,7 @@ public final class LevelPhysics implements AutoCloseable {
         for (PhysicsStructure structure : structures) {
             structure.syncRenderPose();
         }
-        if (config.debug) {
-            renderDebugSnapshot = world.debugSnapshot();
-        }
+        renderDebugSnapshot = world.debugSnapshot();
         if (count > 0) {
             // A manual batch may advance many fixed steps at once. Tick the
             // void level once for the batch to avoid multiplying random ticks

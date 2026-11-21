@@ -40,10 +40,7 @@ public final class CrythstFabric implements ModInitializer {
 
         CommandRegistrationCallback.EVENT.register(CrythstCommand::register);
         PhysicsTicker.register();
-        ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
-            MinecraftPhysics.closeAll();
-            io.mikaple.crythst.integration.minecraft.PhysicsTicker.resetDemoFlags();
-        });
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> MinecraftPhysics.closeAll());
 
         Crythst.LOGGER.info("Crythst initialised (backend available: {})", MinecraftPhysics.available());
     }

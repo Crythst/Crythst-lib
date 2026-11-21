@@ -30,7 +30,6 @@ public final class CrythstConfig {
     public double defaultFriction = 0.7;
     public double defaultRestitution = 0.0;
 
-    public boolean demoOnJoin = false;
     public boolean worldCollisionEnabled = true;
     public double worldCollisionRadius = 8.0;
     public int worldCollisionRefreshTicks = 10;
