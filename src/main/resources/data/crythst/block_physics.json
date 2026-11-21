@@ -1,0 +1,31 @@
+{
+  "defaults": {
+    "mass": 1000,
+    "friction": 0.7,
+    "restitution": 0.0,
+    "rollingFriction": 0.0,
+    "spinningFriction": 0.0,
+    "buoyancyScale": 1.0
+  },
+  "blocks": {
+    "minecraft:stone": { "mass": 2400, "friction": 0.7 },
+    "minecraft:cobblestone": { "mass": 2200, "friction": 0.7 },
+    "minecraft:deepslate": { "mass": 3000, "friction": 0.7 },
+    "minecraft:dirt": { "mass": 1600, "friction": 0.8 },
+    "minecraft:grass_block": { "mass": 1500, "friction": 0.8 },
+    "minecraft:sand": { "mass": 1600, "friction": 0.7 },
+    "minecraft:gravel": { "mass": 1800, "friction": 0.7 },
+    "minecraft:iron_block": { "mass": 7800, "friction": 0.4, "rollingFriction": 0.01 },
+    "minecraft:copper_block": { "mass": 8960, "friction": 0.4 },
+    "minecraft:gold_block": { "mass": 19300, "friction": 0.4 },
+    "minecraft:ice": { "mass": 900, "friction": 0.05 },
+    "minecraft:packed_ice": { "mass": 900, "friction": 0.05 },
+    "minecraft:end_stone": { "mass": 500, "friction": 0.7, "buoyancyScale": 1.0 }
+  },
+  "tags": {
+    "minecraft:planks": { "mass": 700, "friction": 0.6, "restitution": 0.05 },
+    "minecraft:logs": { "mass": 800, "friction": 0.6 },
+    "minecraft:leaves": { "mass": 100, "friction": 0.6 },
+    "minecraft:wool": { "mass": 100, "friction": 0.9 }
+  }
+}
