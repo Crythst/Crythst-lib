@@ -1,11 +1,21 @@
 package io.mikaple.crythst.api.block;
 
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.integration.minecraft.mass.BlockPhysicsProfile;
+import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.physics.body.BodyType;
+import io.mikaple.crythst.physics.bullet.BulletPhysicsEngine;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
+import io.mikaple.crythst.physics.structure.PhysicsStructure;
+import io.mikaple.crythst.physics.structure.StructureDef;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
+import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import io.mikaple.crythst.physics.voxel.VoxelColliderHooks;
+import io.mikaple.crythst.physics.voxel.VoxelVolumes;
+import io.mikaple.crythst.physics.world.PhysicsWorld;
+import io.mikaple.crythst.physics.world.WorldSettings;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Blocks;
@@ -23,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StructureBlockHooksTest {
     private static final double EPSILON = 1.0e-9;
@@ -114,6 +125,104 @@ class StructureBlockHooksTest {
         assertEquals(0.8, result.y(), EPSILON);
     }
 
+    @Test
+    void automaticSlabShapeBecomesHalfHeightParts() {
+        final BlockState slab = Blocks.STONE_SLAB.defaultBlockState();
+        final VoxelColliderHooks hooks = StructureBlockHooks.colliderHooks(new TestVolume(slab));
+
+        final List<VoxelCellPart> parts = hooks.collisionParts(0, 0, 0, new TestVolume(slab));
+
+        assertNotNull(parts, "a slab must not fall back to a full cube");
+        assertEquals(1, parts.size());
+        final VoxelCellPart part = parts.get(0);
+        assertEquals(0.0, part.minY(), EPSILON);
+        assertEquals(0.5, part.sizeY(), EPSILON);
+        assertEquals(1.0, part.sizeX(), EPSILON);
+        assertEquals(1.0, part.sizeZ(), EPSILON);
+    }
+
+    @Test
+    void automaticStairShapeBecomesExactParts() {
+        final BlockState stairs = Blocks.STONE_STAIRS.defaultBlockState();
+        final VoxelColliderHooks hooks = StructureBlockHooks.colliderHooks(new TestVolume(stairs));
+
+        final List<VoxelCellPart> parts = hooks.collisionParts(0, 0, 0, new TestVolume(stairs));
+
+        assertNotNull(parts, "stairs must not fall back to a full cube");
+        assertTrue(parts.size() >= 2, "a stair shape normally has a slab and a step");
+        boolean hasPartialHeight = false;
+        for (VoxelCellPart part : parts) {
+            assertTrue(part.minX() >= -EPSILON && part.minX() + part.sizeX() <= 1.0 + EPSILON);
+            assertTrue(part.minY() >= -EPSILON && part.minY() + part.sizeY() <= 1.0 + EPSILON);
+            assertTrue(part.minZ() >= -EPSILON && part.minZ() + part.sizeZ() <= 1.0 + EPSILON);
+            hasPartialHeight |= part.sizeY() < 1.0 - EPSILON;
+        }
+        assertTrue(hasPartialHeight);
+    }
+
+    @Test
+    void automaticFencePostKeepsItsThinFootprint() {
+        final BlockState fence = Blocks.OAK_FENCE.defaultBlockState();
+        final SingleCellVolume volume = new SingleCellVolume(fence);
+        final VoxelColliderHooks hooks = StructureBlockHooks.colliderHooks(volume);
+
+        final List<VoxelCellPart> parts = hooks.collisionParts(0, 0, 0, volume);
+
+        assertNotNull(parts);
+        assertEquals(1, parts.size(), "an unconnected fence is just its post");
+        final VoxelCellPart post = parts.get(0);
+        assertTrue(post.sizeX() < 0.5 && post.sizeZ() < 0.5,
+                "fence collision must be the post, not the whole voxel");
+    }
+
+    @Test
+    void automaticFullCubeKeepsTheMergedFastPath() {
+        final BlockState stone = Blocks.STONE.defaultBlockState();
+        final VoxelColliderHooks hooks = StructureBlockHooks.colliderHooks(new TestVolume(stone));
+
+        assertNull(hooks.collisionParts(0, 0, 0, new TestVolume(stone)),
+                "a full cube must return null so the greedy merge stays cheap");
+    }
+
+    @Test
+    void automaticEmptyShapeKeepsMassButRemovesCollision() {
+        final BlockState torch = Blocks.TORCH.defaultBlockState();
+        final VoxelColliderHooks hooks = StructureBlockHooks.colliderHooks(new TestVolume(torch));
+
+        final List<VoxelCellPart> parts = hooks.collisionParts(0, 0, 0, new TestVolume(torch));
+
+        assertNotNull(parts, "an empty shape must be an explicit empty part list");
+        assertTrue(parts.isEmpty());
+    }
+
+    @Test
+    void reindexUsesMutableVolumeSideTableStates() {
+        try (PhysicsWorld world = BulletPhysicsEngine.create().createWorld(WorldSettings.defaults())) {
+            final MutableVoxelVolume volume = VoxelVolumes.filled(
+                    new IntBounds3(0, 0, 0, 1, 1, 1), 1000.0, PhysicsMaterial.STONE);
+            final PhysicsStructure structure = new PhysicsStructure(world,
+                    StructureDef.builder(volume)
+                            .type(BodyType.STATIC)
+                            .pose(Transform3d.identity())
+                            .build());
+            try {
+                StructureBlockStates.set(structure, 0, 0, 0,
+                        Blocks.STONE_SLAB.defaultBlockState());
+
+                structure.reindex(volume);
+
+                assertEquals(1, structure.collider().customParts().size(),
+                        "reindex must read the side-table slab state");
+                assertEquals(0.5, structure.collider().customParts().get(0).sizeY(), EPSILON);
+                assertTrue(structure.collider().boxes().isEmpty(),
+                        "the slab cell must not also emit a full cube");
+            } finally {
+                StructureBlockStates.clear(structure);
+                structure.close();
+            }
+        }
+    }
+
     private record TestVolume(BlockState state) implements StatefulVoxelVolume {
         @Override
         public IntBounds3 bounds() {
@@ -128,6 +237,23 @@ class StructureBlockHooksTest {
         @Override
         public BlockState blockState(int x, int y, int z) {
             return state;
+        }
+    }
+
+    private record SingleCellVolume(BlockState state) implements StatefulVoxelVolume {
+        @Override
+        public IntBounds3 bounds() {
+            return new IntBounds3(0, 0, 0, 1, 1, 1);
+        }
+
+        @Override
+        public boolean isSolid(int x, int y, int z) {
+            return x == 0 && y == 0 && z == 0;
+        }
+
+        @Override
+        public BlockState blockState(int x, int y, int z) {
+            return isSolid(x, y, z) ? state : Blocks.AIR.defaultBlockState();
         }
     }
 }

@@ -28,10 +28,11 @@ The pass is intentionally asymmetric:
 - Structures are **never** moved, accelerated or otherwise affected by an
   entity.
 
-The kernel only reads a structure's pose and its immutable `VoxelBox` list. It
-never calls `applyCentralImpulse`, `applyImpulseAt`, `setPose`, `teleport` or
-any other mutating method on a physics body. Walking into a floating structure
-therefore cannot push it around.
+The kernel only reads a structure's pose, its immutable merged `VoxelBox` list
+and its exact `VoxelCellPart` list. It never calls `applyCentralImpulse`,
+`applyImpulseAt`, `setPose`, `teleport` or any other mutating method on a
+physics body. Walking into a floating structure therefore cannot push it
+around.
 
 ## Mixin target and injection
 
@@ -79,8 +80,8 @@ Because the redirect participates in the same movement call:
      penetrations against each candidate structure;
    - up to 3 MTV passes per structure, so one merged box can push the entity
      into a neighbouring box;
-   - at most 8 nearest structures per entity and 256 merged boxes per structure
-     per pass.
+   - at most 8 nearest structures per entity and 256 boxes/parts per structure
+     per pass (merged boxes and fractional parts share the budget).
 4. Pass the resulting motion to vanilla `collide`.
 5. Resolve a shallow residual overlap if vanilla clipping pushed the entity
    into a structure (a world wall next to a structure corner).
@@ -130,13 +131,38 @@ behind a wall correction.
 | Dedicated server | `LevelPhysics.structures()` | authoritative `structure.pose()` |
 | Integrated server | `LevelPhysics.structures()` | authoritative `structure.pose()` |
 | Client, singleplayer | `ClientPhysicsView.structures()` | newest published pose via `renderStateAt(now + timelineDelay)` |
-| Client, multiplayer | `ClientStructureCache.snapshots()` | last synced snapshot pose + merged boxes rebuilt from solid cells |
+| Client, multiplayer | `ClientStructureCache.snapshots()` | last synced snapshot pose + merged boxes and exact parts rebuilt from the snapshot's block states |
 
-Each source passes the structure-origin pose and the collider's **unshifted**
-merged boxes, matching the renderer's `structurePose * (voxel * blockScale)`
-convention. The solver never subtracts the centre of mass from those boxes. The
-Bullet body itself is COM-centred, which is why `PhysicsStructure.pose()` hides
-that offset before publishing the structure pose.
+Each source passes the structure-origin pose, the collider's **unshifted**
+merged boxes and its exact fractional parts, matching the renderer's
+`structurePose * (voxel * blockScale)` convention. The solver never subtracts
+the centre of mass from those boxes. The Bullet body itself is COM-centred,
+which is why `PhysicsStructure.pose()` hides that offset before publishing the
+structure pose.
+
+### Partial block shapes
+
+`VoxelColliderData.customParts()` holds the exact cell geometry for slabs,
+stairs, fences and custom collision hooks. `StructureCollisionBox.parts` carries
+those parts to entity movement, and `EntityStructureSolver` runs the same SAT /
+MTV logic over both lists. Parts are unscaled voxels and are scaled by
+`blockScale` and transformed by the structure pose exactly like merged boxes.
+Full-cube cells never create parts, so the common case keeps the merged fast
+path.
+
+When no explicit collision hook is registered, the collider adapter asks the
+`BlockState` for its vanilla collision shape at a virtual structure-local
+position. A single full-cube AABB returns `null` (merged path), an empty shape
+(plants, torches) returns an empty part list while retaining mass, and a partial
+shape becomes exact parts. `StatefulVoxelVolume` exposes states directly;
+`MutableVoxelVolume` states kept in `StructureBlockStates` are resolved when
+`PhysicsStructure.reindex` passes the owning structure to
+`StructureBlockHooks.colliderHooks(structure, volume)`.
+
+Terrain already uses the same precision: `TerrainSectionVolume` stores exact
+`VoxelCellPart`s for non-full world blocks, while vanilla entity collision
+handles those world blocks directly. Structures now use the equivalent exact
+parts in the movement solver.
 
 The client classes are loaded through a holder that is only reached after
 `FabricLoader.getEnvironmentType() == CLIENT`, so a dedicated server never
@@ -240,6 +266,11 @@ box and the MTV the resolver would choose.
   covers wall sliding, floor support, ceilings, rotated floors, structure
   step-up, high-speed thin-wall tunnelling, velocity filtering, empty sources
   and substep bounds.
+- `StructurePartialCollisionTest` covers a slab top at half height, walking
+  through the empty upper half of a slab cell, stepping onto a stair, a fence
+  post's thin footprint, a rotated/scaled slab and the full-cube fast path.
+- `StructureBlockHooksTest` verifies automatic `BlockState` shapes for slabs,
+  stairs, fence posts, full cubes and empty shapes.
 - The existing `EntityStructureSolver*` tests cover the SAT/MTV math used by
   the kernel.
 - `EntityStructureSolverPhysicsTest` continues to assert that resolving an

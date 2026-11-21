@@ -113,7 +113,7 @@ public final class EntityPhysicsCollisionManager {
                 final Vec3 motion = entity.getDeltaMovement();
                 final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                         entityBox, previousCenter(entity, center), pose, collider.boxes(),
-                        structure.blockScale(),
+                        collider.customParts(), structure.blockScale(),
                         EntityStructureSolver.Policy.gameplay(margin, MAX_BOXES_PER_STRUCTURE,
                                 CONTACT_SLOP, entity.onGround() || motion.y <= 0.0,
                                 motion.y));

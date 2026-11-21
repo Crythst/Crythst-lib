@@ -491,6 +491,7 @@ public final class EntityStructureRidingManager {
                     broad.expand(1.0),
                     broad.center(),
                     collider.boxes(),
+                    collider.customParts(),
                     structure.blockScale()
             ));
         }
@@ -570,6 +571,7 @@ public final class EntityStructureRidingManager {
         return EntityStructureRidingMath.findSupport(
                 view.pose(),
                 view.boxes(),
+                view.parts(),
                 view.blockScale(),
                 feet,
                 halfX,
@@ -813,6 +815,7 @@ public final class EntityStructureRidingManager {
             Aabb bounds,
             Vector3d center,
             List<VoxelBox> boxes,
+            List<io.mikaple.crythst.physics.voxel.VoxelCellPart> parts,
             double blockScale
     ) {
     }

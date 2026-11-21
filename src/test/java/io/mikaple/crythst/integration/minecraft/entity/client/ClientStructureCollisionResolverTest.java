@@ -4,6 +4,7 @@ import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.Test;
@@ -34,6 +35,12 @@ class ClientStructureCollisionResolverTest {
         return new ClientStructureCollisionResolver.Collider(pose, boxes, blockScale);
     }
 
+    private static ClientStructureCollisionResolver.Collider collider(
+            Transform3d pose, List<VoxelBox> boxes, List<VoxelCellPart> parts,
+            double blockScale) {
+        return new ClientStructureCollisionResolver.Collider(pose, boxes, blockScale, parts);
+    }
+
     @Test
     void axisAlignedFloorPushesPlayerUp() {
         final var correction = ClientStructureCollisionResolver.resolve(
@@ -48,6 +55,21 @@ class ClientStructureCollisionResolverTest {
         assertEquals(0.12, correction.offset().y, 1.0e-6);
         assertEquals(0.0, correction.offset().x, 1.0e-6);
         assertEquals(0.0, correction.offset().z, 1.0e-6);
+    }
+
+    @Test
+    void fractionalSlabPartPushesPlayerOntoTheHalfBlockTop() {
+        final VoxelCellPart slab = new VoxelCellPart(0.0, 0.0, 0.0, 1.0, 0.5, 1.0);
+        final var correction = ClientStructureCollisionResolver.resolve(
+                entityBox(0.2, 0.45, 0.2, 0.8, 2.25, 0.8),
+                null,
+                collider(Transform3d.identity(), List.of(), List.of(slab), 1.0),
+                MARGIN, MAX_BOXES, MAX_CORRECTION);
+
+        assertNotNull(correction);
+        assertTrue(correction.normal().y > 0.99);
+        assertEquals(0.05, correction.penetration(), 1.0e-6);
+        assertEquals(0.07, correction.offset().y, 1.0e-6);
     }
 
     @Test

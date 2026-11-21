@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.minecraft.entity.riding;
 
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
@@ -137,8 +138,28 @@ public final class EntityStructureRidingMath {
                                       double blockScale,
                                       Vector3dc feetCenter, double halfX, double halfZ,
                                       double tolerance, int maxBoxes) {
-        if (pose == null || boxes == null || boxes.isEmpty() || maxBoxes <= 0
+        return findSupport(pose, boxes, List.of(), blockScale,
+                feetCenter, halfX, halfZ, tolerance, maxBoxes);
+    }
+
+    /**
+     * Footprint support check that also considers exact fractional cell parts.
+     *
+     * <p>Merged boxes and parts share the same narrow-phase budget. A structure
+     * made only of slabs or stairs therefore still counts as support even though
+     * it has no merged full-cube box.</p>
+     */
+    public static Support findSupport(Transform3d pose, List<VoxelBox> boxes,
+                                      List<VoxelCellPart> parts, double blockScale,
+                                      Vector3dc feetCenter, double halfX, double halfZ,
+                                      double tolerance, int maxBoxes) {
+        if (pose == null || maxBoxes <= 0
                 || blockScale <= 0.0 || !(tolerance >= 0.0) || feetCenter == null) {
+            return null;
+        }
+        final boolean hasBoxes = boxes != null && !boxes.isEmpty();
+        final boolean hasParts = parts != null && !parts.isEmpty();
+        if (!hasBoxes && !hasParts) {
             return null;
         }
         final double safeHalfX = Math.max(0.0, halfX);
@@ -157,7 +178,7 @@ public final class EntityStructureRidingMath {
         final Vector3d sample = new Vector3d();
         for (int i = 0; i < offsetsX.length; i++) {
             sample.set(feetCenter.x() + offsetsX[i], feetCenter.y(), feetCenter.z() + offsetsZ[i]);
-            final Support hit = supportAt(pose, boxes, blockScale, sample, tolerance, maxBoxes);
+            final Support hit = supportAt(pose, boxes, parts, blockScale, sample, tolerance, maxBoxes);
             if (hit == null) {
                 continue;
             }
@@ -191,40 +212,94 @@ public final class EntityStructureRidingMath {
                 feetCenter, 0.0, 0.0, tolerance, maxBoxes);
     }
 
+    /**
+     * Point-like overload that also considers exact fractional cell parts.
+     */
+    public static Support findSupport(Transform3d pose, List<VoxelBox> boxes,
+                                      List<VoxelCellPart> parts, double blockScale,
+                                      Vector3dc feetCenter, double tolerance, int maxBoxes) {
+        return findSupport(pose, boxes, parts, blockScale,
+                feetCenter, 0.0, 0.0, tolerance, maxBoxes);
+    }
+
     private static Support supportAt(Transform3d pose, List<VoxelBox> boxes,
-                                     double blockScale,
+                                     List<VoxelCellPart> parts, double blockScale,
                                      Vector3dc worldSample, double tolerance, int maxBoxes) {
         final Vector3d local = toLocal(pose, worldSample);
-        double bestTop = Double.NaN;
-        double bestGap = Double.POSITIVE_INFINITY;
-        int examined = 0;
-        for (VoxelBox box : boxes) {
-            final double minX = box.minX() * blockScale;
-            final double minZ = box.minZ() * blockScale;
-            final double maxX = (box.minX() + box.sizeX()) * blockScale;
-            final double maxY = (box.minY() + box.sizeY()) * blockScale;
-            final double maxZ = (box.minZ() + box.sizeZ()) * blockScale;
+        final SupportScan scan = new SupportScan(local, tolerance, maxBoxes);
+        if (boxes != null) {
+            for (VoxelBox box : boxes) {
+                scan.accept(box.minX(), box.minY(), box.minZ(),
+                        box.sizeX(), box.sizeY(), box.sizeZ(), blockScale);
+                if (scan.exhausted()) {
+                    break;
+                }
+            }
+        }
+        if (!scan.exhausted() && parts != null) {
+            for (VoxelCellPart part : parts) {
+                scan.accept(part.minX(), part.minY(), part.minZ(),
+                        part.sizeX(), part.sizeY(), part.sizeZ(), blockScale);
+                if (scan.exhausted()) {
+                    break;
+                }
+            }
+        }
+        return scan.result();
+    }
 
-            if (local.x < minX - EDGE_SLACK || local.x > maxX + EDGE_SLACK
-                    || local.z < minZ - EDGE_SLACK || local.z > maxZ + EDGE_SLACK) {
-                continue;
+    private static final class SupportScan {
+        private final Vector3d local;
+        private final double tolerance;
+        private final int maxBoxes;
+        private double bestTop = Double.NaN;
+        private double bestGap = Double.POSITIVE_INFINITY;
+        private int examined;
+        private boolean exhausted;
+
+        private SupportScan(Vector3d local, double tolerance, int maxBoxes) {
+            this.local = local;
+            this.tolerance = tolerance;
+            this.maxBoxes = maxBoxes;
+        }
+
+        private boolean exhausted() {
+            return exhausted;
+        }
+
+        private void accept(double minX, double minY, double minZ,
+                            double sizeX, double sizeY, double sizeZ, double blockScale) {
+            final double scaledMinX = minX * blockScale;
+            final double scaledMinZ = minZ * blockScale;
+            final double scaledMaxX = (minX + sizeX) * blockScale;
+            final double scaledMaxY = (minY + sizeY) * blockScale;
+            final double scaledMaxZ = (minZ + sizeZ) * blockScale;
+
+            if (local.x < scaledMinX - EDGE_SLACK || local.x > scaledMaxX + EDGE_SLACK
+                    || local.z < scaledMinZ - EDGE_SLACK || local.z > scaledMaxZ + EDGE_SLACK) {
+                return;
             }
-            final double gap = local.y - maxY;
+            final double gap = local.y - scaledMaxY;
             if (gap < -tolerance || gap > tolerance) {
-                continue;
+                return;
             }
-            if (examined++ >= maxBoxes) {
-                break;
+            if (examined >= maxBoxes) {
+                exhausted = true;
+                return;
             }
+            examined++;
             if (Math.abs(gap) < Math.abs(bestGap)) {
                 bestGap = gap;
-                bestTop = maxY;
+                bestTop = scaledMaxY;
             }
         }
-        if (!Double.isFinite(bestTop)) {
-            return null;
+
+        private Support result() {
+            if (!Double.isFinite(bestTop)) {
+                return null;
+            }
+            return new Support(bestTop, bestGap, 1);
         }
-        return new Support(bestTop, bestGap, 1);
     }
 
     /**

@@ -4,6 +4,7 @@ import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -45,16 +46,24 @@ public final class ClientStructureCollisionResolver {
      *
      * @param pose       structure pose (voxel metres to world), not the
      *                   centre-of-mass body pose
-     * @param boxes      merged collision boxes in unscaled voxel coordinates
+     * @param boxes      merged full-cube boxes in unscaled voxel coordinates
      * @param blockScale metres per voxel
+     * @param parts      exact fractional cell parts in unscaled voxels
      */
-    public record Collider(Transform3d pose, List<VoxelBox> boxes, double blockScale) {
+    public record Collider(Transform3d pose, List<VoxelBox> boxes, double blockScale,
+                           List<VoxelCellPart> parts) {
         public Collider {
             pose = Objects.requireNonNull(pose, "pose");
             boxes = List.copyOf(boxes);
+            parts = parts == null ? List.of() : List.copyOf(parts);
             if (!(blockScale > 0.0) || !Double.isFinite(blockScale)) {
                 throw new IllegalArgumentException("blockScale must be positive and finite: " + blockScale);
             }
+        }
+
+        /** Coarse-only constructor retained for existing callers and tests. */
+        public Collider(Transform3d pose, List<VoxelBox> boxes, double blockScale) {
+            this(pose, boxes, blockScale, List.of());
         }
     }
 
@@ -133,7 +142,7 @@ public final class ClientStructureCollisionResolver {
         }
         final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                 entityBox, previousCenter, collider.pose(), collider.boxes(),
-                collider.blockScale(), policy);
+                collider.parts(), collider.blockScale(), policy);
         return bound(hit, maxCorrection);
     }
 
@@ -180,7 +189,7 @@ public final class ClientStructureCollisionResolver {
             for (int pass = 0; pass < passes; pass++) {
                 final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                         entityBox.offset(total), previousCenter, collider.pose(), collider.boxes(),
-                        collider.blockScale(), policy);
+                        collider.parts(), collider.blockScale(), policy);
                 if (hit == null) {
                     break;
                 }

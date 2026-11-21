@@ -3,6 +3,7 @@ package io.mikaple.crythst.integration.minecraft.entity;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 
@@ -13,8 +14,9 @@ import java.util.List;
  * structure's merged voxel boxes.
  *
  * <p>This class deliberately knows nothing about Minecraft entities or Bullet
- * bodies: it takes the structure pose and its {@link VoxelBox} list and returns
- * a translation that moves the entity box out of the structure. That keeps the
+ * bodies: it takes the structure pose, its merged {@link VoxelBox} list and its
+ * exact {@link VoxelCellPart} list and returns a translation that moves the
+ * entity box out of the structure. That keeps the
  * one-way collision rule easy to test and guarantees that resolving an entity
  * can never apply a force or impulse to the structure body.</p>
  */
@@ -157,50 +159,130 @@ public final class EntityStructureSolver {
      */
     public static Hit resolve(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
                               List<VoxelBox> boxes, double blockScale, Policy policy) {
+        return resolve(entityBox, previousCenter, pose, boxes, List.of(), blockScale, policy);
+    }
+
+    /**
+     * Resolves against merged full-cube boxes and exact fractional cell parts.
+     *
+     * <p>Both lists use structure-local voxel units; each box is scaled by
+     * {@code blockScale} and transformed by {@code pose} exactly like a merged
+     * box. Parts are used for slabs, stairs, fences and custom collision hooks,
+     * while full cubes stay on the cheap merged path. The narrow-phase budget is
+     * shared across both lists.</p>
+     *
+     * @param boxes  merged full-cube collision boxes in unscaled voxels
+     * @param parts  fractional collision parts in unscaled voxels
+     * @param policy margin, slop, budget and support preference
+     */
+    public static Hit resolve(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
+                              List<VoxelBox> boxes, List<VoxelCellPart> parts,
+                              double blockScale, Policy policy) {
         if (policy == null) {
             throw new IllegalArgumentException("policy is required");
         }
-        if (boxes.isEmpty() || policy.maxBoxes() <= 0 || blockScale <= 0.0) {
+        if ((boxes.isEmpty() && (parts == null || parts.isEmpty()))
+                || policy.maxBoxes() <= 0 || blockScale <= 0.0) {
             return null;
         }
-        final double safeMargin = policy.margin();
-        final Vector3d min = entityBox.min();
-        final Vector3d max = entityBox.max();
-        final Vector3d center = entityBox.center();
-        final double hx = (max.x - min.x) * 0.5;
-        final double hy = (max.y - min.y) * 0.5;
-        final double hz = (max.z - min.z) * 0.5;
-
-        final Vector3d[] axes = poseAxes(pose);
-        final Vector3d b0 = axes[0];
-        final Vector3d b1 = axes[1];
-        final Vector3d b2 = axes[2];
-        final Aabb localQuery = localQueryBox(pose, entityBox.expand(safeMargin), blockScale);
-        final Vector3d queryMin = localQuery.min();
-        final Vector3d queryMax = localQuery.max();
-
-        final Best globalBest = new Best();
-        final Best boxBest = new Best();
-        final Vector3d localCenter = new Vector3d();
-        final Vector3d boxCenter = new Vector3d();
-
-        int examined = 0;
-        boxLoop:
+        final Resolver resolver = new Resolver(entityBox, previousCenter, pose, blockScale, policy);
         for (VoxelBox box : boxes) {
-            if (!overlapsLocalQuery(box, queryMin, queryMax)) {
-                continue;
-            }
-            if (examined++ >= policy.maxBoxes()) {
+            resolver.accept(box.minX(), box.minY(), box.minZ(),
+                    box.sizeX(), box.sizeY(), box.sizeZ());
+            if (resolver.exhausted()) {
                 break;
             }
+        }
+        if (!resolver.exhausted() && parts != null) {
+            for (VoxelCellPart part : parts) {
+                resolver.accept(part.minX(), part.minY(), part.minZ(),
+                        part.sizeX(), part.sizeY(), part.sizeZ());
+                if (resolver.exhausted()) {
+                    break;
+                }
+            }
+        }
+        return resolver.hit();
+    }
 
-            final double hbx = box.sizeX() * blockScale * 0.5;
-            final double hby = box.sizeY() * blockScale * 0.5;
-            final double hbz = box.sizeZ() * blockScale * 0.5;
+    /** Margin/budget overload that also accepts exact fractional parts. */
+    public static Hit resolve(Aabb entityBox, Transform3d pose, List<VoxelBox> boxes,
+                              List<VoxelCellPart> parts, double blockScale,
+                              double margin, int maxBoxes) {
+        return resolve(entityBox, null, pose, boxes, parts, blockScale,
+                Policy.legacy(margin, maxBoxes));
+    }
+
+    /**
+     * Per-call immutable context plus the accumulated best exit. Kept private so
+     * the public API stays a set of pure static functions.
+     */
+    private static final class Resolver {
+        private final Vector3d previousCenter;
+        private final Transform3d pose;
+        private final double blockScale;
+        private final Policy policy;
+        private final double safeMargin;
+        private final double hx;
+        private final double hy;
+        private final double hz;
+        private final Vector3d center;
+        private final Vector3d b0;
+        private final Vector3d b1;
+        private final Vector3d b2;
+        private final Vector3d queryMin;
+        private final Vector3d queryMax;
+        private final Best globalBest = new Best();
+        private final Best boxBest = new Best();
+        private final Vector3d localCenter = new Vector3d();
+        private final Vector3d boxCenter = new Vector3d();
+        private int examined;
+        private boolean exhausted;
+
+        private Resolver(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
+                         double blockScale, Policy policy) {
+            this.previousCenter = previousCenter;
+            this.pose = pose;
+            this.blockScale = blockScale;
+            this.policy = policy;
+            this.safeMargin = policy.margin();
+            final Vector3d min = entityBox.min();
+            final Vector3d max = entityBox.max();
+            this.center = entityBox.center();
+            this.hx = (max.x - min.x) * 0.5;
+            this.hy = (max.y - min.y) * 0.5;
+            this.hz = (max.z - min.z) * 0.5;
+            final Vector3d[] axes = poseAxes(pose);
+            this.b0 = axes[0];
+            this.b1 = axes[1];
+            this.b2 = axes[2];
+            final Aabb localQuery = localQueryBox(pose, entityBox.expand(safeMargin), blockScale);
+            this.queryMin = localQuery.min();
+            this.queryMax = localQuery.max();
+        }
+
+        private boolean exhausted() {
+            return exhausted;
+        }
+
+        private void accept(double minX, double minY, double minZ,
+                            double sizeX, double sizeY, double sizeZ) {
+            if (!overlapsLocalQuery(minX, minY, minZ, sizeX, sizeY, sizeZ, queryMin, queryMax)) {
+                return;
+            }
+            if (examined >= policy.maxBoxes()) {
+                exhausted = true;
+                return;
+            }
+            examined++;
+
+            final double hbx = sizeX * blockScale * 0.5;
+            final double hby = sizeY * blockScale * 0.5;
+            final double hbz = sizeZ * blockScale * 0.5;
             localCenter.set(
-                    (box.minX() + box.sizeX() * 0.5) * blockScale,
-                    (box.minY() + box.sizeY() * 0.5) * blockScale,
-                    (box.minZ() + box.sizeZ() * 0.5) * blockScale
+                    (minX + sizeX * 0.5) * blockScale,
+                    (minY + sizeY * 0.5) * blockScale,
+                    (minZ + sizeZ * 0.5) * blockScale
             );
             pose.transformPoint(localCenter, boxCenter);
 
@@ -214,7 +296,7 @@ public final class EntityStructureSolver {
                     || center.y - hy > boxCenter.y + worldHalfY
                     || center.z + hz < boxCenter.z - worldHalfZ
                     || center.z - hz > boxCenter.z + worldHalfZ) {
-                continue;
+                return;
             }
 
             final double dx = center.x - boxCenter.x;
@@ -225,7 +307,7 @@ public final class EntityStructureSolver {
 
             // The nine cross axes only reject; they never become the MTV.
             if (separatedOnCrossAxes(dx, dy, dz, hx, hy, hz, hbx, hby, hbz, b0, b1, b2)) {
-                continue;
+                return;
             }
 
             boxBest.reset();
@@ -233,7 +315,7 @@ public final class EntityStructureSolver {
             if (!considerFaceAxis(dx, dy, dz, hx,
                     hbx * Math.abs(b0.x) + hby * Math.abs(b1.x) + hbz * Math.abs(b2.x),
                     1.0, 0.0, 0.0, boxBest, previousDelta, false)) {
-                continue boxLoop;
+                return;
             }
             final double boxProjectionY = hbx * Math.abs(b0.y)
                     + hby * Math.abs(b1.y) + hbz * Math.abs(b2.y);
@@ -247,29 +329,29 @@ public final class EntityStructureSolver {
                     && overlapY <= policy.supportLimit();
             if (!considerFaceAxis(dx, dy, dz, hy, boxProjectionY,
                     0.0, 1.0, 0.0, boxBest, previousDelta, support)) {
-                continue boxLoop;
+                return;
             }
             if (!considerFaceAxis(dx, dy, dz, hz,
                     hbx * Math.abs(b0.z) + hby * Math.abs(b1.z) + hbz * Math.abs(b2.z),
                     0.0, 0.0, 1.0, boxBest, previousDelta, false)) {
-                continue boxLoop;
+                return;
             }
 
             // Structure face axes.
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b0.x) + hy * Math.abs(b0.y) + hz * Math.abs(b0.z),
                     hbx, b0.x, b0.y, b0.z, boxBest, previousDelta, false)) {
-                continue boxLoop;
+                return;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b1.x) + hy * Math.abs(b1.y) + hz * Math.abs(b1.z),
                     hby, b1.x, b1.y, b1.z, boxBest, previousDelta, false)) {
-                continue boxLoop;
+                return;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b2.x) + hy * Math.abs(b2.y) + hz * Math.abs(b2.z),
                     hbz, b2.x, b2.y, b2.z, boxBest, previousDelta, false)) {
-                continue boxLoop;
+                return;
             }
 
             // A box whose chosen exit is shallower than the contact slop is
@@ -282,12 +364,14 @@ public final class EntityStructureSolver {
             }
         }
 
-        if (!globalBest.isValid() || globalBest.depth <= policy.slop()) {
-            return null;
+        private Hit hit() {
+            if (!globalBest.isValid() || globalBest.depth <= policy.slop()) {
+                return null;
+            }
+            final Vector3d normal = new Vector3d(globalBest.nx, globalBest.ny, globalBest.nz);
+            final Vector3d offset = new Vector3d(normal).mul(globalBest.depth + safeMargin);
+            return new Hit(offset, normal, globalBest.depth, globalBest.support);
         }
-        final Vector3d normal = new Vector3d(globalBest.nx, globalBest.ny, globalBest.nz);
-        final Vector3d offset = new Vector3d(normal).mul(globalBest.depth + safeMargin);
-        return new Hit(offset, normal, globalBest.depth, globalBest.support);
     }
 
     private static Vector3d[] poseAxes(Transform3d pose) {
@@ -341,10 +425,12 @@ public final class EntityStructureSolver {
         return new Aabb(new Vector3d(minX, minY, minZ), new Vector3d(maxX, maxY, maxZ));
     }
 
-    private static boolean overlapsLocalQuery(VoxelBox box, Vector3d queryMin, Vector3d queryMax) {
-        return box.minX() <= queryMax.x && box.minX() + box.sizeX() >= queryMin.x
-                && box.minY() <= queryMax.y && box.minY() + box.sizeY() >= queryMin.y
-                && box.minZ() <= queryMax.z && box.minZ() + box.sizeZ() >= queryMin.z;
+    private static boolean overlapsLocalQuery(double minX, double minY, double minZ,
+                                              double sizeX, double sizeY, double sizeZ,
+                                              Vector3d queryMin, Vector3d queryMax) {
+        return minX <= queryMax.x && minX + sizeX >= queryMin.x
+                && minY <= queryMax.y && minY + sizeY >= queryMin.y
+                && minZ <= queryMax.z && minZ + sizeZ >= queryMin.z;
     }
 
     private static boolean separatedOnCrossAxes(double dx, double dy, double dz,

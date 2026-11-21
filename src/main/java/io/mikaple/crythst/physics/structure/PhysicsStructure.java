@@ -338,7 +338,7 @@ public final class PhysicsStructure implements AutoCloseable {
 
         final StructureBlockStateSnapshot previousStates = this.blockStateSnapshot;
         final VoxelColliderData newCollider = VoxelColliderBuilder.build(newVolume, colliderOptions,
-                StructureBlockHooks.colliderHooks(newVolume));
+                StructureBlockHooks.colliderHooks(this, newVolume));
         if (newCollider.mass() <= 0.0 || newCollider.isEmpty()) {
             throw new IllegalArgumentException("New volume contains no solid blocks with collision geometry");
         }

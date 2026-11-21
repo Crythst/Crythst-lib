@@ -1,18 +1,22 @@
 package io.mikaple.crythst.integration.minecraft.collision;
 
+import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.client.network.ClientStructureCache;
 import io.mikaple.crythst.client.network.ClientStructureSnapshot;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
+import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureRenderState;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
+import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import io.mikaple.crythst.physics.voxel.VoxelColliderBuilder;
 import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import io.mikaple.crythst.physics.voxel.VoxelColliderOptions;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
+import net.minecraft.world.level.block.state.BlockState;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.resources.Identifier;
@@ -120,15 +124,13 @@ public final class ClientStructureCollisionSource implements StructureCollisionS
             final StructureRenderState state = structure.renderStateAt(
                     now + structure.renderTimelineDelayNanos());
             liveBodyIds.add(state.bodyId());
-            if (collider.boxes().isEmpty()) {
-                continue;
-            }
             next.add(new StructureCollisionBox(
                     state.bodyId(),
                     state.pose(),
                     collider.boxes(),
                     state.blockScale(),
-                    state.aabb()
+                    state.aabb(),
+                    collider.customParts()
             ));
         }
 
@@ -140,16 +142,17 @@ public final class ClientStructureCollisionSource implements StructureCollisionS
                     continue;
                 }
                 final Aabb bounds = networkBounds(structure);
-                final List<VoxelBox> boxes = networkBoxes(structure, syncId);
-                if (boxes.isEmpty()) {
+                final CachedGeometry geometry = networkGeometry(structure, syncId);
+                if (geometry.boxes().isEmpty() && geometry.parts().isEmpty()) {
                     continue;
                 }
                 next.add(new StructureCollisionBox(
                         structure.bodyId(),
                         structure.pose(),
-                        boxes,
+                        geometry.boxes(),
                         structure.blockScale(),
-                        bounds.expand(NETWORK_GEOMETRY_PADDING)
+                        bounds.expand(NETWORK_GEOMETRY_PADDING),
+                        geometry.parts()
                 ));
             }
         }
@@ -161,20 +164,25 @@ public final class ClientStructureCollisionSource implements StructureCollisionS
         return snapshot;
     }
 
-    private static List<VoxelBox> networkBoxes(ClientStructureSnapshot structure, long syncId) {
+    private static CachedGeometry networkGeometry(ClientStructureSnapshot structure, long syncId) {
         if (syncId != snapshotSyncId) {
             NETWORK_GEOMETRY.clear();
         }
         final CachedGeometry cached = NETWORK_GEOMETRY.get(structure.bodyId());
         if (cached != null && cached.geometryRevision() == structure.geometryRevision()) {
-            return cached.boxes();
+            return cached;
         }
+        // The snapshot carries block states, so the same automatic vanilla
+        // shape path as the server applies to slabs, stairs, fences, ...
+        final SnapshotVolume volume = new SnapshotVolume(structure);
         final VoxelColliderData data = VoxelColliderBuilder.build(
-                new SnapshotVolume(structure),
-                VoxelColliderOptions.DEFAULT.withBlockScale(structure.blockScale()));
-        NETWORK_GEOMETRY.put(structure.bodyId(),
-                new CachedGeometry(structure.geometryRevision(), data.boxes()));
-        return data.boxes();
+                volume,
+                VoxelColliderOptions.DEFAULT.withBlockScale(structure.blockScale()),
+                StructureBlockHooks.colliderHooks(volume));
+        final CachedGeometry geometry = new CachedGeometry(
+                structure.geometryRevision(), data.boxes(), data.customParts());
+        NETWORK_GEOMETRY.put(structure.bodyId(), geometry);
+        return geometry;
     }
 
     /**
@@ -215,11 +223,12 @@ public final class ClientStructureCollisionSource implements StructureCollisionS
                 new Vector3d(maxX, maxY, maxZ));
     }
 
-    private record CachedGeometry(long geometryRevision, List<VoxelBox> boxes) {
+    private record CachedGeometry(long geometryRevision, List<VoxelBox> boxes,
+                                  List<VoxelCellPart> parts) {
     }
 
-    /** Adapts a network snapshot to the collider builder's solid-cell view. */
-    private record SnapshotVolume(ClientStructureSnapshot snapshot) implements VoxelVolume {
+    /** Adapts a network snapshot to the collider builder's stateful-cell view. */
+    private record SnapshotVolume(ClientStructureSnapshot snapshot) implements StatefulVoxelVolume {
         @Override
         public IntBounds3 bounds() {
             return snapshot.bounds();
@@ -228,6 +237,11 @@ public final class ClientStructureCollisionSource implements StructureCollisionS
         @Override
         public boolean isSolid(int x, int y, int z) {
             return snapshot.isSolid(x, y, z);
+        }
+
+        @Override
+        public BlockState blockState(int x, int y, int z) {
+            return snapshot.blockStateAt(x, y, z);
         }
     }
 

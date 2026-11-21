@@ -159,10 +159,19 @@ the data-pack result.
 | block-change listener | `PhysicsStructure.reindex` | diffed against a lazily captured state snapshot; only volumes that expose block states |
 
 Custom fractional parts are part of the Bullet shape and mass but are **not**
-added to `VoxelColliderData.boxes()`. Legacy consumers that only walk `boxes()`
-(some render fallbacks, buoyancy, entity collision) still see the block's coarse
-voxel cell. Custom-centre-of-mass blocks keep their cube in `boxes()`, so only
-collision-shape overrides have this caveat.
+added to `VoxelColliderData.boxes()`; they live in `customParts()`. Entity and
+player movement, the client predictor, riding support and the diagnostic
+inspector consume both lists, so slabs, stairs and fences collide exactly.
+Custom-centre-of-mass blocks keep their cube in `boxes()`.
+
+When a block registers no explicit shape/dynamic-collider hook, the collider
+adapter falls back to the `BlockState`'s vanilla collision shape. A full cube
+still returns `null` and keeps the greedy merged-box fast path; an empty shape
+returns an empty part list (mass remains); a partial shape becomes exact
+`VoxelCellPart`s. `StatefulVoxelVolume` supplies states directly, while
+`MutableVoxelVolume` states authored through
+`StructureBlockStates` are used when `PhysicsStructure.reindex` rebuilds the
+collider.
 
 ---
 

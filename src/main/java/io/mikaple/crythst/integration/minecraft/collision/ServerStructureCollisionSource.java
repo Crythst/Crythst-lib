@@ -77,7 +77,8 @@ public final class ServerStructureCollisionSource {
                     structure.pose(),
                     collider.boxes(),
                     structure.blockScale(),
-                    structure.aabb()
+                    structure.aabb(),
+                    collider.customParts()
             ));
         }
         return new Snapshot(gameTime, structureCount, List.copyOf(boxes));

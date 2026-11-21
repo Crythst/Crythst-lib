@@ -28,8 +28,8 @@ import java.util.List;
  * twice.</p>
  *
  * <p>The solver is pure geometry: it takes a {@link StructureCollisionSource}
- * and returns a translation. It never mutates a structure, applies an impulse
- * or teleports an entity.</p>
+ * (merged boxes plus exact fractional parts) and returns a translation. It
+ * never mutates a structure, applies an impulse or teleports an entity.</p>
  */
 public final class StructureMotionSolver {
     /** Narrow-phase budget per structure, per substep, per pass. */
@@ -200,7 +200,7 @@ public final class StructureMotionSolver {
                 for (int pass = 0; pass < MAX_PASSES; pass++) {
                     final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
                             candidate, previousCenter, structure.pose(), structure.boxes(),
-                            structure.blockScale(), policy);
+                            structure.parts(), structure.blockScale(), policy);
                     if (hit == null || hit.penetration() <= CONTACT_SLOP) {
                         break;
                     }
@@ -213,7 +213,7 @@ public final class StructureMotionSolver {
                                 new Vector3d(0.0, input.stepHeight(), 0.0));
                         final EntityStructureSolver.Hit liftHit = EntityStructureSolver.resolve(
                                 lifted, candidate.center(), structure.pose(), structure.boxes(),
-                                structure.blockScale(), policy);
+                                structure.parts(), structure.blockScale(), policy);
                         if (liftHit == null || liftHit.penetration() <= CONTACT_SLOP) {
                             // Step onto the obstacle instead of stopping at its side.
                             candidate = lifted;
@@ -367,7 +367,7 @@ public final class StructureMotionSolver {
                 continue;
             }
             if (EntityStructureRidingMath.findSupport(
-                    structure.pose(), structure.boxes(), structure.blockScale(),
+                    structure.pose(), structure.boxes(), structure.parts(), structure.blockScale(),
                     feet, halfX, halfZ, maxDown, MAX_BOXES_PER_STRUCTURE) != null) {
                 return true;
             }

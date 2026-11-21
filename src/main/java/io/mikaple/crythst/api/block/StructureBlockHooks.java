@@ -3,9 +3,11 @@ package io.mikaple.crythst.api.block;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.minecraft.BlockVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.integration.minecraft.mass.BlockPhysicsProfile;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
+import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelCellPart;
 import io.mikaple.crythst.physics.voxel.VoxelColliderHooks;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
@@ -14,9 +16,13 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
@@ -57,8 +63,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * rebuilt with {@code PhysicsStructure#reindex}.</p>
  */
 public final class StructureBlockHooks {
+    /** Shapes this close to [0,1]^3 are treated as full cubes for merging. */
+    private static final double FULL_CUBE_EPSILON = 1.0e-6;
     private static final Map<Block, BlockStructureHooks> BLOCK_HOOKS = new ConcurrentHashMap<>();
     private static volatile List<BlockEntityHook> blockEntityHooks = List.of();
+
+    /** Per-cell block-state lookup used by the collider adapter. */
+    @FunctionalInterface
+    private interface StateSource {
+        BlockState stateAt(int x, int y, int z);
+    }
 
     private StructureBlockHooks() {
     }
@@ -342,23 +356,50 @@ public final class StructureBlockHooks {
     /**
      * Creates the per-cell hook set consumed by the voxel collider builder.
      *
-     * <p>Only stateful volumes expose enough information to resolve a block
-     * state. Other volumes keep vanilla collider behaviour. The returned object
-     * is safe to use from the structure-building thread.</p>
+     * <p>Volumes that can expose an authored block state additionally fall back
+     * to the state's vanilla collision shape when no explicit collision hook is
+     * registered. Full cubes stay on the cheap merged-box path, empty shapes
+     * contribute no collision geometry, and partial shapes (slabs, stairs,
+     * fences, ...) become exact {@link VoxelCellPart}s.</p>
+     *
+     * <p>This overload has no structure identity, so it only resolves states
+     * carried by a {@link StatefulVoxelVolume}. Use
+     * {@link #colliderHooks(PhysicsStructure, VoxelVolume)} for a
+     * {@link MutableVoxelVolume} whose states live in
+     * {@link StructureBlockStates}.</p>
      *
      * @param volume structure volume being colliderised
      * @return an adapter, or {@link VoxelColliderHooks#NONE}
      */
     public static VoxelColliderHooks colliderHooks(VoxelVolume volume) {
-        if (!(volume instanceof StatefulVoxelVolume stateful)) {
+        return colliderHooks(null, volume);
+    }
+
+    /**
+     * Creates the per-cell hook set for one structure, including authored block
+     * states kept in the {@link StructureBlockStates} side table.
+     *
+     * <p>This is the variant {@link PhysicsStructure#reindex(VoxelVolume)} uses
+     * so a {@link MutableVoxelVolume} with authored states gets the same exact
+     * vanilla shapes as a stateful volume.</p>
+     *
+     * @param structure structure that owns the side-table states, or
+     *                  {@code null} to skip side-table lookup
+     * @param volume    structure volume being colliderised
+     * @return an adapter, or {@link VoxelColliderHooks#NONE}
+     */
+    public static VoxelColliderHooks colliderHooks(PhysicsStructure structure, VoxelVolume volume) {
+        final StateSource states = stateSource(structure, volume);
+        if (states == null) {
             return VoxelColliderHooks.NONE;
         }
         final BlockGetter level = volume instanceof BlockVoxelVolume blockVolume
                 ? blockVolume.level() : null;
+        final BlockGetter virtualLevel = virtualLevel(states, volume);
         return new VoxelColliderHooks() {
             @Override
             public List<VoxelCellPart> collisionParts(int x, int y, int z, VoxelVolume ignored) {
-                final BlockState state = stateAt(stateful, x, y, z);
+                final BlockState state = states.stateAt(x, y, z);
                 if (state == null) {
                     return null;
                 }
@@ -381,7 +422,11 @@ public final class StructureBlockHooks {
                         }
                         return toPartsFromAabbs(x, y, z, shape.toAabbs());
                     }
-                    return null;
+                    // No explicit hook: use the block state's own collision
+                    // shape. The virtual getter supplies neighbour states from
+                    // the volume, so fences, walls and stairs shape themselves
+                    // from the structure rather than from the world level.
+                    return automaticCollisionParts(state, virtualLevel, pos, x, y, z);
                 } catch (Throwable t) {
                     logHookFailure(state, "collision shape", t);
                     return null;
@@ -390,7 +435,7 @@ public final class StructureBlockHooks {
 
             @Override
             public Vector3dc centerOfMass(int x, int y, int z, VoxelVolume ignored) {
-                final BlockState state = stateAt(stateful, x, y, z);
+                final BlockState state = states.stateAt(x, y, z);
                 if (state == null) {
                     return null;
                 }
@@ -418,21 +463,41 @@ public final class StructureBlockHooks {
 
             @Override
             public Double mass(int x, int y, int z, VoxelVolume ignored) {
-                final BlockPhysicsProfile profile = profile(stateful, level, x, y, z);
+                final BlockPhysicsProfile profile = profile(states, level, x, y, z);
                 return profile == null ? null : profile.mass();
             }
 
             @Override
             public PhysicsMaterial material(int x, int y, int z, VoxelVolume ignored) {
-                final BlockPhysicsProfile profile = profile(stateful, level, x, y, z);
+                final BlockPhysicsProfile profile = profile(states, level, x, y, z);
                 return profile == null ? null : profile.toMaterial();
             }
         };
     }
 
-    private static BlockPhysicsProfile profile(StatefulVoxelVolume volume, BlockGetter level,
+    /**
+     * Resolves a cell's state from the volume itself or from the structure's
+     * side table. Returns {@code null} when the volume cannot provide states.
+     */
+    private static StateSource stateSource(PhysicsStructure structure, VoxelVolume volume) {
+        if (volume instanceof StatefulVoxelVolume stateful) {
+            return (x, y, z) -> stateAt(stateful, x, y, z);
+        }
+        if (structure != null && volume instanceof MutableVoxelVolume) {
+            return (x, y, z) -> {
+                if (!volume.bounds().contains(x, y, z) || !volume.isSolid(x, y, z)) {
+                    return null;
+                }
+                final BlockState state = StructureBlockStates.get(structure, x, y, z);
+                return state == null || state.isAir() ? null : state;
+            };
+        }
+        return null;
+    }
+
+    private static BlockPhysicsProfile profile(StateSource states, BlockGetter level,
                                                int x, int y, int z) {
-        final BlockState state = stateAt(volume, x, y, z);
+        final BlockState state = states.stateAt(x, y, z);
         if (state == null) {
             return null;
         }
@@ -451,6 +516,78 @@ public final class StructureBlockHooks {
         }
         final BlockState state = volume.blockState(x, y, z);
         return state == null || state.isAir() ? null : state;
+    }
+
+    /**
+     * Fallback used when a block registers no explicit collision hook: extract
+     * the vanilla collision shape for the virtual structure position.
+     *
+     * @return {@code null} for a full cube (keep the greedy merged box), an
+     *         empty list for a non-colliding shape, or exact cell parts
+     */
+    private static List<VoxelCellPart> automaticCollisionParts(BlockState state, BlockGetter level,
+                                                               BlockPos pos,
+                                                               int x, int y, int z) {
+        if (state.isCollisionShapeFullBlock(level, pos)) {
+            return null;
+        }
+        final VoxelShape shape =
+                state.getCollisionShape(level, pos, CollisionContext.empty());
+        if (shape.isEmpty()) {
+            return List.of();
+        }
+        final List<AABB> aabbs = shape.toAabbs();
+        if (aabbs.size() == 1 && isFullCube(aabbs.get(0))) {
+            return null;
+        }
+        return toPartsFromAabbs(x, y, z, aabbs);
+    }
+
+    private static boolean isFullCube(AABB box) {
+        return Math.abs(box.minX) <= FULL_CUBE_EPSILON
+                && Math.abs(box.minY) <= FULL_CUBE_EPSILON
+                && Math.abs(box.minZ) <= FULL_CUBE_EPSILON
+                && Math.abs(box.maxX - 1.0) <= FULL_CUBE_EPSILON
+                && Math.abs(box.maxY - 1.0) <= FULL_CUBE_EPSILON
+                && Math.abs(box.maxZ - 1.0) <= FULL_CUBE_EPSILON;
+    }
+
+    /**
+     * A read-only {@link BlockGetter} for structure-local voxel positions.
+     * Vanilla shape code sometimes inspects neighbours (fences, walls, stairs);
+     * it must see the structure's own states, not whatever occupies the same
+     * coordinates in the real world.
+     */
+    private static BlockGetter virtualLevel(StateSource states, VoxelVolume volume) {
+        final int minY = volume.bounds().minY();
+        final int height = Math.max(1, volume.bounds().sizeY());
+        return new BlockGetter() {
+            @Override
+            public BlockEntity getBlockEntity(BlockPos pos) {
+                return null;
+            }
+
+            @Override
+            public BlockState getBlockState(BlockPos pos) {
+                final BlockState state = states.stateAt(pos.getX(), pos.getY(), pos.getZ());
+                return state == null ? air() : state;
+            }
+
+            @Override
+            public FluidState getFluidState(BlockPos pos) {
+                return Fluids.EMPTY.defaultFluidState();
+            }
+
+            @Override
+            public int getHeight() {
+                return height;
+            }
+
+            @Override
+            public int getMinY() {
+                return minY;
+            }
+        };
     }
 
     private static List<VoxelCellPart> toPartsFromBoxes(int x, int y, int z,
