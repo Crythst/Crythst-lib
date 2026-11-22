@@ -12,6 +12,11 @@ package structures and terms are intentionally aligned with Sable for migration
 and compatibility (for example ForceGroup, MassData, RigidBodyHandle,
 PhysicsPipeline, constraint configurations and VoxelColliderData). Their
 implementations are independent.
+
+sable-port and Crythst are maintained by the same author (mikaple). This
+explains the intentional API/term alignment, but it does not change the
+PolyForm Shield terms that apply to upstream Sable code; Crythst still contains
+no copied Sable or sable-port source, comments, or resources.
 Ideas, public Minecraft/Fabric APIs, and general physics techniques (greedy
 voxel meshing, compound colliders, fixed-timestep integration, interpolated
 rendering poses) were implemented from scratch.

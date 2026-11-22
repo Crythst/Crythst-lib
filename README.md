@@ -60,6 +60,8 @@ Crythst 是**独立实现**，不是 Sable 或 sable-port 的 fork，也不包�
 
 - **Sable** 是上游项目，探索“可移动方块结构的刚体仿真”，使用 **PolyForm Shield License 1.0.0**。
 - **sable-port** 是 Sable 面向 Fabric 的移植/适配版本，同样使用 **PolyForm Shield License 1.0.0**。
+- **sable-port 与 Crythst 由同一作者（mikaple）维护**。这解释了少量 API 名称/术语对齐的由来：作者可以在自己拥有版权的代码与 API 设计之间做迁移和兼容。  
+  但这一事实**不改变 Sable 上游代码的 PolyForm Shield 条款**；Crythst 仍然不复制 Sable 或 sable-port 的源代码、注释或资源。
 - Crythst 的设计问题空间受到二者启发；批量渲染、section 遮挡、选择、辅助方块逻辑等部分参考了其思路和术语，但代码独立实现。
 - 本仓库未复制 Sable/sable-port 的源代码、注释或资源文件；当前审计未发现整文件或大段连续代码复制。
 - 少量公共 API 名称、包结构和术语有意对齐（如 `ForceGroup`、`MassData`、`RigidBodyHandle`、`PhysicsPipeline`、约束配置、`VoxelColliderData`），这些类的实现是独立的。
