@@ -134,7 +134,7 @@ class PortalTraversalTest {
     }
 
     @Test
-    void transformedEyeLandsOnExitPlaneAndLeavesFromItsFront() {
+    void transformedEyeLandsOnExitPlaneAndPreservesTheSideReached() {
         final PortalPlane entry = plane();
         final PortalPlane exit = new PortalPlane(
                 new Vector3d(20.0, 70.0, -5.0),
@@ -148,16 +148,14 @@ class PortalTraversalTest {
         final Vector3d transformedEye = transform.transformPoint(eye);
         assertEquals(0.0, exit.signedDistance(transformedEye), EPS);
 
-        // A front-to-back crossing leaves through the exit front (+normal).
+        // A negative crossing leaves along the negative exit direction.
         final Vector3d frontVelocity = new Vector3d(0.0, 0.0, -1.0);
-        assertTrue(transform.transformDirection(frontVelocity).dot(exit.normal()) > 0.0,
-                "front-to-back traversal must leave through the exit front");
+        assertTrue(transform.transformDirection(frontVelocity).dot(exit.normal()) < 0.0,
+                "negative crossing keeps its direction at the exit");
 
-        // A back-to-front crossing leaves through the corresponding exit back,
-        // still moving away from the plane (the same rigid transform, so the
-        // view stays continuous across the crossing).
+        // A positive crossing leaves along the positive exit direction.
         final Vector3d backVelocity = new Vector3d(0.0, 0.0, 1.0);
-        assertTrue(transform.transformDirection(backVelocity).dot(exit.normal()) < 0.0,
-                "back-to-front traversal must leave through the exit back");
+        assertTrue(transform.transformDirection(backVelocity).dot(exit.normal()) > 0.0,
+                "positive crossing keeps its direction at the exit");
     }
 }

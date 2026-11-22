@@ -21,6 +21,8 @@
     "PortalLevelExtractorAccessor",
     "PortalLevelRendererMixin",
     "PortalSectionUpdateMixin",
+    "PortalTraversalCameraMixin",
+    "PortalTraversalPacketMixin",
     "StructureBlockOutlineMixin",
     "StructurePickBlockMixin",
     "StructurePlacementMixin"

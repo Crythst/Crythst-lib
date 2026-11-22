@@ -17,6 +17,10 @@ import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
 import com.mojang.renderpearl.api.textures.FilterMode;
 import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import io.mikaple.crythst.client.render.structure.batch.BatchedStructureRenderer;
+import io.mikaple.crythst.client.render.structure.blockentity.StructureBlockEntityRenderer;
+import io.mikaple.crythst.client.render.structure.moving.StructureMovingBlockRenderer;
+import io.mikaple.crythst.integration.fabric.client.StructureBlockRenderer;
 import io.mikaple.crythst.mixin.client.PortalCameraAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
@@ -24,6 +28,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.CloudStatus;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.CloudRenderer;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.RenderBuffers;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
@@ -40,7 +45,9 @@ import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraft.util.ARGB;
+import net.minecraft.util.profiling.InactiveProfiler;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4fStack;
@@ -92,6 +99,7 @@ final class PortalRenderPass {
     private GpuBuffer maskBuffer;
     private int maskBufferBytes;
     private final List<LayerTargets> layerTargets = new ArrayList<>();
+    private final List<PortalCloudRenderer> portalClouds = new ArrayList<>();
     private boolean failureLogged;
 
     /**
@@ -159,7 +167,8 @@ final class PortalRenderPass {
         modelViewStack.pushMatrix();
         try {
             final Set<Integer> failedLayers = new HashSet<>();
-            for (PortalRenderData layer : data) {
+            for (int index = 0; index < data.size(); index++) {
+                final PortalRenderData layer = data.get(index);
                 if (!layer.visible()) {
                     continue;
                 }
@@ -172,7 +181,7 @@ final class PortalRenderPass {
                     continue;
                 }
                 try {
-                    renderLayer(minecraft, main, layer);
+                    renderLayer(minecraft, main, layer, index);
                 } catch (Throwable error) {
                     failedLayers.add(layer.layer());
                     if (!failureLogged) {
@@ -216,7 +225,7 @@ final class PortalRenderPass {
         }
     }
 
-    private void renderLayer(Minecraft minecraft, RenderTarget main, PortalRenderData layer) {
+    private void renderLayer(Minecraft minecraft, RenderTarget main, PortalRenderData layer, int index) {
         final ClientLevel level = minecraft.level;
         final LevelRenderer levelRenderer = minecraft.levelRenderer;
         final CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
@@ -242,7 +251,7 @@ final class PortalRenderPass {
         // 2b. Clear depth to reverse-Z far only through the verified polygon.
         // Entry-world occluders outside the mask keep their depth until the
         // final masked depth restore.
-        drawDepthClear(encoder, main, mask);
+        drawDepthClear(encoder, main, targets, layer);
 
         // 3. Set up destination camera/fog/projection. The real Camera is
         // temporarily aimed at the destination only so FogRenderer can use the
@@ -295,7 +304,7 @@ final class PortalRenderPass {
         }
 
         // 6. Destination world into the main colour+depth attachments.
-        renderDestinationWorld(minecraft, levelRenderer, layer, main, mask);
+        renderDestinationWorld(minecraft, levelRenderer, layer, main, mask, index);
 
         // 7. Composite: keep destination pixels inside the opening, restore the
         // snapshot outside it. Layer 2 also multiplies by the parent mask.
@@ -331,11 +340,12 @@ final class PortalRenderPass {
 
     private void renderDestinationWorld(Minecraft minecraft, LevelRenderer levelRenderer,
                                         PortalRenderData layer, RenderTarget main,
-                                        PortalMaskGeometry.Mask mask) {
+                                        PortalMaskGeometry.Mask mask, int index) {
         final LevelRenderState state = layer.state();
         final OptionsRenderState options = minecraft.gameRenderer
                 .gameRenderState().optionsRenderState;
         FeatureRenderDispatcher.PreparedFrame featureFrame = null;
+        PortalCloudRenderer cloudRenderer = null;
         try {
             if (featureDispatcher == null) {
                 // Rebuild after a failed prepare on a previous layer/frame.
@@ -343,7 +353,7 @@ final class PortalRenderPass {
             }
             final SubmitNodeStorage submits = new SubmitNodeStorage();
             submits.setUseImprovedTransparency(false);
-            submitFeatures(minecraft, levelRenderer, state, submits);
+            submitFeatures(minecraft, levelRenderer, layer, submits);
             try {
                 featureFrame = featureDispatcher.prepareFrame(submits);
             } catch (Throwable error) {
@@ -356,11 +366,8 @@ final class PortalRenderPass {
                 throw error;
             }
 
-            final net.minecraft.client.renderer.CloudRenderer cloudRenderer =
-                    levelRenderer.cloudRenderer();
-            final boolean clouds = options.cloudStatus != CloudStatus.OFF
-                    && ARGB.alpha(state.cloudColor) > 0;
-            if (clouds) {
+            if (options.cloudStatus != CloudStatus.OFF && ARGB.alpha(state.cloudColor) > 0) {
+                cloudRenderer = cloudsFor(index, minecraft.getResourceManager());
                 cloudRenderer.prepare(state.cloudColor, options.cloudStatus, state.cloudHeight,
                         options.cloudRange, state.cameraRenderState.pos,
                         state.gameTime, state.worldPartialTicks);
@@ -398,7 +405,7 @@ final class PortalRenderPass {
                 chunkSections.renderGroup(ChunkSectionLayerGroup.TRANSLUCENT, renderPass,
                         sampler, blockAtlas, state.renderWireframeTerrain);
                 featureFrame.executeTranslucentAfterTerrain(renderPass);
-                if (clouds) {
+                if (cloudRenderer != null) {
                     cloudRenderer.render(options.cloudStatus, renderPass);
                 }
                 levelRenderer.weatherEffectRenderer().render(state.weatherRenderState, renderPass);
@@ -407,6 +414,9 @@ final class PortalRenderPass {
                         state.cameraRenderState.pos, renderDistance);
             }
         } finally {
+            if (cloudRenderer != null) {
+                cloudRenderer.endFrame();
+            }
             if (featureFrame != null) {
                 featureFrame.close();
             }
@@ -414,7 +424,8 @@ final class PortalRenderPass {
     }
 
     private static void submitFeatures(Minecraft minecraft, LevelRenderer levelRenderer,
-                                       LevelRenderState state, SubmitNodeCollector collector) {
+                                       PortalRenderData layer, SubmitNodeCollector collector) {
+        final LevelRenderState state = layer.state();
         final PoseStack poseStack = new PoseStack();
         final CameraRenderState camera = state.cameraRenderState;
         final Vec3 cameraPos = camera.pos;
@@ -436,6 +447,17 @@ final class PortalRenderPass {
             poseStack.popPose();
         }
         state.particlesRenderState.submit(collector, camera);
+        BatchedStructureRenderer.submitPortalView(minecraft, camera, collector);
+        StructureBlockRenderer.submit(minecraft, camera, collector);
+        try {
+            StructureBlockEntityRenderer.submit(minecraft, camera, poseStack, collector);
+        } finally {
+            levelRenderer.blockEntityRenderDispatcher().prepare(minecraft.gameRenderer.mainCamera().position());
+        }
+        StructureMovingBlockRenderer.submit(minecraft, camera, poseStack, collector);
+        if (layer.hitboxes() != null) {
+            layer.hitboxes().submit(collector, camera, false);
+        }
     }
 
     private void drawMask(CommandEncoder encoder, LayerTargets targets,
@@ -470,29 +492,24 @@ final class PortalRenderPass {
 
     /**
      * Writes reverse-Z far depth through the already-verified opening polygon.
-     * Draws the same clipped geometry as the mask; color writes are masked off.
-     * Occluder pixels outside the polygon keep their pre-layer depth until the
-     * final masked depth restore.
+     * Pixels hidden by terrain or by a parent mask keep their depth.
      */
     private void drawDepthClear(CommandEncoder encoder, RenderTarget main,
-                                PortalMaskGeometry.Mask mask) {
-        final int bytes = mask.triangles().length * Float.BYTES;
-        if (bytes <= 0 || bytes > maskBufferBytes) {
-            return;
-        }
+                                LayerTargets targets, PortalRenderData layer) {
+        final GpuTextureView parentMask = parentMask(main, targets, layer);
+        final GpuSampler nearest = RenderSystem.getSamplerCache()
+                .getClampToEdge(FilterMode.NEAREST);
         final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
                         () -> "Crythst portal depth clear")
                 .withColorAttachment(main.getColorTextureView())
                 .withDepthAttachment(main.getDepthTextureView())
-                .withRenderArea(new RenderPass.RenderArea(
-                        mask.minX(), mask.minY(), mask.width(), mask.height()))
                 .build();
-        try (RenderPass renderPass = RenderSystem.getDevice()
-                .createCommandEncoder().createRenderPass(descriptor)) {
+        try (RenderPass renderPass = encoder.createRenderPass(descriptor)) {
             renderPass.setPipeline(RenderSystem.getCompiledPipeline(
                     PortalPassRenderTypes.depthClear()));
-            renderPass.setVertexBuffer(0, maskBuffer.slice(0, bytes));
-            renderPass.draw(mask.vertexCount(), 1, 0, 0);
+            renderPass.setUniform("Sampler0", targets.mask.getColorTextureView(), nearest);
+            renderPass.setUniform("Sampler1", parentMask, nearest);
+            renderPass.draw(3, 1, 0, 0);
         }
     }
 
@@ -580,7 +597,47 @@ final class PortalRenderPass {
                 options.textureFiltering == TextureFilteringMethod.RGSS);
     }
 
+    private PortalCloudRenderer cloudsFor(int index, ResourceManager resources) {
+        // Several portals can share a recursion depth. Each draw needs its
+        // own cloud buffers because all draws are in the same GPU submission.
+        while (portalClouds.size() <= index) {
+            portalClouds.add(null);
+        }
+        PortalCloudRenderer renderer = portalClouds.get(index);
+        if (renderer == null) {
+            renderer = new PortalCloudRenderer();
+            portalClouds.set(index, renderer);
+        }
+        renderer.ensureTexture(resources);
+        return renderer;
+    }
+
+    void invalidateCloudTextures() {
+        for (PortalCloudRenderer renderer : portalClouds) {
+            if (renderer != null) {
+                renderer.textureLoaded = false;
+            }
+        }
+    }
+
+    private static final class PortalCloudRenderer extends CloudRenderer {
+        private boolean textureLoaded;
+
+        void ensureTexture(ResourceManager resources) {
+            if (!textureLoaded) {
+                apply(prepare(resources, InactiveProfiler.INSTANCE), resources, InactiveProfiler.INSTANCE);
+                textureLoaded = true;
+            }
+        }
+    }
+
     void close() {
+        for (PortalCloudRenderer renderer : portalClouds) {
+            if (renderer != null) {
+                renderer.close();
+            }
+        }
+        portalClouds.clear();
         for (LayerTargets targets : layerTargets) {
             targets.close();
         }

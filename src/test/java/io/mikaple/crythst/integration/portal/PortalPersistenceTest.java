@@ -121,6 +121,33 @@ class PortalPersistenceTest {
     }
 
     @Test
+    void legacyDirectionMigrationKeepsAnAsymmetricOpeningInPlace() {
+        final PortalPlane legacyPlane = planeAt(2.0);
+        final PortalShape triangle = PortalShape.polygon(legacyPlane, List.of(
+                new org.joml.Vector2d(-0.7, -1.0),
+                new org.joml.Vector2d(0.9, -1.0),
+                new org.joml.Vector2d(0.5, 0.8)));
+        final UUID linked = UUID.randomUUID();
+        final CompoundTag tag = PortalSavedData.write(List.of(
+                new PortalSavedData.StoredPortal(UUID.randomUUID(), "triangle",
+                        Level.OVERWORLD, legacyPlane, linked, triangle.outline())));
+        tag.putInt("version", 2);
+
+        final PortalSavedData.StoredPortal migrated = new PortalSavedData(tag).readPortals().getFirst();
+        assertVectorEquals(legacyPlane.normal().negate(), migrated.plane().normal());
+        assertVectorEquals(legacyPlane.up(), migrated.plane().up());
+        assertEquals(linked, migrated.linkedId());
+        for (Vector3d vertex : triangle.worldOutline()) {
+            assertTrue(migrated.shape().worldOutline().stream()
+                    .anyMatch(migratedVertex -> vertex.distance(migratedVertex) < EPS));
+        }
+
+        final CompoundTag saved = PortalSavedData.write(List.of(migrated));
+        assertVectorEquals(migrated.plane().normal(),
+                new PortalSavedData(saved).readPortals().getFirst().plane().normal());
+    }
+
+    @Test
     void transformMapsNormalsAndRoundTrips() {
         final PortalPlane entry = new PortalPlane(
                 new Vector3d(0.0, 0.0, 0.0),
@@ -135,7 +162,8 @@ class PortalPersistenceTest {
         final Vector3d normal = transform.transformDirection(entry.normal());
         final Vector3d exitNormal = exit.normal();
         assertNotNull(normal);
-        assertVectorEquals(exitNormal.negate(), normal);
+        assertVectorEquals(exitNormal, normal);
+        assertVectorEquals(exit.right(), transform.transformDirection(entry.right()));
         assertVectorEquals(exit.up(), transform.transformDirection(entry.up()));
 
         final Vector3d point = new Vector3d(0.75, 1.25, 0.5);

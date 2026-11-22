@@ -4,8 +4,10 @@ import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.resource.ResourceHandle;
 import com.mojang.blaze3d.systems.RenderSystem;
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.resource.v1.ResourceLoader;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
@@ -17,6 +19,9 @@ import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -135,6 +140,9 @@ public final class PortalRenderManager {
         }
         registered = true;
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> close());
+        ResourceLoader.get(PackType.CLIENT_RESOURCES).registerReloadListener(
+                Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "portal_clouds"),
+                (ResourceManagerReloadListener) resources -> pass.invalidateCloudTextures());
     }
 
     private void extractFrame(Camera camera, DeltaTracker deltaTracker, float partialTick) {
@@ -226,7 +234,7 @@ public final class PortalRenderManager {
             final ChunkSectionsToRender chunkRender = chunkSections.prepare(
                     levelRenderer.sectionRenderDispatcher(), view.viewRotation(),
                     extractedState.sections(), atlasWidth, atlasHeight, options);
-            extracted.add(new PortalRenderData(portal, view, extractedState.state(),
+            extracted.add(new PortalRenderData(portal, view, extractedState.state(), extractedState.hitboxes(),
                     extractedState.sections(), new Matrix4f(view.mainViewProjection()),
                     mainCamera.pos, mask, chunkRender, 1, 0,
                     extractedState.sectionCount()));
@@ -275,14 +283,15 @@ public final class PortalRenderManager {
         final List<PortalSnapshot> candidates = new ArrayList<>();
         final Vector3d parentPosition = new Vector3d(
                 parentCamera.pos.x, parentCamera.pos.y, parentCamera.pos.z);
+        final Set<UUID> ancestors = Set.of(parent.id());
         for (PortalSnapshot portal : PortalClientCache.get()) {
-            if (portal.id().equals(parent.id()) || rendered.contains(portal.id())
+            if (rendered.contains(portal.id())
                     || !portal.dimension().equals(level.dimension())
                     || !portal.viewableIn(level.dimension())) {
                 continue;
             }
             if (PortalRecursion.nextLayer(1, PortalCaptureSettings.MAX_RECURSION,
-                    portal.id(), Set.of(parent.id())) == 0) {
+                    portal.id(), ancestors, parent.linkedPortalId()) == 0) {
                 continue;
             }
             if (!isVisible(parentCamera, portal)) {
@@ -319,7 +328,7 @@ public final class PortalRenderManager {
             final ChunkSectionsToRender chunkRender = chunkSections.prepare(
                     levelRenderer.sectionRenderDispatcher(), childView.viewRotation(),
                     childState.sections(), atlasWidth, atlasHeight, options);
-            return new PortalRenderData(child, childView, childState.state(),
+            return new PortalRenderData(child, childView, childState.state(), childState.hitboxes(),
                     childState.sections(), screenViewProjection, parentCamera.pos,
                     mask, chunkRender, 2, 1, childState.sectionCount());
         }

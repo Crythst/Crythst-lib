@@ -5,6 +5,7 @@ import org.joml.Matrix4fc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 import org.joml.Vector3f;
+import org.joml.Vector4f;
 
 /**
  * Oblique near-plane clipping for the destination render.
@@ -83,12 +84,26 @@ public final class PortalClip {
         final float ww = projection.m33();
         switch (convention) {
             case ZERO_TO_ONE_REVERSED -> {
-                // Reverse Z: near is z' = w. Setting z' = w + plane·p maps the
-                // portal plane exactly to the near depth.
-                result.m02(wx + (float) normalView.x);
-                result.m12(wy + (float) normalView.y);
-                result.m22(wz + (float) normalView.z);
-                result.m32(ww + (float) d);
+                // Scale the plane so the opposite far corner stays at z'=0.
+                // Without the scale, looking across the portal at an angle
+                // can put visible terrain beyond the new far plane.
+                final Matrix4f inverse = new Matrix4f(projection).invert();
+                final Vector4f plane = new Vector4f(normalView, (float) d);
+                float farDistance = 0.0f;
+                for (int x = -1; x <= 1; x += 2) {
+                    for (int y = -1; y <= 1; y += 2) {
+                        final Vector4f farCorner = inverse.transform(new Vector4f(x, y, 0.0f, 1.0f));
+                        farDistance = Math.min(farDistance, plane.dot(farCorner));
+                    }
+                }
+                if (!Float.isFinite(farDistance) || farDistance >= -EPSILON) {
+                    return result;
+                }
+                plane.mul(-1.0f / farDistance);
+                result.m02(wx + plane.x);
+                result.m12(wy + plane.y);
+                result.m22(wz + plane.z);
+                result.m32(ww + plane.w);
             }
             case NEGATIVE_ONE_TO_ONE -> {
                 // OpenGL near is z' = -w.

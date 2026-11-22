@@ -83,9 +83,9 @@ final class PortalPassRenderTypes {
                     result = RenderPipeline.builder()
                             .withLocation(Identifier.fromNamespaceAndPath(
                                     Crythst.MOD_ID, "portal_depth_clear"))
-                            .withVertexShader(DEPTH_CLEAR_SHADER)
+                            .withVertexShader(SCREENQUAD)
                             .withFragmentShader(DEPTH_CLEAR_SHADER)
-                            .withVertexBinding(0, DefaultVertexFormat.POSITION)
+                            .withBindGroupLayout(BindGroupLayouts.SAMPLER0_SAMPLER1)
                             .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
                             .withColorTargetState(new ColorTargetState(
                                     Optional.empty(), GpuFormat.RGBA8_UNORM,

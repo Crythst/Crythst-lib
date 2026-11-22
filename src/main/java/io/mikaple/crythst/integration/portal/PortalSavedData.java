@@ -40,7 +40,7 @@ public final class PortalSavedData extends SavedData {
             CompoundTag.CODEC.xmap(PortalSavedData::new, PortalSavedData::tag),
             DataFixTypes.LEVEL);
 
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
     private static final String KEY_VERSION = "version";
     private static final String KEY_PORTALS = "portals";
     private static final String KEY_OUTLINE = "outline";
@@ -70,11 +70,12 @@ public final class PortalSavedData extends SavedData {
     /** Reads and validates every persisted portal record. */
     public List<StoredPortal> readPortals() {
         final List<StoredPortal> result = new ArrayList<>();
+        final boolean legacyDirection = data.getIntOr(KEY_VERSION, 1) < VERSION;
         final ListTag list = data.getListOrEmpty(KEY_PORTALS);
         for (int i = 0; i < list.size(); i++) {
             final CompoundTag entry = list.getCompoundOrEmpty(i);
             try {
-                final StoredPortal portal = readEntry(entry);
+                final StoredPortal portal = readEntry(entry, legacyDirection);
                 if (portal != null) {
                     result.add(portal);
                 }
@@ -85,7 +86,7 @@ public final class PortalSavedData extends SavedData {
         return result;
     }
 
-    private static StoredPortal readEntry(CompoundTag entry) {
+    private static StoredPortal readEntry(CompoundTag entry, boolean legacyDirection) {
         final UUID id = parseUuid(entry.getStringOr("id", ""));
         if (id == null) {
             return null;
@@ -112,8 +113,15 @@ public final class PortalSavedData extends SavedData {
             return null;
         }
 
+        List<Vector2d> outline = readOutline(entry);
+        if (legacyDirection) {
+            // The old normal faced the creator. Preserve up and world-space
+            // outline vertices while changing to their original look direction.
+            normal.negate();
+            right.negate();
+            outline = outline.stream().map(point -> new Vector2d(-point.x, point.y)).toList();
+        }
         final PortalPlane plane = new PortalPlane(origin, normal, right, width, height);
-        final List<Vector2d> outline = readOutline(entry);
         final UUID linked = parseUuid(entry.getStringOr("linked", ""));
         return new StoredPortal(id, name, dimension, plane, linked, outline);
     }

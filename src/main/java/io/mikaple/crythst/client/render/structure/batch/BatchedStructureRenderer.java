@@ -140,6 +140,7 @@ public final class BatchedStructureRenderer {
     private static volatile double renderDistance = DEFAULT_RENDER_DISTANCE;
     private static volatile BatchStats stats = BatchStats.EMPTY;
 
+    private static long mainFrameNanos;
     private static int submittedBatches;
     private static long submittedVertices;
     private static int culledSections;
@@ -295,39 +296,43 @@ public final class BatchedStructureRenderer {
      * {@code LevelRenderEvents.BEFORE_GIZMOS}.
      */
     public static void render(LevelRenderContext context) {
-        if (!enabled || Minecraft.getInstance().level == null
-                || !CrythstFabric.config().enabled) {
-            return;
-        }
-        // F9 selects the legacy coloured cuboids. Honor it as a hard switch so
-        // the user never sees two representations at once.
-        if (StructureBlockRenderer.blockRenderingEnabled()) {
-            return;
-        }
-
-        final Minecraft client = Minecraft.getInstance();
-        final ResourceKey<Level> dimension = client.level.dimension();
         final LevelRenderState levelState = context.levelState();
-        final CameraRenderState camera = levelState == null ? null : levelState.cameraRenderState;
-        final SubmitNodeCollector collector = context.submitNodeCollector();
-        if (camera == null || camera.pos == null || collector == null) {
+        submit(Minecraft.getInstance(), levelState == null ? null : levelState.cameraRenderState,
+                context.submitNodeCollector(), true);
+    }
+
+    /** Collects another view into its own submit list during the same frame. */
+    public static void submitPortalView(Minecraft client, CameraRenderState camera,
+                                        SubmitNodeCollector collector) {
+        submit(client, camera, collector, false);
+    }
+
+    private static void submit(Minecraft client, CameraRenderState camera,
+                               SubmitNodeCollector collector, boolean mainView) {
+        if (!enabled || client.level == null || !CrythstFabric.config().enabled
+                || StructureBlockRenderer.blockRenderingEnabled()
+                || camera == null || camera.pos == null || collector == null) {
             return;
         }
 
+        final ResourceKey<Level> dimension = client.level.dimension();
         final long frameStart = System.nanoTime();
         // Structure poses are published on the server tick boundary and network
         // poses arrive at ~20 Hz. Sampling them with the client partial tick
         // makes the mesh jump whenever a server update lands mid-client-tick,
         // so both the local and network paths use the same timestamped,
         // one-tick-delayed frame time instead.
-        final long frameNanos = frameStart;
+        if (mainView) {
+            mainFrameNanos = frameStart;
+            POSE_MONITOR.beginFrame(mainFrameNanos);
+            StructureBatchCache.beginFrame(dimension);
+            NETWORK.beginFrame();
+        }
+        final long frameNanos = mainFrameNanos == 0L ? frameStart : mainFrameNanos;
         final float alpha = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
         final Set<Long> serverBodyIds = new HashSet<>(Math.max(16, structures.size() * 2));
 
-        POSE_MONITOR.beginFrame(frameNanos);
-        StructureBatchCache.beginFrame(dimension);
-        NETWORK.beginFrame();
         OPAQUE.clear();
         TRANSLUCENT.clear();
         FALLBACK_SECTIONS.clear();
@@ -354,7 +359,9 @@ public final class BatchedStructureRenderer {
         for (PhysicsStructure structure : structures) {
             final StructureRenderState state = structure.renderStateAt(frameNanos);
             serverBodyIds.add(state.bodyId());
-            POSE_MONITOR.observe(state.bodyId(), state.pose());
+            if (mainView) {
+                POSE_MONITOR.observe(state.bodyId(), state.pose());
+            }
 
             final StructureBlockSnapshots.Snapshot snapshot =
                     StructureBlockSnapshots.get(dimension, state.bodyId());
@@ -424,7 +431,9 @@ public final class BatchedStructureRenderer {
             final StructureBatchSnapshots.Snapshot geometry = NETWORK.geometry(network);
             final Transform3d pose = ClientStructureCache.interpolatedPose(
                     network.bodyId(), frameNanos);
-            POSE_MONITOR.observe(network.bodyId(), pose);
+            if (mainView) {
+                POSE_MONITOR.observe(network.bodyId(), pose);
+            }
             final double blockScale = network.blockScale();
             if (!isVisible(camera, StructureBatchSnapshots.worldBounds(
                     geometry, pose, blockScale), bodyFrustumMargin(blockScale))) {
@@ -442,7 +451,9 @@ public final class BatchedStructureRenderer {
         }
 
         final long buildEnd = System.nanoTime();
-        StructureBatchCache.retryOverBudgetSections();
+        if (mainView) {
+            StructureBatchCache.retryOverBudgetSections();
+        }
 
         // Opaque/cutout: near-to-far improves early depth rejection. The
         // translucent pass writes depth, so it must be sorted far-to-near or a
@@ -495,6 +506,9 @@ public final class BatchedStructureRenderer {
             }
         }
 
+        if (!mainView) {
+            return;
+        }
         POSE_MONITOR.endFrame(frameNanos);
 
         final long frameEnd = System.nanoTime();

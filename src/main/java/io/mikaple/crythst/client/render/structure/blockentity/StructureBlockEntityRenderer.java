@@ -16,6 +16,9 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.core.BlockPos;
@@ -78,16 +81,19 @@ public final class StructureBlockEntityRenderer {
     }
 
     private static void collect(LevelRenderContext context) {
-        final Minecraft minecraft = Minecraft.getInstance();
+        final LevelRenderState state = context.levelState();
+        submit(Minecraft.getInstance(), state == null ? null : state.cameraRenderState,
+                context.poseStack(), context.submitNodeCollector());
+    }
+
+    public static void submit(Minecraft minecraft, CameraRenderState cameraState,
+                              PoseStack poseStack, SubmitNodeCollector collector) {
         final ClientLevel level = minecraft.level;
-        if (level == null || context.levelState() == null
-                || context.levelState().cameraRenderState == null
-                || context.levelState().cameraRenderState.pos == null
-                || context.poseStack() == null
-                || context.submitNodeCollector() == null) {
+        if (level == null || cameraState == null || cameraState.pos == null
+                || poseStack == null || collector == null) {
             return;
         }
-        final Vec3 camera = context.levelState().cameraRenderState.pos;
+        final Vec3 camera = cameraState.pos;
         final Vector3d cameraPos = new Vector3d(camera.x, camera.y, camera.z);
         final BlockEntityRenderDispatcher dispatcher =
                 minecraft.getBlockEntityRenderDispatcher();
@@ -131,7 +137,7 @@ public final class StructureBlockEntityRenderer {
                 CACHE.put(bodyId, cached);
             }
             submit(cached, render.pose(), render.blockScale(), cameraPos,
-                    dispatcher, partialTick, context);
+                    dispatcher, partialTick, cameraState, poseStack, collector);
         }
 
         // Multiplayer: immutable snapshots and block-entity updates from the
@@ -166,18 +172,18 @@ public final class StructureBlockEntityRenderer {
             }
             final Transform3d pose = ClientStructureCache.interpolatedPose(bodyId, now);
             submit(cached, pose, network.blockScale(), cameraPos,
-                    dispatcher, partialTick, context);
+                    dispatcher, partialTick, cameraState, poseStack, collector);
         }
         CACHE.keySet().removeIf(id -> !live.contains(id));
     }
 
     private static void submit(Cached cached, Transform3d pose, double blockScale,
                                Vector3d cameraPos, BlockEntityRenderDispatcher dispatcher,
-                               float partialTick, LevelRenderContext context) {
+                               float partialTick, CameraRenderState cameraState,
+                               PoseStack poseStack, SubmitNodeCollector collector) {
         if (cached.entries.isEmpty()) {
             return;
         }
-        final PoseStack poseStack = context.poseStack();
         for (Entry entry : cached.entries) {
             entry.syncAnimation(cached.openCounts.getOrDefault(entry.packedLocal(), -1));
             final Matrix4f matrix = StructureOutlineTransform.cameraRelativeMatrix(
@@ -192,7 +198,7 @@ public final class StructureBlockEntityRenderer {
                     continue;
                 }
                 dispatcher.submit(state, poseStack,
-                        context.submitNodeCollector(), context.levelState().cameraRenderState);
+                        collector, cameraState);
             } catch (RuntimeException ignored) {
                 // A modded BER can throw for an unsupported synthetic level;
                 // skip that entity rather than breaking the whole frame.

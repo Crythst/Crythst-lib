@@ -63,13 +63,13 @@ class PortalTeleportMathTest {
     }
 
     @Test
-    void frontToBackLeavesThroughExitFrontAndBackToFrontThroughExitBack() {
+    void preservesPositiveAndNegativeDirectionsAcrossTheLink() {
         final PortalTransform transform = PortalTransform.between(entry(), exit());
-        final Vector3d frontVelocity = new Vector3d(0.0, 0.0, -1.0);
-        final Vector3d backVelocity = new Vector3d(0.0, 0.0, 1.0);
+        final Vector3d positiveVelocity = new Vector3d(0.0, 0.0, 1.0);
+        final Vector3d negativeVelocity = new Vector3d(0.0, 0.0, -1.0);
 
-        assertTrue(transform.transformDirection(frontVelocity).dot(exit().normal()) > 0.0);
-        assertTrue(transform.transformDirection(backVelocity).dot(exit().normal()) < 0.0);
+        assertTrue(transform.transformDirection(positiveVelocity).dot(exit().normal()) > 0.0);
+        assertTrue(transform.transformDirection(negativeVelocity).dot(exit().normal()) < 0.0);
     }
 
     @Test
@@ -84,13 +84,48 @@ class PortalTeleportMathTest {
     }
 
     @Test
+    void predictionFromTheOldSideStillPlacesThePlayerOnTheCrossedSide() {
+        final PortalTransform transform = PortalTransform.between(entry(), exit());
+        for (int side : new int[]{-1, 1}) {
+            final Vector3d staleEye = entry().origin().fma(-side * 0.2, entry().normal());
+            final Vector3d feet = PortalTeleportMath.playerFeetAfterCrossing(
+                    transform, staleEye, 1.62, 0.9, side > 0);
+            assertTrue(exit().signedDistance(new Vector3d(feet).add(0, 1.62, 0)) * side > 0.0);
+            assertTrue(exit().signedDistance(new Vector3d(feet).add(0, 0.9, 0)) * side > 0.0);
+        }
+    }
+
+    @Test
+    void cameraInterpolationCrossesTheExitPlaneInEitherDirection() {
+        final PortalTransform transform = PortalTransform.between(entry(), exit());
+        final double eyeHeight = 1.62;
+        for (int side : new int[]{-1, 1}) {
+            final Vector3d startEye = entry().origin().fma(-side * 0.3, entry().normal());
+            final Vector3d movement = new Vector3d(entry().normal()).mul(side * 0.4);
+            final Vector3d endEye = new Vector3d(startEye).add(movement);
+            final Vector3d exitFeet = PortalTeleportMath.playerFeetAfterCrossing(
+                    transform, endEye, eyeHeight, 0.9, side > 0);
+            final Vector3d exitEndEye = new Vector3d(exitFeet).add(0, eyeHeight, 0);
+            final Vector3d exitStartEye = PortalTeleportMath.previousFeetAfterCrossing(
+                    transform, exitFeet, movement).add(0, eyeHeight, 0);
+            final Vector3d beforeCrossing = new Vector3d(exitStartEye).lerp(exitEndEye, 0.25);
+            final Vector3d afterCrossing = new Vector3d(exitStartEye).lerp(exitEndEye, 0.95);
+
+            assertVectorEquals(transform.transformDirection(movement),
+                    new Vector3d(exitEndEye).sub(exitStartEye));
+            assertFalse(PortalTeleportMath.eyeReachedExit(exit(), beforeCrossing, side > 0));
+            assertTrue(PortalTeleportMath.eyeReachedExit(exit(), afterCrossing, side > 0));
+        }
+    }
+
+    @Test
     void exitBiasFallsBackToEntrySideForStationaryObjects() {
         final Vector3d biasFront = PortalTeleportMath.exitBias(
                 exit(), new Vector3d(), new Vector3d(0.0, 0.0, -0.2));
         final Vector3d biasBack = PortalTeleportMath.exitBias(
                 exit(), new Vector3d(), new Vector3d(0.0, 0.0, 0.2));
-        assertTrue(biasFront.dot(exit().normal()) > 0.0);
-        assertTrue(biasBack.dot(exit().normal()) < 0.0);
+        assertTrue(biasFront.dot(exit().normal()) < 0.0);
+        assertTrue(biasBack.dot(exit().normal()) > 0.0);
     }
 
     @Test

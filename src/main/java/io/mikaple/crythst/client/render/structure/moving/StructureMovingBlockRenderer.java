@@ -10,6 +10,9 @@ import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.block.MovingBlockRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -43,16 +46,19 @@ public final class StructureMovingBlockRenderer {
     }
 
     private static void collect(LevelRenderContext context) {
-        final Minecraft minecraft = Minecraft.getInstance();
+        final LevelRenderState state = context.levelState();
+        submit(Minecraft.getInstance(), state == null ? null : state.cameraRenderState,
+                context.poseStack(), context.submitNodeCollector());
+    }
+
+    public static void submit(Minecraft minecraft, CameraRenderState cameraState,
+                              PoseStack poseStack, SubmitNodeCollector collector) {
         final ClientLevel level = minecraft.level;
-        if (level == null || context.levelState() == null
-                || context.levelState().cameraRenderState == null
-                || context.levelState().cameraRenderState.pos == null
-                || context.poseStack() == null
-                || context.submitNodeCollector() == null) {
+        if (level == null || cameraState == null || cameraState.pos == null
+                || poseStack == null || collector == null) {
             return;
         }
-        final Vec3 camera = context.levelState().cameraRenderState.pos;
+        final Vec3 camera = cameraState.pos;
         final Vector3d cameraPos = new Vector3d(camera.x, camera.y, camera.z);
         final long now = System.nanoTime();
 
@@ -91,7 +97,6 @@ public final class StructureMovingBlockRenderer {
 
                 final Matrix4f matrix = StructureOutlineTransform.cameraRelativeMatrix(
                         render.pose(), voxelX, voxelY, voxelZ, scale, cameraPos);
-                final PoseStack poseStack = context.poseStack();
                 poseStack.pushPose();
                 try {
                     poseStack.mulPose(matrix);
@@ -106,7 +111,7 @@ public final class StructureMovingBlockRenderer {
                             direction.getStepX() * extended,
                             direction.getStepY() * extended,
                             direction.getStepZ() * extended);
-                    context.submitNodeCollector().submitMovingBlock(poseStack, state, 0);
+                    collector.submitMovingBlock(poseStack, state, 0);
                 } finally {
                     poseStack.popPose();
                 }

@@ -16,12 +16,9 @@ import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Util;
 import org.joml.Matrix4fc;
-import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.EnumMap;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -68,19 +65,18 @@ final class PortalChunkSections implements AutoCloseable {
                                   List<SectionRenderDispatcher.RenderSection> sections,
                                   int atlasWidth, int atlasHeight,
                                   OptionsRenderState options) {
-        final Map<ChunkSectionLayer, List<DrawGroup>> drawGroups = new EnumMap<>(ChunkSectionLayer.class);
+        final Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> drawsPerLayer =
+                new EnumMap<>(ChunkSectionLayer.class);
         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
-            drawGroups.put(layer, new ArrayList<>());
+            drawsPerLayer.put(layer, new ArrayList<>());
         }
         final List<DynamicGpuData.ChunkSectionInfo> sectionInfos = new ArrayList<>();
-        final Map<Integer, DrawGroup> drawGroupCache = new HashMap<>();
         int largestIndexCount = 0;
 
         if (dispatcher != null) {
             dispatcher.lock();
             final long fadeDuration = Util.toMillis(options.chunkSectionFadeInTime);
             final long now = Util.getMillis();
-            Integer lastTransparentGroupHash = null;
             try {
                 for (SectionRenderDispatcher.RenderSection section : sections) {
                     final SectionMesh sectionMesh = section.getSectionMesh();
@@ -102,7 +98,6 @@ final class PortalChunkSections implements AutoCloseable {
                         }
 
                         final GpuBuffer vertexBuffer = slice.vertexBuffer();
-                        int combinedHash = 31 * 173 + vertexBuffer.hashCode();
                         final int firstIndex;
                         final IndexType indexType;
                         final GpuBuffer indexBuffer;
@@ -114,66 +109,27 @@ final class PortalChunkSections implements AutoCloseable {
                         } else {
                             indexBuffer = slice.indexBuffer();
                             indexType = draw.indexType();
-                            combinedHash = 31 * combinedHash + indexBuffer.hashCode();
-                            combinedHash = 31 * combinedHash + indexType.hashCode();
                             firstIndex = (int) (slice.indexBufferOffset() / indexType.bytes);
                         }
                         final int baseVertex = (int) (slice.vertexBufferOffset()
                                 / layer.pipeline(false).getVertexFormatBinding(0).getVertexSize());
 
-                        DrawGroup drawGroup = null;
-                        if (layer.translucent()) {
-                            if (lastTransparentGroupHash != null
-                                    && combinedHash == lastTransparentGroupHash) {
-                                drawGroup = drawGroups.get(layer).getLast();
-                            }
-                            lastTransparentGroupHash = combinedHash;
-                        } else {
-                            drawGroup = drawGroupCache.get(combinedHash);
-                        }
-                        if (drawGroup == null) {
-                            drawGroup = new DrawGroup(vertexBuffer.slice(),
-                                    indexBuffer == null ? null : indexBuffer.slice(),
-                                    indexType, new ArrayList<>());
-                            drawGroupCache.put(combinedHash, drawGroup);
-                            drawGroups.get(layer).add(drawGroup);
-                        }
-                        drawGroup.draws().add(new DynamicGpuData.IndexedDraw(
-                                draw.indexCount(), 1, firstIndex, baseVertex, sectionInfoIndex));
+                        final int uniformIndex = sectionInfoIndex;
+                        drawsPerLayer.get(layer).add(new RenderPass.Draw<>(
+                                0, vertexBuffer, indexBuffer, indexType,
+                                firstIndex, draw.indexCount(), baseVertex,
+                                (sectionUbos, uploader) ->
+                                        uploader.setUniform("ChunkSection", sectionUbos[uniformIndex])));
                     }
                 }
             } finally {
                 dispatcher.unlock();
             }
         }
-
-        final Map<ChunkSectionLayer, List<RenderPass.Draw<GpuBufferSlice[]>>> drawsPerLayer =
-                new EnumMap<>(ChunkSectionLayer.class);
         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
-            final List<RenderPass.Draw<GpuBufferSlice[]>> draws = new ArrayList<>();
-            final List<DrawGroup> groups = new ArrayList<>(drawGroups.get(layer));
             if (layer.translucent()) {
-                Collections.reverse(groups);
+                drawsPerLayer.put(layer, drawsPerLayer.get(layer).reversed());
             }
-            for (DrawGroup group : groups) {
-                final List<DynamicGpuData.IndexedDraw> indexed = new ArrayList<>(group.draws());
-                if (layer.translucent()) {
-                    Collections.reverse(indexed);
-                }
-                for (DynamicGpuData.IndexedDraw draw : indexed) {
-                    draws.add(new RenderPass.Draw<>(
-                            0,
-                            group.vertexBuffer().buffer(),
-                            group.indexBuffer() == null ? null : group.indexBuffer().buffer(),
-                            group.indexType(),
-                            draw.firstIndex(),
-                            draw.indexCount(),
-                            draw.baseVertex(),
-                            (sectionUbos, uploader) ->
-                                    uploader.setUniform("ChunkSection", sectionUbos[draw.baseInstance()])));
-                }
-            }
-            drawsPerLayer.put(layer, draws);
         }
 
         if (largestIndexCount != 0) {
@@ -193,11 +149,5 @@ final class PortalChunkSections implements AutoCloseable {
     public void close() {
         this.chunkSections.close();
         this.terrainTransforms.close();
-    }
-
-    private record DrawGroup(GpuBufferSlice vertexBuffer,
-                             @Nullable GpuBufferSlice indexBuffer,
-                             @Nullable IndexType indexType,
-                             List<DynamicGpuData.IndexedDraw> draws) {
     }
 }

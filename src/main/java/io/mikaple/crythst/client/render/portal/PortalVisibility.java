@@ -1,18 +1,25 @@
 package io.mikaple.crythst.client.render.portal;
 
+import io.mikaple.crythst.integration.fabric.client.PlayerObbDebugRenderer;
 import io.mikaple.crythst.mixin.client.PortalCameraAccessor;
 import io.mikaple.crythst.mixin.client.PortalLevelExtractorAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.debug.DebugScreenEntries;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.culling.Frustum;
+import net.minecraft.client.renderer.debug.EntityHitboxDebugRenderer;
+import net.minecraft.client.renderer.gizmos.DrawableGizmoPrimitives;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
+import net.minecraft.gizmos.Gizmos;
+import net.minecraft.gizmos.SimpleGizmoCollector;
+import net.minecraft.util.Util;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
@@ -28,10 +35,11 @@ import java.util.List;
  */
 final class PortalVisibility {
 
-    record Result(LevelRenderState state, List<SectionRenderDispatcher.RenderSection> sections,
+    record Result(LevelRenderState state, DrawableGizmoPrimitives hitboxes,
+                  List<SectionRenderDispatcher.RenderSection> sections,
                   int sectionCount, String failureReason) {
         static Result failure(String reason) {
-            return new Result(null, List.of(), 0, reason);
+            return new Result(null, null, List.of(), 0, reason);
         }
 
         boolean ready() {
@@ -94,6 +102,7 @@ final class PortalVisibility {
             }
 
             PortalRenderManager.beginDestinationExtraction();
+            final DrawableGizmoPrimitives hitboxes;
             try {
                 // The probe holds the main camera's biome/attribute sample.
                 // Re-sample at the destination so sky colour, fog and cloud
@@ -101,6 +110,7 @@ final class PortalVisibility {
                 camera.attributeProbe().reset();
                 camera.attributeProbe().tick(level, view.position());
                 minecraft.levelExtractor.extract(deltaTracker, camera, partialTick);
+                hitboxes = collectHitboxes(minecraft, view, partialTick);
             } finally {
                 PortalRenderManager.endDestinationExtraction();
             }
@@ -117,7 +127,7 @@ final class PortalVisibility {
             destinationCamera.yRot = view.yaw();
             destinationCamera.isFrustumCaptured = true;
 
-            return new Result(destination,
+            return new Result(destination, hitboxes,
                     List.copyOf(levelRenderer.visibleSections()), sections, null);
         } catch (Throwable error) {
             PortalRenderDiagnostics.failure("Crythst destination extraction failed", error);
@@ -129,10 +139,10 @@ final class PortalVisibility {
             cameraAccess.crythst$setRotation(savedYaw, savedPitch);
             cameraAccess.crythst$setCullFrustum(savedCull);
             cameraAccess.crythst$setCapturedFrustum(savedCaptured);
-            if (level != null) {
-                camera.attributeProbe().reset();
-                camera.attributeProbe().tick(level, savedPos);
-            }
+            camera.attributeProbe().reset();
+            camera.attributeProbe().tick(level, savedPos);
+            levelRenderer.entityRenderDispatcher().prepare(camera, minecraft.crosshairPickEntity);
+            levelRenderer.blockEntityRenderDispatcher().prepare(savedPos);
             levelRenderer.clearVisibleSections();
             levelRenderer.visibleSections().addAll(savedVisible);
             levelRenderer.nearbyVisibleSections().addAll(savedNearby);
@@ -144,5 +154,31 @@ final class PortalVisibility {
                 }
             }
         }
+    }
+
+    private static DrawableGizmoPrimitives collectHitboxes(Minecraft minecraft,
+                                                           PortalViewCamera view, float partialTick) {
+        final var connection = minecraft.getConnection();
+        if (connection == null
+                || !minecraft.debugEntries.isCurrentlyEnabled(DebugScreenEntries.ENTITY_HITBOXES)) {
+            return null;
+        }
+        // Keep only the hitbox renderers in a private collector. Running the
+        // whole debug pass would draw the portal frustum in the main world.
+        final SimpleGizmoCollector collector = new SimpleGizmoCollector();
+        final Vec3 pos = view.position();
+        final var debugValues = connection.createDebugValueAccess();
+        try (var ignored = Gizmos.withCollector(collector)) {
+            new EntityHitboxDebugRenderer(minecraft).emitGizmos(
+                    pos.x, pos.y, pos.z, debugValues, view.frustum(), partialTick);
+            new PlayerObbDebugRenderer().emitGizmos(
+                    pos.x, pos.y, pos.z, debugValues, view.frustum(), partialTick);
+        }
+        final DrawableGizmoPrimitives hitboxes = new DrawableGizmoPrimitives();
+        final long now = Util.getMillis();
+        for (var entry : collector.drainGizmos()) {
+            entry.gizmo().emit(hitboxes, entry.getAlphaMultiplier(now));
+        }
+        return hitboxes;
     }
 }

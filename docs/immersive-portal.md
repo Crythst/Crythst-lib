@@ -121,7 +121,7 @@ framegraph pass 由 `PortalLevelRendererMixin` 注入 `LevelRenderer.addMainPass
   - 使用命令源实体的**眼睛位置** + 视线方向；非实体命令源使用命令位置 +1.62。
   - 平面放在视线前方 **2 格**。
   - 默认尺寸 `2 x 3`，允许范围 `0.5 .. 16`。
-  - 平面法线朝向创建者（视线反方向），因此创建者看到的是正面。
+  - 平面法线沿创建者的视线，定义传送门的正方向。
 - `link`
   - 双向链接；会先解除两端原有的链接，避免悬挂引用。
   - 不同维度也可以链接：实体可以跨维度，物理体 v1 跳过（见限制）。
@@ -144,12 +144,13 @@ framegraph pass 由 `PortalLevelRendererMixin` 注入 `LevelRenderer.addMainPass
 
 传送门定义保存在**主世界**的 `SavedDataStorage` 中，文件通常位于
 `world/data/crythst/portals.dat`。客户端渲染临时附件（snapshot/mask）不会写入存档；加载后由平面数据重新生成。
+旧存档的法线朝向创建者。首次加载时会转换为创建时的视线方向，并保留门的位置、轮廓和链接。
 
 ### 存储格式
 
 ```nbt
 {
-  version: 1,
+  version: 3,
   portals: [
     {
       id: "uuid-string",
@@ -201,13 +202,13 @@ normal = right x up
 ```text
 x = 沿 right      ∈ [-width/2, +width/2]
 y = 沿 up         ∈ [-height/2, +height/2]
-z = 沿 normal     （z > 0 为正面）
+z = 沿 normal     （z > 0 为正方向一侧）
 ```
 
 由创建者视线 `look` 推导：
 
 ```text
-normal = -look
+normal = normalize(look)
 right  = normalize(worldUp x normal)
 up     = normalize(normal x right)
 origin = eye + 2 * look
@@ -233,22 +234,20 @@ origin = eye + 2 * look
 链接旋转 `Q` 满足：
 
 ```text
-Q * nA = -nB
+Q * nA =  nB
 Q * uA =  uB
-Q * rA = -rB
+Q * rA =  rB
 ```
 
 这是一个**纯旋转**（行列式 `+1`），不是镜像。等价地，在入口局部坐标中：
 
 ```text
-exitLocal = (-x, y, -z)
+exitLocal = (x, y, z)
 ```
 
-为什么法线要取反：实体从 `A` 的**正面**进入，应当从 `B` 对应的面出来并远离
-`B` 表面。若使用 `nA -> nB`，玩家会在出口正面继续朝平面里走，立即再次穿越，
-形成循环。`nA -> -nB` 让进入速度 `-nA` 映射为 `+nB`，正确地从出口外面离开。
-同一个刚体变换同时适用于**双向**穿越：正面→背面从出口正面离开；背面→正面从出口
-背面离开；两者速度都指向远离出口平面的方向，因此视角在穿门瞬间保持连续。
+沿入口正方向穿越（局部 `z` 从负到正）会沿出口的正方向离开。反向穿越时，
+同一个变换会让实体沿出口的反方向离开。门内相机也使用这套变换，因此预览和穿越后的
+前向一致。相同朝向创建的两扇门会保留玩家朝向，朝向相差 90° 时玩家也转 90°。
 
 位置与方向变换：
 
@@ -279,14 +278,14 @@ pitch = -asin(dir.y)
 
 ```text
 side = sign(vB · nB)
-如果速度几乎平行于平面：side = -sign(entryLocal.z)
+如果速度几乎平行于平面：side = sign(entryLocal.z)
 如果仍为 0：side = +1
 pExit = pB + side * 0.6 * nB      // 物理体
 ```
 
-玩家不使用这个推出偏移：玩家脚点直接取 `T(eye) - (0, eyeHeight, 0)`，相机在穿门瞬间
-正好位于 `T(eye)`，因此视角连续。非玩家实体使用沿**变换后运动方向**的小偏移（0.05 格，
-正面/背面穿越会自动落在正确的一侧），物理体仍使用 0.6 格。
+玩家的脚点以 `T(eye) - (0, eyeHeight, 0)` 为基准。延迟或斜门让眼睛或身体中心
+落在出口另一侧时，只沿法线补足到本次穿越的一侧。非玩家实体沿变换后的运动方向
+偏移 0.05 格，物理体偏移 0.6 格。
 
 同时每实体/物理体有 **10 tick 冷却**，并保证同一 tick 最多传送一次，避免
 出口平面立即把对象送回入口。

@@ -10,26 +10,10 @@ import org.joml.Vector3dc;
  * The rigid transform that identifies an entry portal plane with an exit
  * portal plane.
  *
- * <h2>Why the normal is flipped</h2>
- *
- * <p>A portal is not a mirror: an object entering one face leaves through the
- * corresponding face of the exit, moving away from the exit surface. The
- * proper rotation maps</p>
- *
- * <pre>
- *     entry.normal -&gt; -exit.normal
- *     entry.up     -&gt;  exit.up
- *     entry.right  -&gt; -exit.right
- * </pre>
- *
- * <p>Equivalently, local coordinates map as {@code (-x, y, -z)}: a 180 degree
- * yaw turn about the up axis, still determinant {@code +1}.</p>
- *
- * <p>The same rigid transform serves both traversal directions and the camera
- * view: a front-to-back crossing exits on the destination front with velocity
- * pointing away from it, and a back-to-front crossing exits on the destination
- * back, also moving away. Using one transform for both directions keeps the
- * view continuous across the crossing instant.</p>
+ * <p>The proper rotation maps entry right, up and positive travel direction
+ * to the corresponding exit axes. Local coordinates are preserved, so a
+ * camera before the entry plane sees the world beyond the exit plane, and
+ * continuing through the entry leaves the exit in the same local direction.</p>
  *
  * <p>The transform is rigid and scale-free ({@code 1:1}); it only maps points,
  * directions and rotations relative to the entry origin.</p>
@@ -47,27 +31,14 @@ public final class PortalTransform {
         this.matrix = new Matrix3d().rotation(rotation);
     }
 
-    /**
-     * The rigid link transform. It is bidirectional: a front-to-back crossing
-     * exits on the destination front, a back-to-front crossing exits on the
-     * destination back, and in both cases the transformed velocity points away
-     * from the destination plane.
-     */
+    /** Maps the entry basis to the exit basis for either direction of travel. */
     public static PortalTransform between(PortalPlane entry, PortalPlane exit) {
         if (entry == null || exit == null) {
             throw new IllegalArgumentException("Both portal planes are required");
         }
         final Matrix3d source = basis(entry);
         final Matrix3d destination = basis(exit);
-        // S = diag(-1, 1, -1): flip local x and z (proper rotation because
-        // det(B_exit) * det(S) * det(B_entry^T) = 1 * 1 * 1).
-        final Matrix3d flip = new Matrix3d(
-                -1.0, 0.0, 0.0,
-                0.0, 1.0, 0.0,
-                0.0, 0.0, -1.0);
-        final Matrix3d rotationMatrix = new Matrix3d(destination)
-                .mul(flip)
-                .mul(source.transpose());
+        final Matrix3d rotationMatrix = destination.mul(source.transpose());
         final Quaterniond q = new Quaterniond().setFromNormalized(rotationMatrix);
         return new PortalTransform(entry, exit, q);
     }

@@ -17,6 +17,7 @@ import org.joml.Vector3dc;
  * same quaternion. This is what keeps a tilted or moving portal continuous.</p>
  */
 public final class PortalTeleportMath {
+    private static final double PLAYER_EXIT_CLEARANCE = 1.0e-3;
     private PortalTeleportMath() {
     }
 
@@ -62,17 +63,44 @@ public final class PortalTeleportMath {
         return transform.transformPoint(eye).sub(0.0, eyeHeight, 0.0);
     }
 
+    /** Keeps the eye and crossing sample on the exit side selected by the sweep. */
+    public static Vector3d playerFeetAfterCrossing(PortalTransform transform, Vector3dc eye,
+                                                   double eyeHeight, double centreHeight,
+                                                   boolean alongPositiveDirection) {
+        final Vector3d transformedEye = transform.transformPoint(eye);
+        final Vector3d feet = new Vector3d(transformedEye).sub(0.0, eyeHeight, 0.0);
+        final Vector3d exitNormal = transform.exit().normal().mul(alongPositiveDirection ? 1.0 : -1.0);
+        final double eyeDistance = transformedEye.sub(transform.exit().origin()).dot(exitNormal);
+        final double centreDistance = eyeDistance + (centreHeight - eyeHeight) * exitNormal.y;
+        final double clearance = PLAYER_EXIT_CLEARANCE - Math.min(eyeDistance, centreDistance);
+        return feet.fma(Math.max(0.0, clearance), exitNormal);
+    }
+
+    /** Applies the same exit placement and rotation to the start of the tick. */
+    public static Vector3d previousFeetAfterCrossing(PortalTransform transform,
+                                                     Vector3dc exitFeet,
+                                                     Vector3dc entryTickDisplacement) {
+        return new Vector3d(exitFeet).sub(transform.transformDirection(entryTickDisplacement));
+    }
+
+    /** Whether the interpolated exit-space eye has reached the crossed side. */
+    public static boolean eyeReachedExit(PortalPlane exit, Vector3dc eye,
+                                         boolean alongPositiveDirection) {
+        final double distance = exit.signedDistance(eye);
+        return alongPositiveDirection ? distance >= 0.0 : distance <= 0.0;
+    }
+
     /**
      * Unit exit-side bias for non-player entities. The bias follows the
      * transformed velocity; if the object is almost stationary it falls back to
-     * the side of the entry plane it came from.
+     * the side of the entry plane it reached.
      */
     public static Vector3d exitBias(PortalPlane destination, Vector3dc transformedVelocity,
                                     Vector3dc entryLocal) {
         final Vector3d normal = destination.normal();
         double side = Math.signum(transformedVelocity.dot(normal));
         if (side == 0.0) {
-            side = -Math.signum(entryLocal.z());
+            side = Math.signum(entryLocal.z());
         }
         if (side == 0.0) {
             side = 1.0;

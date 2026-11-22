@@ -8,16 +8,13 @@ import org.jspecify.annotations.Nullable;
  * Sampled plane-crossing test used by traversal and the client transition.
  *
  * <p>Traversal is bidirectional. Both directions use the same rigid
- * {@link PortalTransform}: a front-to-back crossing exits on the destination
- * front, a back-to-front crossing exits on the destination back, and the
- * transformed velocity points away from the plane in both cases. The rectangle
- * check is shared by both directions.</p>
+ * {@link PortalTransform}, preserving the direction of travel and the sign
+ * of the post-crossing position in portal-local coordinates.</p>
  *
  * <p>The test is a segment/plane intersection between the previous and current
  * sample points, followed by a rectangle check at the intersection. It does not
  * use a thick slab, so a slow-moving player can physically walk into the portal
- * and only traverses when the sampled point (the eye for players) actually
- * passes the plane.</p>
+ * and only traverses when the sampled point actually passes the plane.</p>
  *
  * <p>Pure JOML so it can be unit tested without bootstrapping Minecraft.</p>
  */
@@ -27,11 +24,14 @@ public final class PortalCrossing {
 
     /**
      * One segment/plane crossing. {@code inside} tells whether the intersection
-     * lies inside the portal rectangle; {@code frontToBack} selects the
-     * traversal transform.
+     * lies inside the portal rectangle. {@code frontToBack} is the legacy
+     * name for travel from the positive to the negative side.
      */
     public record Crossing(double before, double after, Vector3d point,
                            boolean inside, boolean frontToBack) {
+        public boolean alongPositiveDirection() {
+            return after > before;
+        }
     }
 
     /**

@@ -18,13 +18,9 @@ import org.joml.Vector3dc;
  *     <li>{@code z} runs along {@link #normal()}.</li>
  * </ul>
  *
- * <p>For a portal created by a player, {@code normal} points <em>towards</em>
- * the creator (it is the opposite of the look direction), so the visible front
- * face is the {@code +normal} side. The rectangle is centred on
- * {@link #origin()}.</p>
- *
- * <p>This class is intentionally free of Minecraft types so both the server
- * model and the client renderer can share it.</p>
+ * <p>For a portal created by a player, the normal follows their look
+ * direction and defines positive travel through the plane. The rectangle is
+ * centred on {@link #origin()}.</p>
  */
 public final class PortalPlane {
     /** Maximum angle tolerance for a usable derived basis. */
@@ -81,10 +77,9 @@ public final class PortalPlane {
     /**
      * Derives a portal plane from a creator's eye position and look direction.
      *
-     * <p>The plane is placed {@code distance} blocks along the look direction
-     * and faces back towards the creator. If the look direction is (nearly)
-     * vertical, a stable fallback up axis is chosen so the basis stays
-     * well-defined.</p>
+     * <p>The plane is placed {@code distance} blocks ahead, with its positive
+     * direction along the look vector. Near vertical, a fallback up axis
+     * keeps the basis well-defined.</p>
      */
     public static PortalPlane fromLook(Vector3dc eye, Vector3dc look,
                                        double distance, double width, double height) {
@@ -95,20 +90,16 @@ public final class PortalPlane {
             forward.normalize();
         }
 
-        // The visible face points back at the creator.
-        final Vector3d n = new Vector3d(forward).negate();
-
         final Vector3d referenceUp = new Vector3d(0.0, 1.0, 0.0);
-        if (Math.abs(n.dot(referenceUp)) > 0.999) {
+        if (Math.abs(forward.dot(referenceUp)) > 0.999) {
             referenceUp.set(0.0, 0.0, 1.0);
         }
 
         // right = up x normal, up = normal x right, so normal = right x up.
-        final Vector3d r = new Vector3d(referenceUp).cross(n).normalize();
-        final Vector3d u = new Vector3d(n).cross(r).normalize();
+        final Vector3d r = new Vector3d(referenceUp).cross(forward).normalize();
 
         final Vector3d centre = new Vector3d(eye).fma(distance, forward);
-        return new PortalPlane(centre, n, r, width, height);
+        return new PortalPlane(centre, forward, r, width, height);
     }
 
     public Vector3d origin() {

@@ -28,6 +28,14 @@ class PortalRecursionTest {
     }
 
     @Test
+    void exitSurfaceCannotRenderTheReverseLinkInsideItsOwnOpening() {
+        final UUID unrelatedPortal = UUID.randomUUID();
+        assertEquals(0, PortalRecursion.nextLayer(1, 2, B, Set.of(A), B));
+        assertEquals(0, PortalRecursion.nextLayer(1, 2, A, Set.of(B), A));
+        assertEquals(2, PortalRecursion.nextLayer(1, 2, unrelatedPortal, Set.of(A), B));
+    }
+
+    @Test
     void invalidLayersAreRejected() {
         assertEquals(0, PortalRecursion.nextLayer(0, 2, B, Set.of()));
         assertEquals(0, PortalRecursion.nextLayer(1, 0, B, Set.of()));
