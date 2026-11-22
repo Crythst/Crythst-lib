@@ -150,8 +150,7 @@ path, and the changed block state is mirrored for the structure renderer.
 
 `StructureOperationRedirector` lets the server run vanilla block break/use/
 placement semantics against the auxiliary void level instead of reimplementing
-them. It is deliberately not wired into the owned placement/right-click files;
-the existing custom interaction path remains the default.
+them. It is the primary path and is enabled by default.
 
 Feature flag:
 
@@ -161,13 +160,14 @@ Feature flag:
 }
 ```
 
-`CrythstConfig#useVoidLevelOperations` defaults to `false`. When enabled:
+`CrythstConfig#useVoidLevelOperations` defaults to `true`. When enabled:
 
 | Entry point | Vanilla path |
 | --- | --- |
-| `useOn(player, hit, hand)` | `ServerPlayerGameMode.useItemOn(player, voidLevel, stack, hand, auxiliaryHit)` — menus, `BlockState.useItemOn`, `useWithoutItem`, `ItemStack.useOn` |
+| `useOn(player, hit, hand)` | `ServerPlayerGameMode.useItemOn(player, voidLevel, stack, hand, auxiliaryHit)` — menus, `BlockState.useItemOn`, `useWithoutItem`, `ItemStack.useOn`, `BlockItem`/`BlockPlaceContext` placement |
 | `useWithoutItem(player, hit)` | `BlockState.useWithoutItem(voidLevel, player, auxiliaryHit)` |
-| `breakBlock(player, hit)` | `ServerPlayerGameMode.destroyBlock(auxiliaryPos)` with the game mode temporarily pointed at the void level, then restored |
+| `breakBlock(player, hit)` | `ServerPlayerGameMode.destroyBlock(auxiliaryPos)` with the real game mode temporarily pointed at the void level, then restored |
+| `breakMapped(player, mapped)` | Same `destroyBlock`, using a mining session's already-validated mapping |
 
 The redirector calls `LevelPhysics#flushAuxiliaryBlockStates()` and
 `projectAuxiliaryEntities()` afterwards. That mirrors block/BE changes, rebuilds
@@ -175,22 +175,43 @@ the collider/render snapshots and projects drops, XP orbs, TNT and other
 spawned entities back to the host world. Sounds/particles from the operation
 were already projected by `AuxiliaryServerLevel`.
 
-Integration points (owned by the interaction agent):
+### Long-press mining state machine
 
-1. Server right-click: after the authoritative structure raycast and normal
-   reach/occlusion checks, call
-   `StructureOperationRedirector.useOn(player, hit, hand)`. If the status is
-   `HANDLED`, consume the interaction; `NOT_HANDLED`/`DISABLED` fall through to
-   the existing custom path.
-2. Mining/break: after the existing authoritative break validation, call
-   `StructureOperationRedirector.breakBlock(player, hit)`. If `HANDLED`, skip
-   the custom volume-edit path; the redirector has already removed the block,
-   mirrored it, refreshed/split the body and projected drops.
-3. `OUT_OF_BOUNDS` means a block item would place outside the copied volume.
-   Fall back to the custom placement path, which can expand the volume.
+`StructureMiningSessions` owns one session per player:
+
+1. Client sends `START_MINE`. Server re-raycasts, checks reach/occlusion and
+   maps the hit to the auxiliary block. Creative calls vanilla `destroyBlock`
+   immediately and never enters a session.
+2. Survival creates a dedicated `ServerPlayerGameMode` pointed at the void
+   level and calls vanilla `handleBlockBreakAction(START_DESTROY_BLOCK)`.
+3. Each server tick the dedicated game mode advances vanilla progress
+   (`BlockState#getDestroyProgress`, tool/enchantment/effect rules) and sends
+   crack/level feedback. Client `TICK_MINE` packets are heartbeats only; they
+   do not carry a progress value. Missing heartbeats for four ticks abort.
+4. At server-side `1.0` the session calls vanilla
+   `handleBlockBreakAction(STOP_DESTROY_BLOCK)`, so `destroyBlock` supplies
+   drops, XP, statistics and game-master/tool rules. If the progress formulas
+   differ by one tick, the redirector's `destroyBlock` completes the same
+   target (still exactly once per tick).
+5. `STOP_MINE`, target/tool changes, leaving reach, a closer real block, a mode
+   change or an auxiliary chunk unload remove the session. The local client
+   crack overlay is visual only.
+
+### Fallback policy
+
+`StructureOperationRedirector.shouldFallback(status)` is the routing rule:
+
+- `DISABLED` and `NOT_HANDLED` (for example an unloaded auxiliary chunk)
+  use the legacy custom break/use/edit path.
+- `OUT_OF_BOUNDS` block placement uses the legacy expanding placement path.
+- `HANDLED` and `FAILED` consume the click and never run the custom path, so an
+  edit cannot double-apply.
 
 The world raycast remains the authority boundary; client coordinates are never
-trusted by the redirector.
+trusted by the redirector. The custom `breakBlock`/`placeBlock`/`interactBlock`
+implementations remain available only for these fallbacks, entity-item
+placement (spawn eggs and item frames need surface positioning) and
+`/crythstinteraction` diagnostics.
 
 ## Block drops and tool rules
 
@@ -227,3 +248,9 @@ loot for blocks that vanilla would move or destroy without drops.
 - Neighbour updates beyond the per-tick budget are dropped. This prevents a
   redstone loop from stalling the server, at the cost of incomplete logic in
   pathological structures.
+
+## Implemented tick-path details
+
+See [void-level-ticking.md](void-level-ticking.md) for the concrete root causes
+fixed for copied non-solid logic blocks, chunk promotion/tick-container
+registration, entity ejection and attached decorations/seats.

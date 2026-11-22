@@ -78,6 +78,26 @@ class VoidWorldLogicTest {
     }
 
     @Test
+    void copyStateKeepsNonSolidLogicBlocksAndUsesStoneOnlyForSolidFallback() {
+        final BlockState air = Blocks.AIR.defaultBlockState();
+        final BlockState wire = Blocks.REDSTONE_WIRE.defaultBlockState();
+        final BlockState water = Blocks.WATER.defaultBlockState();
+        final BlockState torch = Blocks.REDSTONE_TORCH.defaultBlockState();
+
+        assertEquals(wire, EmptyPhysicsLevel.copyState(wire, false),
+                "redstone wire has no collision shape but must be copied");
+        assertEquals(water, EmptyPhysicsLevel.copyState(water, false),
+                "fluids have no solid cell but must be copied");
+        assertEquals(torch, EmptyPhysicsLevel.copyState(torch, false),
+                "torches have no collision shape but must be copied");
+        assertEquals(Blocks.STONE.defaultBlockState(),
+                EmptyPhysicsLevel.copyState(null, true),
+                "a solid cell without state falls back to stone");
+        assertNull(EmptyPhysicsLevel.copyState(air, false),
+                "empty non-solid cells are skipped");
+    }
+
+    @Test
     void shouldMirrorStateDistinguishesAirSolidAndPropertyChanges() {
         final BlockState air = Blocks.AIR.defaultBlockState();
         final BlockState stone = Blocks.STONE.defaultBlockState();

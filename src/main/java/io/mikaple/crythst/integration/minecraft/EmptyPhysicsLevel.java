@@ -2,11 +2,13 @@ package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.api.block.BlockEntityStructureActor;
+import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
 import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.mixin.MinecraftServerAccessor;
+import io.mikaple.crythst.mixin.ServerLevelEntityManagerAccessor;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
@@ -305,6 +307,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private final AuxiliaryServerLevel level;
     private final ServerLevel hostLevel;
     private final Map<Long, Integer> activeChunks = new HashMap<>();
+    /** Chunks whose vanilla tick containers have been registered. */
+    private final Set<Long> initializedChunks = new HashSet<>();
     private final Map<Long, Region> regions = new HashMap<>();
     /** Positions whose auxiliary block state changed since the last flush. */
     private final Set<Long> changedBlocks = new HashSet<>();
@@ -324,10 +328,26 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private long totalSkippedBlocks;
     private long totalNeighborUpdates;
     private long totalDroppedWork;
+    private long totalEjectedEntities;
+    private long totalAdoptedAttachedEntities;
+    private long totalEjectionFailures;
     private long suppressedFailureLogs;
     private long lastFailureLogTick = Long.MIN_VALUE;
+    private String lastFailureDescription = "";
     private int nextRegionX;
     private boolean closed;
+    private @Nullable StructureAttachedEntities attachedEntities;
+    private @Nullable EntityProjector entityProjector;
+
+    /**
+     * Projects one entity out of the auxiliary level. Implemented by
+     * {@code LevelPhysics}; kept as a callback so the void level does not own
+     * the host-world projection policy.
+     */
+    @FunctionalInterface
+    public interface EntityProjector {
+        StructureEntityProjection.Result project(RegionView region, Entity entity);
+    }
 
     private EmptyPhysicsLevel(AuxiliaryServerLevel level, ServerLevel hostLevel) {
         this.level = level;
@@ -415,11 +435,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 }
                 for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
                     for (int x = bounds.minX(); x < bounds.maxX(); x++) {
-                        if (!volume.isSolid(x, y, z)) {
-                            continue;
-                        }
-                        final BlockState state = blockState(structure, volume, x, y, z);
-                        if (state.isAir()) {
+                        // A stateful volume can leave non-solid logic blocks
+                        // (redstone wire, torches, water) in the side table.
+                        // Only fall back to stone for a solid volume cell that
+                        // carries no state at all.
+                        final BlockState state = copyState(
+                                blockStateOrNull(structure, volume, x, y, z),
+                                volume.isSolid(x, y, z));
+                        if (state == null) {
                             continue;
                         }
                         final BlockPos pos = new BlockPos(
@@ -427,11 +450,13 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                 worldY,
                                 baseZ + (z - bounds.minZ()));
                         ensureChunk(pos);
-                        // Flag 2 skips neighbour updates: the copied region is
-                        // an isolated snapshot, not a live world edit.
+                        // Copy states first with no neighbour updates. The
+                        // region is not complete yet, so a live update could
+                        // break unsupported blocks before their support exists.
                         if (!level.setBlock(pos, state, 2)) {
                             continue;
                         }
+                        region.copiedPositions.add(pos.asLong());
                         if (state.hasBlockEntity()) {
                             region.blockEntityPositions.add(pos.asLong());
                         }
@@ -446,20 +471,206 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         } finally {
             endSuppressChanges();
         }
+
+        // Now that every neighbour exists, wake the snapshot exactly like a
+        // live loaded chunk: onPlace schedules repeaters/torches/fluids,
+        // neighbour updates seed redstone and shape updates, and fluid ticks
+        // make copied water/lava actually flow.
+        wakeCopiedRegion(region);
+        activateActiveChunks();
     }
 
-    private BlockState blockState(PhysicsStructure structure, VoxelVolume volume, int x, int y, int z) {
+    /**
+     * Pure copy-selection rule: keep every explicit non-air state (including
+     * non-colliding redstone/fluid blocks), falling back to stone only for a
+     * solid cell without state information.
+     *
+     * @return the state to copy, or {@code null} for an empty non-solid cell
+     */
+    public static @Nullable BlockState copyState(@Nullable BlockState state, boolean solid) {
+        if (state != null && !state.isAir()) {
+            return state;
+        }
+        return solid ? Blocks.STONE.defaultBlockState() : null;
+    }
+
+    private @Nullable BlockState blockStateOrNull(PhysicsStructure structure, VoxelVolume volume,
+                                                  int x, int y, int z) {
         if (volume instanceof StatefulVoxelVolume stateful) {
             final BlockState state = stateful.blockState(x, y, z);
-            if (state != null) {
+            if (state != null && !state.isAir()) {
                 return state;
             }
         }
         if (volume instanceof BlockVoxelVolume blockVolume) {
-            return blockVolume.blockState(x, y, z);
+            final BlockState state = blockVolume.blockState(x, y, z);
+            if (state != null && !state.isAir()) {
+                return state;
+            }
         }
         final BlockState sideTable = StructureBlockStates.get(structure, x, y, z);
-        return sideTable == null ? Blocks.STONE.defaultBlockState() : sideTable;
+        return sideTable == null || sideTable.isAir() ? null : sideTable;
+    }
+
+    private void wakeCopiedRegion(Region region) {
+        final BlockState air = Blocks.AIR.defaultBlockState();
+        for (long packed : region.copiedPositions) {
+            final BlockPos pos = BlockPos.of(packed);
+            final BlockState state = level.getBlockState(pos);
+            if (state.isAir()) {
+                continue;
+            }
+            try {
+                state.onPlace(level, pos, air, false);
+                level.updateNeighborsAt(pos, state.getBlock());
+                final FluidState fluid = state.getFluidState();
+                if (!fluid.isEmpty()) {
+                    level.scheduleTick(pos, fluid.getType(),
+                            Math.max(1, fluid.getType().getTickDelay(level)));
+                }
+            } catch (Throwable t) {
+                reportTickFailure("initialize copied block " + pos.toShortString(), t);
+            }
+        }
+    }
+
+    /**
+     * Installs the host-side attachment registry used for decorations/seats.
+     * May be {@code null} in pure unit tests, in which case attached entities
+     * are ejected with the ordinary projection path.
+     */
+    public void setAttachedEntities(@Nullable StructureAttachedEntities attachedEntities) {
+        this.attachedEntities = attachedEntities;
+    }
+
+    public void setEntityProjector(@Nullable EntityProjector entityProjector) {
+        this.entityProjector = entityProjector;
+    }
+
+    private void activateActiveChunks() {
+        if (activeChunks.isEmpty()) {
+            return;
+        }
+        // Let the vanilla distance manager promote our simulation tickets to
+        // BLOCK_TICKING and complete the chunk futures. We deliberately pass
+        // tickChunks=false: our own phases below run block/fluid/BE logic, while
+        // spawning, entity tracking and chunk unload stay out of this level.
+        try {
+            level.getChunkSource().tick(() -> true, false);
+        } catch (Throwable t) {
+            reportTickFailure("chunk lifecycle", t);
+        }
+        for (long chunkKey : List.copyOf(activeChunks.keySet())) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null) {
+                continue;
+            }
+            if (initializedChunks.add(chunkKey)) {
+                try {
+                    chunk.unpackTicks(level.getGameTime());
+                    chunk.registerTickContainerInLevel(level);
+                } catch (Throwable t) {
+                    reportTickFailure("register chunk ticks " + chunk.getPos(), t);
+                }
+            }
+            final FullChunkStatus status = chunk.getFullStatus();
+            if (status == null || !status.isOrAfter(FullChunkStatus.BLOCK_TICKING)) {
+                try {
+                    // The chunk is explicitly ticketed at BLOCK_TICKING level.
+                    // Set the cached status immediately so block entities added
+                    // after the copy register their tickers without waiting a
+                    // frame for the promotion future.
+                    chunk.setFullStatus(() -> FullChunkStatus.BLOCK_TICKING);
+                } catch (Throwable t) {
+                    reportTickFailure("set chunk status " + chunk.getPos(), t);
+                }
+            }
+            primeEntitySection(chunk);
+            try {
+                // Idempotent: registers tickers for any block entity that was
+                // copied before the entity section finished loading.
+                chunk.registerAllBlockEntitiesAfterLevelLoad();
+            } catch (Throwable t) {
+                reportTickFailure("register block entities " + chunk.getPos(), t);
+            }
+        }
+    }
+
+    /**
+     * Marks the active chunk's entity section as block-ticking and drains
+     * pending entity loads. This does not tick entities or AI; it only lets
+     * {@code LevelChunk.isTicking} return true so vanilla block-entity tickers
+     * can be registered by {@link LevelChunk#registerAllBlockEntitiesAfterLevelLoad()}.
+     */
+    private void primeEntitySection(LevelChunk chunk) {
+        try {
+            final var entityManager =
+                    ((ServerLevelEntityManagerAccessor) (ServerLevel) level)
+                            .crythst$entityManager();
+            entityManager.updateChunkStatus(chunk.getPos(), FullChunkStatus.BLOCK_TICKING);
+            entityManager.processPendingLoads();
+        } catch (Throwable t) {
+            reportTickFailure("prime entity section " + chunk.getPos(), t);
+        }
+    }
+
+    /**
+     * Ejects every non-player entity from active regions. Decorative/seat
+     * entities are adopted by {@link StructureAttachedEntities}; all other
+     * entities use the host projection callback. Called both before block logic
+     * and after block-entity work so an entity never participates in void AI or
+     * stays in the void for more than one phase.
+     */
+    private void ejectEntities() {
+        if (regions.isEmpty()) {
+            return;
+        }
+        final List<RegionEntity> entities = new ArrayList<>();
+        collectRegionEntities((region, entity) -> entities.add(new RegionEntity(region, entity)));
+        for (RegionEntity entry : entities) {
+            final Entity entity = entry.entity;
+            if (entity == null || entity.isRemoved() || entity instanceof Player) {
+                continue;
+            }
+            final Region region = regionById(entry.region.structureId());
+            if (region == null || region.structure == null || region.structure.closed()) {
+                continue;
+            }
+            if (attachedEntities != null
+                    && attachedEntities.shouldAttachOnEjection(entity)) {
+                if (attachedEntities.adoptVoidEntity(region.structure, entry.region, entity)) {
+                    totalAdoptedAttachedEntities++;
+                } else {
+                    totalEjectionFailures++;
+                }
+                continue;
+            }
+            if (entityProjector == null) {
+                totalEjectionFailures++;
+                continue;
+            }
+            final StructureEntityProjection.Result result =
+                    entityProjector.project(entry.region, entity);
+            if (result == StructureEntityProjection.Result.PROJECTED
+                    || result == StructureEntityProjection.Result.DUPLICATE) {
+                totalEjectedEntities++;
+            } else if (result == StructureEntityProjection.Result.FAILED) {
+                totalEjectionFailures++;
+            }
+        }
+    }
+
+    private record RegionEntity(RegionView region, Entity entity) {
+    }
+
+    private @Nullable Region regionById(long structureId) {
+        for (Region region : regions.values()) {
+            if (region.structureId == structureId) {
+                return region;
+            }
+        }
+        return null;
     }
 
     /**
@@ -1017,11 +1228,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      * Runs the vanilla block-logic phases that matter for a structure copy,
      * without running a full {@link ServerLevel#tick}.
      *
-     * <p>Phases, in vanilla order: scheduled block ticks, scheduled fluid
-     * ticks, random block/fluid ticks, queued block events, block entities.
-     * Weather, world border, natural spawning, raids, entity AI and chunk
-     * source/loading work are intentionally not run. Only active structure
-     * chunks are read; no chunk is loaded just because the void level exists.</p>
+     * <p>The auxiliary level is a complete <em>block-world</em> level: active
+     * chunks are promoted to block ticking and their tick containers/block
+     * entities registered. Phases, in vanilla order: entity ejection, scheduled
+     * block ticks, scheduled fluid ticks, random block/fluid ticks, queued
+     * block events, block entities, then a second entity ejection. Global
+     * weather, world-time/clock, world border, natural spawning, raids and
+     * entity AI are intentionally not run; entities are ejected before any
+     * entity logic could execute.</p>
      *
      * @param randomTickSpeed random block/fluid ticks per section
      * @return structures whose volume changed and must be reindexed
@@ -1041,6 +1255,10 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         ticking = true;
         neighborBudget = MAX_NEIGHBOR_UPDATES_PER_TICK;
         try {
+            activateActiveChunks();
+            // Eject before any block/entity work so no entity AI, movement or
+            // pathfinding runs in the void copy.
+            ejectEntities();
             runScheduledBlockTicks();
             runScheduledFluidTicks();
             if (!activeChunks.isEmpty()) {
@@ -1049,6 +1267,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             drainBlockEvents();
             if (!activeChunks.isEmpty()) {
                 level.tickBlockEntities();
+                // Dispensers/droppers/block events can spawn entities. Flush
+                // them before any later phase could tick them.
+                ejectEntities();
+            }
+            if (attachedEntities != null) {
+                attachedEntities.tick();
             }
             mirrorBlockEntities();
         } finally {
@@ -1222,12 +1446,65 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         return totalDroppedWork;
     }
 
+    public long totalEjectedEntities() {
+        return totalEjectedEntities;
+    }
+
+    public long totalAdoptedAttachedEntities() {
+        return totalAdoptedAttachedEntities;
+    }
+
+    public long totalEjectionFailures() {
+        return totalEjectionFailures;
+    }
+
+    /** Pending scheduled block ticks across all registered chunk containers. */
+    public int pendingBlockTicks() {
+        return level.getBlockTicks().count();
+    }
+
+    /** Pending scheduled fluid ticks across all registered chunk containers. */
+    public int pendingFluidTicks() {
+        return level.getFluidTicks().count();
+    }
+
+    public @Nullable StructureAttachedEntities attachedEntities() {
+        return attachedEntities;
+    }
+
+    /**
+     * Cumulative void-level diagnostics, safe for commands and logs.
+     */
+    public String status() {
+        return "levelCreated=true"
+                + " regions=" + regionCount()
+                + " activeChunks=" + activeChunkCount()
+                + " scheduledBlockTicks=" + totalBlockTicks
+                + " scheduledFluidTicks=" + totalFluidTicks
+                + " pendingBlockTicks=" + pendingBlockTicks()
+                + " pendingFluidTicks=" + pendingFluidTicks()
+                + " randomTicks=" + totalRandomTicks
+                + " blockEvents=" + totalBlockEvents
+                + " neighbors=" + totalNeighborUpdates
+                + " mirroredBlocks=" + totalMirroredBlocks
+                + " skippedBlocks=" + totalSkippedBlocks
+                + " droppedWork=" + totalDroppedWork
+                + " entitiesEjected=" + totalEjectedEntities
+                + " attachedAdopted=" + totalAdoptedAttachedEntities
+                + " ejectionFailures=" + totalEjectionFailures
+                + " lastFailure=" + (lastFailureDescription.isEmpty()
+                        ? "none" : lastFailureDescription);
+    }
+
     /**
      * Rate-limited failure log for tick phases. The first failure is logged
      * immediately, then at most once every 200 ticks with a suppressed count.
      */
     public void reportTickFailure(String phase, Throwable failure) {
         final long now = level.getGameTime();
+        lastFailureDescription = phase + ": " + (failure == null
+                ? "unknown" : failure.getClass().getSimpleName()
+                        + (failure.getMessage() == null ? "" : " " + failure.getMessage()));
         if (lastFailureLogTick == Long.MIN_VALUE
                 || now - lastFailureLogTick >= 200L) {
             Crythst.LOGGER.warn("Auxiliary void-level {} failed for {} "
@@ -1313,6 +1590,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         } finally {
             regions.clear();
             activeChunks.clear();
+            initializedChunks.clear();
         }
         // Keep nextRegionX monotonic: if clearing a region failed, a new
         // structure must not be placed on top of its leftover blocks.
@@ -1333,10 +1611,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             final Integer count = activeChunks.get(chunkKey);
             if (count == null || count <= 1) {
                 activeChunks.remove(chunkKey);
+                initializedChunks.remove(chunkKey);
                 try {
                     removeBlockTickingTicket(chunkKey);
                 } catch (Throwable t) {
-                    Crythst.LOGGER.debug("Could not remove void-level simulation ticket", t);
+                    Crythst.LOGGER.debug("Could not remove void-level chunk tickets", t);
                 }
             } else {
                 activeChunks.put(chunkKey, count - 1);
@@ -1382,15 +1661,21 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     }
 
     private void addBlockTickingTicket(long chunkKey) {
+        final ChunkPos pos = new ChunkPos(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+        // PLAYER_SIMULATION updates DistanceManager's simulation tracker, which
+        // is what LevelTicks/ServerLevel#shouldTickBlocksAt consult. It does not
+        // load the chunk by itself, so add a loading ticket at the same level
+        // to promote the holder to FullChunkStatus.BLOCK_TICKING.
         level.getChunkSource().addTicket(
-                new Ticket(TicketType.PLAYER_SIMULATION, BLOCK_TICKING_LEVEL),
-                new ChunkPos(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey)));
+                new Ticket(TicketType.PLAYER_SIMULATION, BLOCK_TICKING_LEVEL), pos);
+        level.getChunkSource().addTicket(
+                new Ticket(TicketType.PLAYER_LOADING, BLOCK_TICKING_LEVEL), pos);
     }
 
     private void removeBlockTickingTicket(long chunkKey) {
-        level.getChunkSource().removeTicketWithRadius(
-                TicketType.PLAYER_SIMULATION,
-                new ChunkPos(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey)), 1);
+        final ChunkPos pos = new ChunkPos(ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+        level.getChunkSource().removeTicketWithRadius(TicketType.PLAYER_SIMULATION, pos, 0);
+        level.getChunkSource().removeTicketWithRadius(TicketType.PLAYER_LOADING, pos, 0);
     }
 
     @Override
@@ -1620,6 +1905,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         private final int volumeMinY;
         private final int volumeMinZ;
         private final Set<Long> chunks = new HashSet<>();
+        /** Absolute positions that received a non-air copied state. */
+        private final Set<Long> copiedPositions = new HashSet<>();
         /**
          * Absolute positions whose copied block state declares a block entity.
          * Recording them during the copy avoids probing every voxel later.

@@ -107,8 +107,8 @@ public final class SavedStructureVolume implements StatefulVoxelVolume {
         final boolean[] solid = new boolean[cells];
         final double[] mass = new double[cells];
         final PhysicsMaterial[] materials = new PhysicsMaterial[cells];
-        final BlockState[] states = volume instanceof BlockVoxelVolume || structure != null
-                ? new BlockState[cells] : null;
+        final BlockState[] states = volume instanceof StatefulVoxelVolume
+                || structure != null ? new BlockState[cells] : null;
 
         double fallbackMass = DEFAULT_MASS;
         PhysicsMaterial fallbackMaterial = PhysicsMaterial.DEFAULT;
@@ -119,21 +119,9 @@ public final class SavedStructureVolume implements StatefulVoxelVolume {
             for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
                 for (int x = bounds.minX(); x < bounds.maxX(); x++) {
                     final int index = index(bounds, x, y, z);
-                    if (!volume.isSolid(x, y, z)) {
-                        materials[index] = PhysicsMaterial.DEFAULT;
-                        continue;
-                    }
-                    solid[index] = true;
-                    final double cellMass = volume.blockMass(x, y, z);
-                    mass[index] = cellMass > 0.0 ? cellMass : DEFAULT_MASS;
-                    final PhysicsMaterial material = volume.blockMaterial(x, y, z);
-                    materials[index] = material == null ? PhysicsMaterial.DEFAULT : material;
-                    if (firstSolid) {
-                        fallbackMass = mass[index];
-                        fallbackMaterial = materials[index];
-                        firstSolid = false;
-                    }
-
+                    // Capture states for non-solid cells too. Redstone wire,
+                    // torches, buttons, fluids and other logic blocks have no
+                    // collision shape but must survive persistence.
                     if (states != null) {
                         BlockState state = null;
                         if (volume instanceof BlockVoxelVolume blockVolume) {
@@ -147,6 +135,20 @@ public final class SavedStructureVolume implements StatefulVoxelVolume {
                             states[index] = state;
                             anyState = true;
                         }
+                    }
+                    if (!volume.isSolid(x, y, z)) {
+                        materials[index] = PhysicsMaterial.DEFAULT;
+                        continue;
+                    }
+                    solid[index] = true;
+                    final double cellMass = volume.blockMass(x, y, z);
+                    mass[index] = cellMass > 0.0 ? cellMass : DEFAULT_MASS;
+                    final PhysicsMaterial material = volume.blockMaterial(x, y, z);
+                    materials[index] = material == null ? PhysicsMaterial.DEFAULT : material;
+                    if (firstSolid) {
+                        fallbackMass = mass[index];
+                        fallbackMaterial = materials[index];
+                        firstSolid = false;
                     }
                 }
             }
@@ -185,19 +187,20 @@ public final class SavedStructureVolume implements StatefulVoxelVolume {
 
     /**
      * Block state for a voxel, or {@code null} outside the bounds.
-     * Non-solid cells report air; solid cells without an explicit state report
-     * stone.
+     * Explicit states are returned for solid and non-solid cells alike; a
+     * non-solid cell without an explicit state reports air, and a solid cell
+     * without one reports stone.
      */
     public BlockState blockState(int x, int y, int z) {
         if (!bounds.contains(x, y, z)) {
             return null;
         }
         final int index = index(bounds, x, y, z);
-        if (!solid[index]) {
-            return Blocks.AIR.defaultBlockState();
-        }
         if (states != null && states[index] != null) {
             return states[index];
+        }
+        if (!solid[index]) {
+            return Blocks.AIR.defaultBlockState();
         }
         return Blocks.STONE.defaultBlockState();
     }

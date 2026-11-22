@@ -45,6 +45,7 @@ public final class CrythstCommand {
                 .requires(Commands.hasPermission(Commands.LEVEL_GAMEMASTERS))
                 .then(Commands.literal("status").executes(CrythstCommand::status))
                 .then(Commands.literal("timing").executes(CrythstCommand::timing))
+                .then(Commands.literal("voiddebug").executes(CrythstCommand::voidDebug))
                 .then(Commands.literal("bodies").executes(CrythstCommand::bodies))
                 .then(Commands.literal("pause").executes(context -> setPaused(context, true)))
                 .then(Commands.literal("resume").executes(context -> setPaused(context, false)))
@@ -94,6 +95,8 @@ public final class CrythstCommand {
                 + " voidEvents=" + physics.lastVoidTick().blockEvents()
                 + " voidMirrored=" + physics.lastVoidTick().mirroredBlocks()
                 + " voidDropped=" + physics.lastVoidTick().dropped()
+                + " voidEjected=" + physics.auxiliaryLevelEjectedEntities()
+                + " attached=" + physics.attachedEntities().attachedCount()
                 + " constraints=" + physics.world().constraintCount()
                 + " awake=" + stats.awakeBodyCount()
                 + " contacts=" + stats.contactCount()
@@ -129,7 +132,35 @@ public final class CrythstCommand {
             poseDiagnostics = "";
         }
         final String suffix = poseDiagnostics.isEmpty() ? "" : " | " + poseDiagnostics;
-        source.sendSuccess(() -> Component.literal(physics.timingText() + suffix), false);
+        final String voidStatus = " | void " + physics.voidTickStatus();
+        source.sendSuccess(() -> Component.literal(physics.timingText() + suffix + voidStatus), false);
+        return 1;
+    }
+
+    /**
+     * Full auxiliary void-level diagnostics: created/disabled state, regions,
+     * active chunks, scheduled/fluid/random/event counters, entity ejection and
+     * attachment failures.
+     */
+    private static int voidDebug(com.mojang.brigadier.context.CommandContext<CommandSourceStack> context) {
+        final CommandSourceStack source = context.getSource();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(source.getLevel());
+        if (physics == null) {
+            source.sendSuccess(() -> Component.literal("voiddebug: no physics world for this dimension"), false);
+            return 0;
+        }
+        final var subLevel = physics.auxiliaryLevel();
+        if (subLevel == null) {
+            source.sendSuccess(() -> Component.literal(
+                    "voiddebug: level=disabled " + physics.attachedEntities().summary()), false);
+            return 0;
+        }
+        source.sendSuccess(() -> Component.literal("voiddebug: " + subLevel.status()), false);
+        source.sendSuccess(() -> Component.literal("voiddebug last tick: "
+                + physics.lastVoidTick().summary()), false);
+        source.sendSuccess(() -> Component.literal("voiddebug entity policy: "
+                + physics.entityProjectionStatus()
+                + " | " + physics.attachedEntities().summary()), false);
         return 1;
     }
 

@@ -34,6 +34,10 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
             for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
                 for (int x = bounds.minX(); x < bounds.maxX(); x++) {
                     final int index = index(x, y, z);
+                    final BlockState state = snapshot.blockState(x, y, z);
+                    if (state != null && !state.isAir()) {
+                        states[index] = state;
+                    }
                     if (!snapshot.isSolid(x, y, z)) {
                         continue;
                     }
@@ -72,12 +76,12 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
             return Blocks.AIR.defaultBlockState();
         }
         final int index = index(x, y, z);
-        if (!solid[index]) {
-            return Blocks.AIR.defaultBlockState();
-        }
         final BlockState state = states[index];
         if (state != null) {
             return state;
+        }
+        if (!solid[index]) {
+            return Blocks.AIR.defaultBlockState();
         }
         final BlockState sourceState = source.blockState(x, y, z);
         return sourceState == null ? Blocks.STONE.defaultBlockState() : sourceState;

@@ -7,6 +7,7 @@ import io.mikaple.crythst.api.event.PhysicsTickEvent;
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
 import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
 import io.mikaple.crythst.config.CrythstConfig;
+import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
@@ -43,6 +44,7 @@ public final class LevelPhysics implements AutoCloseable {
     private final PhysicsTimingMonitor timing = new PhysicsTimingMonitor();
     private final PhysicsPipeline apiPipeline;
     private final StructurePhysicsRuntime structureActors;
+    private final StructureAttachedEntities attachedEntities;
     private long physicsTickIndex;
 
     /**
@@ -86,6 +88,7 @@ public final class LevelPhysics implements AutoCloseable {
         this.unstuck = new UnstuckResolver(level, world, config);
         this.apiPipeline = new PhysicsPipeline(this);
         this.structureActors = new StructurePhysicsRuntime(level);
+        this.attachedEntities = new StructureAttachedEntities(level);
         this.world.addStepListener(new StepListener() {
             @Override
             public void beforeStep(PhysicsWorld steppedWorld, double fixedTimeStep) {
@@ -155,6 +158,8 @@ public final class LevelPhysics implements AutoCloseable {
         final EmptyPhysicsLevel sub = subLevel();
         if (sub != null) {
             try {
+                sub.setAttachedEntities(attachedEntities);
+                sub.setEntityProjector(this::projectVoidEntity);
                 sub.addStructure(structure, definition.volume());
                 refreshStructureActors(structure);
             } catch (Throwable t) {
@@ -174,6 +179,9 @@ public final class LevelPhysics implements AutoCloseable {
     public void removeStructure(PhysicsStructure structure) {
         structure.invalidateBlockEntityActors();
         structureActors.forget(structure);
+        // Release decorations/seats as normal host entities at their last valid
+        // pose before the body/region disappears.
+        attachedEntities.releaseStructure(structure);
         // Flush entities that the region spawned before its blocks and pose
         // disappear.
         projectSubLevelEntities();
@@ -245,7 +253,10 @@ public final class LevelPhysics implements AutoCloseable {
             structure.invalidateBlockEntityActors();
             structureActors.forget(structure);
         }
-        return StructureSplitter.splitIfNeeded(this, structure, volume);
+        final List<PhysicsStructure> result =
+                StructureSplitter.splitIfNeeded(this, structure, volume);
+        attachedEntities.relocate(structure, result);
+        return result;
     }
 
     /**
@@ -287,6 +298,8 @@ public final class LevelPhysics implements AutoCloseable {
         if (subLevel == null) {
             subLevelCreationFailed = true;
         } else {
+            subLevel.setAttachedEntities(attachedEntities);
+            subLevel.setEntityProjector(this::projectVoidEntity);
             Crythst.LOGGER.info("Created auxiliary void level for {} (block logic ticking enabled)",
                     level.dimension().identifier());
         }
@@ -314,6 +327,26 @@ public final class LevelPhysics implements AutoCloseable {
      */
     public @org.jetbrains.annotations.Nullable EmptyPhysicsLevel auxiliaryLevel() {
         return subLevel;
+    }
+
+    /**
+     * Host-world registry for decorative/rideable entities attached to a
+     * structure. This is the integration point for the placement handler:
+     * after spawning a real host item frame/painting/seat, call
+     * {@link StructureAttachedEntities#attachAtCurrentPosition} (or
+     * {@code attachRideable}/{@code attachDecoration}) with the structure.
+     */
+    public StructureAttachedEntities attachedEntities() {
+        return attachedEntities;
+    }
+
+    /**
+     * Updates all attached host mirrors and their passengers from the current
+     * structure poses. Normally called by {@link #tick()}; exposed for tests
+     * and integrations that drive physics manually.
+     */
+    public void tickAttachedEntities() {
+        attachedEntities.tick();
     }
 
     /**
@@ -372,7 +405,9 @@ public final class LevelPhysics implements AutoCloseable {
                 refreshStructureActors(structure);
                 // Reconnect/split editing must still run; this may close the
                 // original and create new bodies, each with its own region.
-                StructureSplitter.splitIfNeeded(this, structure, volume);
+                final List<PhysicsStructure> result =
+                        StructureSplitter.splitIfNeeded(this, structure, volume);
+                attachedEntities.relocate(structure, result);
             } catch (Throwable t) {
                 if (subLevel != null) {
                     subLevel.reportTickFailure("block edit reindex", t);
@@ -422,49 +457,63 @@ public final class LevelPhysics implements AutoCloseable {
         if (subLevel == null || closed) {
             return;
         }
-        final Map<Long, PhysicsStructure> byId = new HashMap<>();
-        for (PhysicsStructure structure : structures) {
-            if (!structure.closed()) {
-                byId.put(structure.body().id(), structure);
-            }
-        }
-        if (byId.isEmpty()) {
+        if (structures.isEmpty()) {
             lastEntityProjection = StructureEntityProjection.Batch.EMPTY;
             return;
         }
+        lastEntityProjection = StructureEntityProjection.Batch.EMPTY;
+        subLevel.collectRegionEntities(this::projectVoidEntity);
+    }
 
+    /**
+     * Projects one entity out of a void region. Also used by the void-level
+     * tick as its before/after-entity ejection callback.
+     */
+    private StructureEntityProjection.Result projectVoidEntity(
+            EmptyPhysicsLevel.RegionView region, net.minecraft.world.entity.Entity entity) {
+        final PhysicsStructure structure = structureById(region.structureId());
+        if (structure == null || structure.closed() || entity == null) {
+            return StructureEntityProjection.Result.SKIPPED_REMOVED;
+        }
+        if (entity.isRemoved()) {
+            return StructureEntityProjection.Result.SKIPPED_REMOVED;
+        }
+        final UUID uuid = entity.getUUID();
         final long now = level.getGameTime();
-        final StructureEntityProjection.Batch[] batch = {StructureEntityProjection.Batch.EMPTY};
-        subLevel.collectRegionEntities((region, entity) -> {
-            final PhysicsStructure structure = byId.get(region.structureId());
-            if (structure == null || structure.closed()) {
-                return;
+        final Long retryAfter = entityProjectionRetryAfter.get(uuid);
+        if (retryAfter != null && retryAfter > now) {
+            return StructureEntityProjection.Result.FAILED;
+        }
+        final StructureEntityProjection.RegionAnchor anchor =
+                new StructureEntityProjection.RegionAnchor(
+                        region.localOriginX(), region.localOriginY(), region.localOriginZ());
+        final StructureEntityProjection.Result result =
+                StructureEntityProjection.project(level, structure, anchor, entity);
+        lastEntityProjection = lastEntityProjection.plus(result);
+        if (result == StructureEntityProjection.Result.FAILED) {
+            entityProjectionRetryAfter.put(uuid, now + 20L);
+            if (!entityProjectionFailureLogged) {
+                entityProjectionFailureLogged = true;
+                Crythst.LOGGER.warn("Could not project entity {} from the auxiliary void level "
+                                + "for {}; it stays in the void region and will be retried",
+                        entity.getType(), level.dimension().identifier());
             }
-            final UUID uuid = entity.getUUID();
-            final Long retryAfter = entityProjectionRetryAfter.get(uuid);
-            if (retryAfter != null && retryAfter > now) {
-                return;
+        } else {
+            entityProjectionRetryAfter.remove(uuid);
+        }
+        if (result == StructureEntityProjection.Result.PROJECTED) {
+            projectedEntityCount++;
+        }
+        return result;
+    }
+
+    private @org.jetbrains.annotations.Nullable PhysicsStructure structureById(long id) {
+        for (PhysicsStructure structure : structures) {
+            if (!structure.closed() && structure.body().id() == id) {
+                return structure;
             }
-            final StructureEntityProjection.RegionAnchor anchor =
-                    new StructureEntityProjection.RegionAnchor(
-                            region.localOriginX(), region.localOriginY(), region.localOriginZ());
-            final StructureEntityProjection.Result result =
-                    StructureEntityProjection.project(level, structure, anchor, entity);
-            batch[0] = batch[0].plus(result);
-            if (result == StructureEntityProjection.Result.FAILED) {
-                entityProjectionRetryAfter.put(uuid, now + 20L);
-                if (!entityProjectionFailureLogged) {
-                    entityProjectionFailureLogged = true;
-                    Crythst.LOGGER.warn("Could not project entity {} from the auxiliary void level "
-                                    + "for {}; it stays in the void region and will be retried",
-                            entity.getType(), level.dimension().identifier());
-                }
-            } else {
-                entityProjectionRetryAfter.remove(uuid);
-            }
-        });
-        lastEntityProjection = batch[0];
-        projectedEntityCount += batch[0].projected();
+        }
+        return null;
     }
 
     public void tick() {
@@ -519,6 +568,10 @@ public final class LevelPhysics implements AutoCloseable {
         }
         renderDebugSnapshot = world.debugSnapshot();
         maybeRebase();
+        // Attached host mirrors (item frames, paintings, seats) and their
+        // passengers follow the pose that was just published. This runs before
+        // the void block pass so placement/mount code sees the current pose.
+        attachedEntities.tick();
         if (!frozen) {
             // Block logic advances with the simulated world. Ticking here means
             // one random-tick pass per server tick, not one per Bullet sub-step.
@@ -612,8 +665,10 @@ public final class LevelPhysics implements AutoCloseable {
         // Move any entities the regions spawned into this level before the
         // auxiliary regions disappear.
         projectSubLevelEntities();
-        // Clear the auxiliary regions exactly once, before their structures
-        // (and therefore their body ids) are closed.
+        // Release attached host mirrors before the structures and regions
+        // disappear, then clear the auxiliary regions exactly once before their
+        // structures (and therefore their body ids) are closed.
+        attachedEntities.clear();
         clearSubLevel();
         for (PhysicsStructure structure : structures) {
             structure.invalidateBlockEntityActors();
@@ -704,6 +759,11 @@ public final class LevelPhysics implements AutoCloseable {
         return subLevel == null ? 0 : subLevel.regionCount();
     }
 
+    /** Cumulative number of ordinary entities ejected from the void level. */
+    public long auxiliaryLevelEjectedEntities() {
+        return subLevel == null ? 0 : subLevel.totalEjectedEntities();
+    }
+
     /**
      * Entities spawned by block logic in the auxiliary level during the most
      * recent projection pass, plus skip/failure counts.
@@ -747,16 +807,27 @@ public final class LevelPhysics implements AutoCloseable {
     /** One-line world-logic diagnostic for commands and logs. */
     public String voidTickStatus() {
         if (subLevel == null) {
-            return "voidLevel=disabled";
+            return "voidLevel=disabled"
+                    + " attached=" + attachedEntities.attachedCount()
+                    + " attachedFailures=" + attachedEntities.failureCount();
         }
-        return "blockTicks=" + subLevel.totalBlockTicks()
+        return "voidLevel=active"
+                + " regions=" + subLevel.regionCount()
+                + " activeChunks=" + subLevel.activeChunkCount()
+                + " blockTicks=" + subLevel.totalBlockTicks()
                 + " fluidTicks=" + subLevel.totalFluidTicks()
+                + " pendingBlockTicks=" + subLevel.pendingBlockTicks()
+                + " pendingFluidTicks=" + subLevel.pendingFluidTicks()
                 + " blockEvents=" + subLevel.totalBlockEvents()
                 + " randomTicks=" + subLevel.totalRandomTicks()
                 + " mirroredBlocks=" + subLevel.totalMirroredBlocks()
                 + " skippedBlocks=" + subLevel.totalSkippedBlocks()
                 + " neighbors=" + subLevel.totalNeighborUpdates()
                 + " droppedWork=" + subLevel.totalDroppedWork()
+                + " entitiesEjected=" + subLevel.totalEjectedEntities()
+                + " attachedAdopted=" + subLevel.totalAdoptedAttachedEntities()
+                + " ejectionFailures=" + subLevel.totalEjectionFailures()
+                + " attached=" + attachedEntities.summary()
                 + " last=" + lastVoidTick.summary();
     }
 
@@ -835,6 +906,7 @@ public final class LevelPhysics implements AutoCloseable {
             return;
         }
         closed = true;
+        attachedEntities.clear();
         if (subLevel != null) {
             try {
                 subLevel.close();
