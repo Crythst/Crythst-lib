@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.collision.StructureCollisionSources;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
 import io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector;
@@ -113,6 +114,14 @@ public final class StructureInteractionEvents {
         final StructureBlockHitResult hit = StructureInteraction.raycast(serverPlayer,
                 serverPlayer.blockInteractionRange());
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
+            // Placing a real-world block must not ignore a structure occupying
+            // the target cell (structures are air in the vanilla block grid).
+            if (stack.getItem() instanceof BlockItem
+                    && StructurePlacementOcclusion.obstructed(
+                            StructureCollisionSources.forEntity(serverPlayer),
+                            level, hitResult)) {
+                return InteractionResult.FAIL;
+            }
             return InteractionResult.PASS;
         }
         return useStructure(serverPlayer, hit, stack);

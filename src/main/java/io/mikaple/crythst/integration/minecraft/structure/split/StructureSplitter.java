@@ -19,6 +19,7 @@ import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolumes;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Vector3d;
 
@@ -281,6 +282,10 @@ public final class StructureSplitter {
         if (components.size() <= 1) {
             return List.of(original);
         }
+        // The auxiliary regions are rebuilt for each split component. Capture
+        // pending repeater/observer/fluid ticks before the original region is
+        // removed, then hand each tick to the component that owns its voxel.
+        final CompoundTag originalTicks = physics.captureScheduledTicks(original);
 
         final IntBounds3 bounds = volume.bounds();
         final VoxelColliderOptions colliderOptions =
@@ -328,6 +333,15 @@ public final class StructureSplitter {
                 owners.put(cell, i);
             }
         }
+
+        final List<ListTag> splitBlockTicks = new ArrayList<>(componentCount);
+        final List<ListTag> splitFluidTicks = new ArrayList<>(componentCount);
+        for (int i = 0; i < componentCount; i++) {
+            splitBlockTicks.add(new ListTag());
+            splitFluidTicks.add(new ListTag());
+        }
+        distributeTicks(originalTicks.getListOrEmpty("Block"), owners, splitBlockTicks);
+        distributeTicks(originalTicks.getListOrEmpty("Fluid"), owners, splitFluidTicks);
 
         final List<Map<BlockPos, CompoundTag>> splitBlockEntities = new ArrayList<>(componentCount);
         for (int i = 0; i < componentCount; i++) {
@@ -385,6 +399,19 @@ public final class StructureSplitter {
                 StructureBlockEntityData.put(split, blockEntities);
                 physics.applyBlockEntities(split, blockEntities);
             }
+            final CompoundTag ticks = new CompoundTag();
+            if (!splitBlockTicks.get(i).isEmpty()) {
+                ticks.put("Block", splitBlockTicks.get(i));
+            }
+            if (!splitFluidTicks.get(i).isEmpty()) {
+                ticks.put("Fluid", splitFluidTicks.get(i));
+            }
+            if (!ticks.isEmpty()) {
+                physics.applyScheduledTicks(split, ticks);
+            }
+            // New body id: publish its block snapshot before the next tick so
+            // the split does not flicker for one frame.
+            physics.captureSnapshotNow(split);
         }
 
         removeStructure(physics, original);
@@ -444,6 +471,22 @@ public final class StructureSplitter {
             }
         }
         return total;
+    }
+
+    private static void distributeTicks(ListTag source, Map<Cell, Integer> owners,
+                                        List<ListTag> destinations) {
+        for (int i = 0; i < source.size(); i++) {
+            final CompoundTag entry = source.getCompoundOrEmpty(i);
+            if (entry.isEmpty()) {
+                continue;
+            }
+            final Cell cell = new Cell(entry.getIntOr("X", 0),
+                    entry.getIntOr("Y", 0), entry.getIntOr("Z", 0));
+            final Integer owner = owners.get(cell);
+            if (owner != null) {
+                destinations.get(owner).add(entry.copy());
+            }
+        }
     }
 
     private static void removeStructure(LevelPhysics physics, PhysicsStructure structure) {

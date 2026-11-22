@@ -179,6 +179,23 @@ public final class StructureBlockSnapshots {
     }
 
     /**
+     * Immediately captures one structure, bypassing the end-of-tick producer.
+     * Used after a split creates new body ids so the renderer does not drop the
+     * structure for one frame while the next tick's snapshot pass runs.
+     */
+    public static void captureNow(ResourceKey<Level> dimension, PhysicsStructure structure) {
+        if (dimension == null || structure == null || structure.closed()) {
+            return;
+        }
+        final Snapshot snapshot = build(structure);
+        if (snapshot == null) {
+            return;
+        }
+        SNAPSHOTS.computeIfAbsent(dimension, ignored -> new ConcurrentHashMap<>())
+                .put(structure.body().id(), snapshot);
+    }
+
+    /**
      * Immutable snapshot for a body in one dimension, or {@code null} when the
      * body is not tracked (not present locally, too large, or not solid).
      *

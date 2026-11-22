@@ -9,6 +9,7 @@ import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
+import io.mikaple.crythst.integration.minecraft.structure.StructureBlockSnapshots;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -148,6 +149,15 @@ public final class LevelPhysics implements AutoCloseable {
 
     private void refreshRenderStructures() {
         renderStructures = List.copyOf(structures);
+    }
+
+    /**
+     * Publishes a block snapshot immediately. Split components get new body ids;
+     * without this the client can see them one frame before their snapshot
+     * exists and they flash/disappear.
+     */
+    public void captureSnapshotNow(PhysicsStructure structure) {
+        StructureBlockSnapshots.captureNow(level.dimension(), structure);
     }
 
     public PhysicsStructure createStructure(StructureDef definition) {

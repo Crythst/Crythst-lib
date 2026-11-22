@@ -1,10 +1,14 @@
 package io.mikaple.crythst.mixin.client;
 
+import io.mikaple.crythst.integration.fabric.CrythstFabric;
+import io.mikaple.crythst.integration.minecraft.collision.ClientStructureCollisionSource;
+import io.mikaple.crythst.integration.minecraft.interaction.StructurePlacementOcclusion;
 import io.mikaple.crythst.integration.minecraft.interaction.client.ClientStructureInteraction;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.phys.BlockHitResult;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -41,6 +45,19 @@ public abstract class StructurePlacementMixin {
                                                    CallbackInfoReturnable<InteractionResult> callback) {
         if (ClientStructureInteraction.requestStructureUse(player, hand, hitResult)) {
             callback.setReturnValue(InteractionResult.CONSUME);
+            return;
+        }
+        // A real-world block target can still be occupied by a structure. Stop
+        // the predictive BlockItem.place rather than sending a packet the
+        // server will reject (which would leave a ghost block for one tick).
+        if (player != null && hitResult != null
+                && player.getMainHandItem().getItem() instanceof BlockItem
+                && CrythstFabric.config() != null
+                && CrythstFabric.config().enabled
+                && StructurePlacementOcclusion.obstructed(
+                        ClientStructureCollisionSource.of(player.level()),
+                        player.level(), hitResult)) {
+            callback.setReturnValue(InteractionResult.FAIL);
         }
     }
 }

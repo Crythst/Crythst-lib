@@ -353,6 +353,13 @@ public final class StructureOperationRedirector {
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
         final EmptyPhysicsLevel auxiliary = physics == null ? null : physics.auxiliaryLevel();
         final BlockState previous = mapped.live().state();
+        // Resolve the feedback point before the break. A split/reindex may
+        // remove the original auxiliary region in finish(), which used to make
+        // the projected break sound/particles disappear exactly on fractures.
+        final BlockPos breakPos = mapped.live().pos();
+        final Vec3 feedbackCenter = auxiliary == null ? null
+                : auxiliary.projectAuxiliaryPoint(
+                        breakPos.getX() + 0.5, breakPos.getY() + 0.5, breakPos.getZ() + 0.5);
         final boolean projecting = physics != null
                 && physics.beginAuxiliaryAudioProjection(mapped.structure());
         boolean destroyed = false;
@@ -365,7 +372,12 @@ public final class StructureOperationRedirector {
                 // client prediction, which is disabled for structure attacks.
                 auxiliary.beginSuppressBreakFeedback();
             }
-            destroyed = gameMode.destroyBlock(mapped.live().pos());
+            destroyed = gameMode.destroyBlock(breakPos);
+            if (destroyed && feedbackCenter != null) {
+                StructureFeedback.breakBlock(hostLevel,
+                        new Vector3d(feedbackCenter.x, feedbackCenter.y, feedbackCenter.z),
+                        previous, mapped.structure().blockScale(), hostLevel.getRandom());
+            }
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level destroyBlock failed for structure body #{}",
                     mapped.structure().body().id(), t);
@@ -379,16 +391,6 @@ public final class StructureOperationRedirector {
                 physics.endAuxiliaryAudioProjection();
             }
             finish(player, hostLevel);
-        }
-        if (destroyed && auxiliary != null) {
-            final BlockPos pos = mapped.live().pos();
-            final Vec3 center = auxiliary.projectAuxiliaryPoint(
-                    pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-            if (center != null) {
-                StructureFeedback.breakBlock(hostLevel,
-                        new Vector3d(center.x, center.y, center.z),
-                        previous, mapped.structure().blockScale(), hostLevel.getRandom());
-            }
         }
         return new Result(destroyed ? Status.HANDLED : Status.FAILED,
                 destroyed ? InteractionResult.SUCCESS : InteractionResult.FAIL);
