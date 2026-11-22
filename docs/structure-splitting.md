@@ -93,8 +93,12 @@ For every component, `splitIfNeeded` builds a `MutableVoxelVolume` with the
 * solid flags;
 * per-cell `blockMass`;
 * per-cell `PhysicsMaterial`;
-* block states, preferring a `StatefulVoxelVolume` and falling back to
-  `StructureBlockStates`;
+* all owned block states, including non-colliding logic blocks (wire, torches,
+  repeaters, observers, fluids), carried through an internal
+  `StatefulVoxelVolume` so the auxiliary ticking level sees them immediately;
+* pending block/fluid ticks, assigned to the component that owns the tick
+  position. Non-solid positions use the nearest component, so a repeater or
+  fluid tick is never dropped merely because it has no collider cell;
 * block-entity NBT from `StructureBlockEntityData`, filtered to the cells owned
   by that component.
 
@@ -125,13 +129,9 @@ the partial splits are closed and the original is kept.
   `CollisionFilter.DEFAULT`; damping is reset to zero. Greedy merge, merged
   materials and a custom filter are therefore not carried over exactly. The
   resulting collision surface and mass are still correct.
-* **Block states and the auxiliary void level.** New structures are created
-  before their `StructureBlockStates` entries can be keyed by the new body, so
-  the auxiliary ticking level copies stone for mutable split volumes. The render
-  and interaction paths read the side table and see the correct states, matching
-  the existing restore-path limitation.
-* **Block-entity NBT.** NBT is split by cell ownership, but a block entity whose
-  position is outside every solid component is dropped.
+* **Block-entity NBT.** NBT is split by cell ownership; a block entity at a
+  non-solid position (for example a sign or hanging block) follows the nearest
+  component instead of being dropped.
 * **Zero-mass cells.** `MutableVoxelVolume.blockMass` falls back to 1000 kg for
   non-positive stored mass. A whole body with zero mass is still detected and
   removed before copying, but an individual zero-mass cell inside a positive-mass
@@ -150,4 +150,7 @@ contains pure tests that do not start a Minecraft server:
 * diagonal and corner-only contact keeps blocks in one body;
 * a connected L shape is one component with multiple merged boxes;
 * air-only volumes produce no components;
-* empty and zero-mass volumes are reported massless.
+* empty and zero-mass volumes are reported massless;
+* ticks on both solid and non-solid logic cells go to the correct component,
+  preserving delay/priority/order;
+* unresolved (air) cells fall back to the nearest component deterministically.

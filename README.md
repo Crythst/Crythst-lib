@@ -645,6 +645,7 @@ Crythst 以 **MIT License** 发布，版权归 mikaple 所有，完整文本见 
 - [浮力](docs/buoyancy.md)
 - [方块质量](docs/block-mass.md)
 - [沉浸式传送门](docs/immersive-portal.md)
+- [无缝传送门复刻路线指南](docs/seamless-portal-replication.md)
 - [Create 兼容](docs/create-compatibility.md)
 
 **渲染、调试与资源**

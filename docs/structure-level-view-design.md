@@ -1,7 +1,8 @@
 # StructureLevelView design and implementation
 
-Status: **implemented (P2, lightweight view)**. A full `Level` facade, AI /
-pathfinding integration and the host↔structure neighbour graph are deferred.
+Status: **implemented (P2, lightweight view plus entities/metadata/chunks)**.
+A full `Level` subclass, AI / pathfinding integration and the host↔structure
+neighbour graph are deferred.
 
 The original design targeted Sable/CA compatibility. This document now records
 the concrete implementation and its boundaries.
@@ -70,6 +71,21 @@ public interface StructureLevelView {
     BlockPos worldBlockToLocal(BlockPos world);
     Vec3 soundPosition(BlockPos local);
     Vec3 particlePosition(Vector3dc localMetres);
+
+    // metadata / entities / chunks
+    default @Nullable ResourceKey<Level> dimension();
+    default @Nullable Identifier dimensionId();
+    default long gameTime();
+    default long dayTime();
+    default RandomSource random();
+    default boolean addFreshEntity(Entity entity);
+    default boolean addFreshEntityAtLocal(Entity entity, Vector3dc localMetres);
+    default List<Entity> getEntitiesInLocalBox(AABB localVoxelBox,
+            @Nullable Predicate<? super Entity> filter);
+    default AABB localVoxelBoxToWorldAabb(AABB localVoxelBox);
+    default @Nullable LevelChunk getChunkIfLoaded(int chunkX, int chunkZ);
+    default boolean isChunkLoaded(int chunkX, int chunkZ);
+    default boolean isKeptLoaded();
 
     // exact shapes / collisions in local voxel coordinates
     VoxelShape localShape(...);
@@ -244,8 +260,9 @@ A view is a thin wrapper around one structure object, not a cache.
 ## Deferred
 
 1. **Full `Level` facade.** This view is not a `Level` subclass and does not
-   provide chunks, lighting, entities, tick lists, day/night or dimension data.
-   Code that stores a `Level` reference still needs a real facade.
+   provide lighting, tick lists, pathfinding or a host-level entity container.
+   Dimension, game time, random, entity spawning/query, particle/sound helpers
+   and non-loading chunk queries are available.
 2. **Player-operation redirector.** `operationTarget` exposes the void
    `ServerLevel`/position for a future redirect, but no mixin yet calls
    `ServerPlayerGameMode`, `useItemOn` or `destroyBlock` on it. Player
@@ -256,9 +273,10 @@ A view is a thin wrapper around one structure object, not a cache.
 4. **Host ↔ structure neighbour graph.** Neighbour updates run inside the void
    dimension (including for view writes), but cross-boundary redstone, hoppers,
    fluids, game events and explosions are not wired.
-5. **Entity projection.** Sounds and particles have world-position helpers and
-   host-level play/add methods, but `addFreshEntity` is not added. Existing void-
-   level entity projection remains the server-side path.
+5. **Entity projection.** `addFreshEntity`/`addFreshEntityAtLocal` spawn into
+   the host world and `getEntitiesInLocalBox` returns a coarse host-world AABB
+   superset. There is no structure-local entity container; existing void-level
+   entity projection remains the server-side logical path.
 6. **Block-entity network sync.** Client views cannot return block entities yet.
 7. **Command/selector integration.** Vanilla selectors and commands still see
    host-world blocks, not structure-local blocks.
@@ -266,6 +284,8 @@ A view is a thin wrapper around one structure object, not a cache.
    but the existing outline algorithm has not been replaced.
 9. **Incremental view invalidation.** Epochs are per process and per structure;
    there is no persistent generation or network-synchronised revision yet.
+10. **Loading tickets.** `StructureLoadingTickets` pins host chunks covered by
+    the structure AABB; it is not a plot-region ticket and does not persist.
 
 ## Compatibility boundary
 

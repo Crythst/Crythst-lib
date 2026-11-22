@@ -4,6 +4,10 @@
 
 ## 下一步重点：沉浸式传送门（Immersive Portal）
 
+> 当前 `docs/immersive-portal.md` 描述的是**离屏纹理原型**，不是无缝实现。
+> 重构路线、架构决策、里程碑和验收标准见
+> [`docs/seamless-portal-replication.md`](docs/seamless-portal-replication.md)。
+
 目标：做一套真正“可穿过去”的传送门，而不是简单地把玩家传送到另一个坐标。优先支持静态传送门，再扩展到物理结构上的移动传送门。
 
 ### 设计范围

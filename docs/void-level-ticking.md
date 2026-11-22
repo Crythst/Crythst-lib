@@ -35,8 +35,12 @@ This document records the end-to-end tick path of the auxiliary
    `inBlockTickingRange=true`, `BLOCK_TICKING` status and registered
    containers, the auxiliary level's `LevelTicks` pass did not drain scheduled
    work. `EmptyPhysicsLevel` now drains each active chunk's
-   `LevelChunkTicks` container directly (sorted by trigger tick, capped by the
-   per-tick budget). Tick containers are registered **before**
+   `LevelChunkTicks` container directly, capped by the per-tick budget. The
+   due ticks from **all** active chunks are collected first and then run in
+   vanilla intra-tick order (priority, then sub-tick), not in HashMap/chunk
+   order. Ticks scheduled by a tick that is currently running are therefore
+   left for the next game tick, exactly like vanilla's
+   `collect -> run -> cleanup`. Tick containers are registered **before**
    `wakeCopiedRegion`, because `LevelTicks#schedule` drops requests for a chunk
    whose container is not registered yet. Containers are unregistered when a
    region is removed so stale ticks cannot accumulate.
@@ -61,6 +65,28 @@ This document records the end-to-end tick path of the auxiliary
    the copy. Region removal also clears that region's pending ticks, so an
    inactive chunk no longer saves overdue repeater/observer work that fires
    unexpectedly when the chunk is reused.
+9. **Sub-tick order was replayed across worlds.** A live `ScheduledTick`'s
+   sub-tick order is only meaningful inside one `Level` instance. The
+   auxiliary level counter restarts at zero on reload, so replaying a saved
+   high order made a restored repeater run *after* work scheduled later in the
+   same game tick. Capture now records a deterministic priority/order sequence
+   and restore assigns fresh monotonic orders, mirroring vanilla
+   `SavedTick#unpack` (which gives restored ticks a fresh order too). Unpacked
+   pending ticks are included in the capture and cleared on discard.
+10. **Applying captured ticks deleted fresh work.** Restore used to clear every
+    tick in the region before reinserting the snapshot, dropping fluid/onPlace
+    ticks seeded while the region was copied. Restore now replaces only the
+    exact position/type present in the snapshot; unrelated fresh ticks stay.
+    A whole void tick is also limited to one pass per game time, so a manual
+    `/crythst step` plus the normal end-of-tick callback cannot double-tick
+    scheduled/random/BE work.
+11. **Split dropped logic cells and their ticks.** Split ownership only covered
+    colliding voxels. Repeaters, observers, torches, wire and fluid have no
+    colliding cell, so their pending ticks were discarded during a split (and
+    the new component copied stone instead of the real state). Split volumes
+    now carry all owned states through a `StatefulVoxelVolume`, assign every
+    non-solid state/tick to the nearest component, and preserve the original
+    delay, priority and order tags for restore.
 
 ## Tick phases
 
@@ -68,10 +94,12 @@ This document records the end-to-end tick path of the auxiliary
 
 1. chunk lifecycle/promotion for active regions;
 2. entity ejection (before any entity logic);
-3. scheduled block ticks (direct `LevelChunkTicks<Block>` drain per active
-   chunk, budget 4096);
-4. scheduled fluid ticks (direct `LevelChunkTicks<Fluid>` drain, budget 4096);
-5. random block/fluid ticks per active section (configured speed);
+3. scheduled block ticks: due ticks are collected from every active chunk,
+   sorted by `TickPriority` then `subTickOrder`, and only then run (budget
+   4096). Ticks newly scheduled during this phase wait for the next game tick;
+4. scheduled fluid ticks: same collect/sort/run batch (budget 4096);
+5. random block/fluid ticks per active section (configured speed); the whole
+   block-logic pass runs at most once per game time;
 6. queued block events (budget 4096, queue cap 8192);
 7. vanilla `tickBlockEntities()`, then a direct-ticker fallback for entries
    vanilla skipped because the chunk/entity section was not tickable or the
@@ -84,6 +112,25 @@ Global world border, weather, world clock/time, raids, natural spawning and
 entity AI are not ticked. Chunk lifecycle work is limited to tickets/futures;
 `ServerChunkCache#tick(..., false)` is used so `tickChunks`/spawning does not
 run.
+
+## Sub-tick and game-time semantics
+
+The auxiliary level reads game time through a `DerivedLevelData` wrapper that
+delegates `getGameTime()` to the host `ServerLevel` itself. It therefore advances
+one-for-one with the host clock (including modded dimensions or a separate host
+clock) and does not advance while the server is frozen. A tick scheduled at
+`now + delay` is processed on the first pass with `gameTime >= now + delay`,
+matching vanilla's increment-then-tick order.
+
+A `ScheduledTick.subTickOrder` is **not** a durable global clock. It only orders
+ticks inside one `Level` instance. Consequently:
+
+- capture sorts by priority/order but restore assigns fresh monotonic orders;
+- split/refresh keep the original relative sequence through that sorted list;
+- delays are stored relative to the capture game time, never as absolute
+  trigger ticks, so a save/load round trip does not age or resurrect work;
+- one block-logic pass runs per game time, and ticks scheduled by the current
+  batch are deferred to the next game time.
 
 ## Entity policy
 
@@ -131,6 +178,10 @@ automatically.
   cumulative scheduled block/fluid ticks, random ticks, events, neighbours,
   mirrored/skipped blocks, dropped work, entity ejection and attachment
   failures.
+- A dedicated tick-schedule line prints `gameTime`, the last game time actually
+  processed, tick/scheduled pass counts, and per-region pending `block/fluid`
+  counts. The main tick line adds the next due trigger, its delay from now,
+  priority and sub-tick.
 - The same line now includes block-entity counters: live BEs, registered
   tickers in active chunks and in the level-wide list, pending tickers,
   loaded/total active chunks, random-ticking sections, chunk
@@ -145,9 +196,11 @@ automatically.
 
 ## Test coverage and limitations
 
-Unit tests cover the pure parts: tick budgets/results, region coordinate
-mapping, copy-state selection, mirror decisions and the chunk-object
-re-registration decision. The live paths (chunk tickets, entity-section load,
+Unit tests cover the pure parts: tick budgets/results, global due-tick ordering
+by priority/sub-tick, captured-tick tag ordering, region coordinate mapping,
+copy-state selection, mirror decisions, chunk-object re-registration,
+persistence of relative delays/orders, and split tick ownership including
+non-solid logic cells. The live paths (chunk tickets, entity-section load,
 vanilla ticker registration and actual redstone/hopper/moving-piston
 behaviour) need an in-game or dedicated-server harness; they are not covered by
 the JUnit suite. Use `/crythst voiddebug` with the counters above to distinguish

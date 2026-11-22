@@ -90,6 +90,95 @@ The pipeline deliberately does **not** expose stepping. Crythst's fixed-step
 clock drives simulation from `LevelPhysics.tick`; manual stepping would break
 terrain loading, block logic and render interpolation.
 
+### Constraints (`physics/constraint`)
+
+Constraints are created and removed through the pipeline or directly through a
+structure. Frames, anchors and axes are always **structure-local metres** for
+the structure they belong to; for a world-anchored joint, side B is world-space
+and its values are used directly. `ConstraintFrames` exposes the same
+structure↔world↔body conversions for custom integrations.
+
+```java
+PhysicsPipeline pipeline = CrythstApi.physics(level);
+StructureConstraintHandle weld = pipeline.addConstraint(a, b,
+        FixedConstraintConfiguration.between(frameA, frameB));
+StructureConstraintHandle hinge = pipeline.addConstraint(a, b,
+        RotaryConstraintConfiguration.between(anchorA, axisA, anchorB, axisB)
+                .withLimits(-Math.PI / 2.0, Math.PI / 2.0)
+                .withMotor(1.5, 200.0));
+StructureConstraintHandle anchor = pipeline.addConstraint(a,
+        FreeConstraintConfiguration.toWorld(new Vector3d(100.0, 70.0, 0.0)));
+
+pipeline.removeConstraint(weld);
+// Equivalent structure-side convenience methods:
+StructureConstraintHandle h = a.addConstraint(b, config);
+StructureConstraintHandle w = a.addConstraintToWorld(config);
+List<StructureConstraintHandle> mine = a.constraints();
+a.removeConstraint(h);
+```
+
+| Configuration | Backend joint | Degrees of freedom |
+| --- | --- | --- |
+| `FixedConstraintConfiguration` | 6-DOF with all limits zero | none (weld) |
+| `FreeConstraintConfiguration` | point-to-point | 3 rotational |
+| `RotaryConstraintConfiguration` | hinge | 1 rotational + optional motor |
+| `GenericConstraintConfiguration` | slider | 1 translational (local X) + angular limit + optional linear motor |
+
+`StructureConstraintHandle` exposes `id()`, `type()`, `enabled()`,
+`setEnabled`, `isValid()`, `remove()`, `involves`, `structureA/B`,
+`bodyIdA/B`, `configuration()` and the hinge motor accessors
+(`supportsMotor`, `setMotorEnabled`, `motorTargetVelocity`, `maxMotorImpulse`).
+`constraints()` on a pipeline returns every joint in the world; on a structure
+it returns only joints involving that body.
+
+**Deferred:** a true full 6-DOF configuration with independent per-axis
+limits/motors is not exposed. `GenericConstraintConfiguration` is the existing
+prismatic subset (slide along frame X). Constraints are also not persisted:
+after a reload, recreate them from your own saved structure identities and
+configurations. The configuration object is available on handles created
+through the API to make that straightforward.
+
+### Loose boxes (`physics/box`)
+
+```java
+StructureBoxObject crate = pipeline.createBox(
+        StructureBoxDef.dynamic(new Vector3d(0.5, 0.5, 0.5),
+                new Vector3d(10.0, 65.0, 10.0))
+                .withMass(80.0)
+                .withDamping(0.05, 0.1));
+crate.applyImpulse(new Vector3d(0.0, 800.0, 0.0));
+StructureBoxObject found = pipeline.box(bodyId);
+crate.remove();
+```
+
+A `StructureBoxDef` describes half extents, pose, body type, optional mass,
+material, filter, damping and CCD. Boxes are ordinary loose rigid bodies: no
+voxel grid, no auxiliary block level, and the body origin is the box centre.
+`pipeline.physicsWorld()` is the low-level escape hatch used by this helper;
+do not call `step`/`advance` through it.
+
+### Ropes (`physics/rope`)
+
+```java
+StructureRope rope = StructureRope.between(pipeline,
+        shipA, new Vector3d(0.0, 0.5, 0.0),
+        shipB, new Vector3d(0.0, 0.5, 0.0));
+rope.setLength(3.0); // rest length in metres
+StructureRope tether = StructureRope.toWorld(pipeline,
+        shipA, new Vector3d(1.0, 1.0, 0.0), worldAnchor);
+rope.close();
+```
+
+`StructureRope` is a minimal, native impulse rope driven by the public
+pre-physics-substep event. It applies equal/opposite impulses at the two anchor
+points while the endpoints are farther apart than `length()`, with configurable
+`stiffness` (`N/m`), `damping` (`N·s/m`) and `maxTension` (`N`). It exposes
+`endpointA()`, `endpointB()`, `isTaut()`, `tension()` and `isValid()`. It is
+**not** a solver constraint: it can stretch under load, depends on substep
+length, and has no collision/self-collision. Use a point constraint when a
+perfectly rigid link is required. Closing the rope removes its listener, and it
+also closes itself when an endpoint structure disappears.
+
 ---
 
 ## 2. Block hooks
@@ -147,6 +236,33 @@ Within collision geometry, a dynamic collider wins over a VoxelShape hook.
 `BlockPhysicsRegistry`, so it composes with
 `data/crythst/block_physics.json` instead of replacing it. Return `null` to keep
 the data-pack result.
+
+### Lift and propeller actors
+
+`BlockStructureLiftProvider` is a specialized `BlockEntityStructureActor`.
+Implementing it on a block entity is enough to queue a lift force once per fixed
+substep; discovery and failure isolation use the normal actor path.
+
+```java
+public final class ThrusterBlockEntity extends BlockEntity
+        implements BlockStructureLiftProvider {
+    @Override
+    public Vector3dc structureLift(StructurePhysicsContext context) {
+        return new Vector3d(0.0, 500.0, 0.0); // N, world space
+    }
+}
+```
+
+The default applies the force at the centre of mass and uses
+`BlockStructureLiftProvider.DEFAULT_LIFT_GROUP`. Override `applicationPoint` for
+an off-centre anchor and `forceGroup` for a dedicated debug group.
+
+`BlockStructurePropeller` is the propeller-style specialization: implement
+`thrustNewtons(context)` and `thrustAxisLocal()`. The default lift rotates the
+local axis through the substep pose and returns `axis * thrust` in newtons.
+Neither hook adds a new discovery mechanism: the block entity must still be in
+the auxiliary ticking level, and the structure's actor cache must be refreshed
+after changing actor implementations.
 
 ### What is actually wired
 
@@ -322,7 +438,104 @@ In multiplayer, `structures()` is empty. Use `snapshots()`, `snapshot(id)` or
 the client render views below; the network container deliberately returns
 immutable snapshots, not `PhysicsStructure` objects. Because the default
 `byId` / `containing` methods use `structures()`, they do not resolve network
-snapshots on a client.
+snapshots on a client. `ClientStructureContainer` adds the snapshot-native
+queries `snapshotContaining(Vec3)` and `snapshotsIntersecting(Aabb)`; they use
+the immutable pose/cell data and never read a native body.
+
+### Loading tickets (`sublevel/ticket`)
+
+Crythst keeps the auxiliary ticking region of every live structure loaded. A
+`StructureLoadingTicket` additionally pins the **host** chunks covered by the
+structure's world AABB, which is useful while a structure crosses terrain that
+would otherwise be unloaded:
+
+```java
+StructureLoadingTickets.StructureLoadingTicket ticket =
+        StructureLoadingTickets.acquire(serverLevel, structure, 1); // 1 chunk radius
+ticket.refresh();          // after the structure moved
+ticket.isRegionActive();   // auxiliary ticking region exists
+ticket.chunkCount();
+ticket.release();
+```
+
+Tickets are reference-counted per chunk across handles, so independent systems
+can share a region. `StructureLoadingTickets.refreshAll(level)`,
+`tickets(level)`, `tickets(level, bodyId)` and `releaseAll(level)` cover
+lifecycle and diagnostics. Tickets are runtime state and are not persisted; a
+ticket does not protect a structure from explicit removal.
+`ServerStructureContainer.acquireLoadingTicket(...)` is a convenience wrapper.
+
+### Tracking points (`sublevel/tracking`)
+
+`StructureTrackingPoints` stores named structure-local points with the world
+position captured at save time. The data is a normal per-level `SavedData`, so
+vanilla writes it with the world; points survive reloads even though body ids
+do not.
+
+```java
+StructureTrackingPoints points = CrythstApi.trackingPoints(serverLevel); // or container.trackingPoints()
+StructureTrackingPoint dock = points.add("dock", structure, new Vector3d(1.0, 2.0, 3.0),
+        true, 1); // keep host chunks loaded within one chunk
+points.get(dock.id());
+points.byName("dock");
+points.forStructure(bodyId);
+points.worldPosition(dock);
+points.nearest(worldPoint, 8.0);
+points.nearby(worldPoint, 16.0);
+
+points.refreshTickets();        // re-bind after a world reload
+points.captureWorldPositions(); // update saved fallback positions
+points.remove(dock);
+points.clear();
+```
+
+Resolution order is current body id, optional stable structure identity
+(captured from `StructureSavedData` when available), then the structure
+containing the saved world position. `keepLoaded` points reacquire a ticket on
+`refreshTickets()` and release it on removal. `StructureTrackingPoint` has a
+plain NBT encoding (`toTag`/`fromTag`) and
+`StructureTrackingPoints.writePoints/readPoints` for tooling and tests.
+
+### Structure level view
+
+`StructureLevelView` (obtained with `container.view(bodyId)` or
+`CrythstApi.view(...)`) is a level-like read/write surface over one structure's
+local voxel grid. Its `BlockPos` arguments are always structure-local; the
+auxiliary void region coordinates are hidden.
+
+```java
+StructureLevelView view = container.view(bodyId);
+BlockState state = view.getBlockState(localPos);
+FluidState fluid = view.getFluidState(localPos);
+BlockEntity be = view.getBlockEntity(localPos);
+view.setBlockAndUpdate(localPos, Blocks.STONE.defaultBlockState());
+view.registryAccess();
+
+Vector3d world = view.voxelCenterToWorld(x, y, z, new Vector3d());
+BlockPos local = view.worldBlockToLocal(worldBlock);
+AABB worldBox = view.localVoxelBoxToWorldAabb(localBox);
+List<Entity> nearby = view.getEntitiesInLocalBox(localBox, null);
+view.addFreshEntityAtLocal(entity, localMetres);
+view.playSound(null, localPos, sound, SoundSource.BLOCKS, 1.0f, 1.0f);
+view.addParticle(particle, localX, localY, localZ, 0.0, 0.0, 0.0);
+
+ResourceKey<Level> dimension = view.dimension();
+long gameTime = view.gameTime();
+long dayTime = view.dayTime();
+RandomSource random = view.random();
+LevelChunk chunk = view.getChunkIfLoaded(localChunkX, localChunkZ); // non-loading
+boolean loaded = view.isChunkLoaded(localChunkX, localChunkZ);
+boolean pinned = view.isKeptLoaded();
+```
+
+Writes are authoritative on server views, reindex the collider, refresh the
+auxiliary region and advance `epoch()`. Client views are read-only. Entities are
+host-world entities: `addFreshEntity` and `getEntitiesInLocalBox` do not create
+an entity container, and the entity query is a coarse world-AABB superset for
+rotated structures. Chunk queries never load a chunk. `dimension`, game time,
+random, sound and particle helpers project through the structure pose. A full
+`Level` facade (lighting, tick lists, pathfinding, cross-boundary neighbour
+graph) remains deferred.
 
 ---
 
@@ -592,6 +805,46 @@ Crythst converts the totals to impulses at the end of the substep:
 `N·s = N * dt`, `N·m·s = N·m * dt`, then applies one linear/angular impulse pair.
 Do not multiply by the time step yourself and do not retain the accumulator.
 
+### `physics/force/ForceTotals`
+
+`ForceTotals` is an immutable snapshot of the forces/torques contributed
+through force groups during the most recent fixed substep:
+
+```java
+ForceTotals totals = pipeline.forceTotals(structure);
+Vector3d force = totals.force();                 // N
+Vector3d torque = totals.torque();               // N·m
+for (ForceTotals.GroupForce group : totals.groups()) {
+    group.group();
+    group.forceNewtons();
+    group.torqueNewtonMetres();
+}
+ForceTotals.empty(bodyId);                       // no actor contribution
+```
+
+Values are recorded **before** conversion to impulses, so they remain in
+newtons/newton-metres. Only actor force groups are included; direct impulses and
+forces applied through the pre-step event are not. `LevelPhysics#forceTotals`
+and `LevelPhysics#forceTotalsStatus` provide the same read-only diagnostic for
+commands.
+
+### `physics/StructureMassTracker`
+
+```java
+StructureMassTracker mass = pipeline.massTracker(structure);
+double total = mass.mass();                      // kg, collider mass * massScale
+double cell = mass.cellMass(1, 0, 3);            // kg for one local voxel
+double atWorld = mass.massAtWorld(worldPoint);   // kg for the containing cell
+Vector3d com = mass.centerOfMassWorld();         // metres
+int solid = mass.solidCellCount();
+```
+
+Total mass, inertia and centre of mass come from the collider, so custom shape,
+dynamic-collider and physics-property hooks are reflected. Per-cell masses come
+from the volume. With custom fractional colliders the sum of cell masses can
+differ from the total; use `mass()` for physics and cell values for gameplay or
+diagnostics.
+
 ### `physics/StructurePhysicsRuntime`
 
 One runtime belongs to a `LevelPhysics`. `LevelPhysics` invokes
@@ -684,6 +937,8 @@ This is the container-aware event layer: `registerContainerReady` and
 | `CrythstApi.structureAt(Level, Vector3dc)` | JOML overload |
 | `CrythstApi.physics(ServerLevel)` | `PhysicsPipeline`, creating the level world if needed; `null` if unavailable |
 | `CrythstApi.body(Level, long)` | `RigidBodyHandle` from an existing world, without creating one |
+| `CrythstApi.acquireLoadingTicket(ServerLevel, PhysicsStructure, int)` | host-chunk loading ticket for a structure |
+| `CrythstApi.trackingPoints(ServerLevel)` | persistent structure tracking points for a level |
 
 The original engine methods (`engine()`, `createWorld(...)`,
 `backendDescription()`, `isAvailable()`) remain available for callers that need
@@ -697,8 +952,15 @@ Covered by the native API:
 
 - rigid-body impulse/velocity/teleport handle, centre-of-mass, mass tensor;
 - per-level physics pipeline with body-id operations and no raw stepping;
+- fixed/free/rotary/prismatic structure constraints, handles, add/remove,
+  world-space frame conversion and hinge motor control;
+- loose box bodies and a minimal substep-driven rope between structure/world
+  anchors;
+- per-cell and total mass tracking, centre of mass, and last-substep force
+  totals per body and per force group;
 - block collision shape, custom centre of mass, dynamic collider, assembly and
-  block-change listeners, post-data-pack physics properties;
+  block-change listeners, post-data-pack physics properties, lift/propeller
+  actors;
 - server and client structure containers, observers, container-ready events and
   a Brigadier structure argument;
 - entity containment, velocity, sub-level-aware distance, interpolated eye
@@ -707,6 +969,9 @@ Covered by the native API:
   `AssemblyTransform`;
 - block-entity physics actors, per-substep force groups and the internal
   `StructurePhysicsRuntime`;
+- structure level views with block/fluid/BE access, writes, entities, particles,
+  sounds, metadata, random source and non-loading chunk queries;
+- host-chunk loading tickets and persistent world-space tracking points;
 - client render views, timestamped render poses, pose providers, clip/pick
   extensions and tracking/inherited velocity;
 - pure coordinate/quaternion helpers in `StructureMath`;
@@ -714,15 +979,19 @@ Covered by the native API:
 
 Not covered yet:
 
-- public constraints (fixed/rotary/generic 6-DOF), ropes, box physics objects or
-  generic pipeline extension points (the core `PhysicsWorld` still has low-level
-  constraint support);
-- loading tickets, tracking-point saved data and schematic serialization
-  context;
-- a `SubLevel`-like second `Level` view with plot/plot-yard allocation and
+- a true full 6-DOF constraint configuration with independent per-axis
+  limits/motors; the current `GenericConstraintConfiguration` is the prismatic
+  subset;
+- constraint persistence across world reloads (recreate from structure identity
+  and the retained configuration);
+- rope solver constraints, rope collision/self-collision and non-impulse rope
+  dynamics;
+- a `Level`-subclass `SubLevel` facade with plot/plot-yard allocation and
   plot-local chunk holders;
-- propeller/lift-provider/actor parity for every Sable block API;
-- force totals/debug UI and a public force-group renderer;
+- propeller/lift-provider parity for every Sable block API (the native
+  lift/propeller actor hooks are implemented);
+- a public force-group renderer/debug panel (totals and status text are
+  available);
 - client-authoritative structure containers (the network client container
   returns immutable snapshots, not `PhysicsStructure` objects);
 - block-entity render dispatch for structure block entities;
@@ -740,8 +1009,12 @@ gap matrix and staged plan.
 ## 12. Threading and nullability summary
 
 - Registry writes: any thread.
-- Hook invocation, actor/force callbacks, event dispatch, body operations,
-  assembly and server containers: server thread.
+- Hook invocation, actor/force callbacks, constraint/box/rope operations, event
+  dispatch, body operations, assembly, loading tickets, tracking-point mutation
+  and server containers: server thread.
+- Tracking-point reads (`all`, `byName`, `worldPosition`, NBT helpers) are safe
+  wherever the saved data is available; the underlying `SavedData` is not
+  thread-safe, so use the server thread when mixing reads and writes.
 - Client render views, pose providers, clip/pick extensions and tracking:
   client thread only; do not class-load them on a dedicated server.
 - `PhysicsStructure.pose()` is safe to read for rendering; do not call

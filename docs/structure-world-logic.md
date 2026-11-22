@@ -32,12 +32,14 @@ spawners and other host-world systems inside an empty copy.
 
 `EmptyPhysicsLevel.tick(randomTickSpeed)` runs:
 
-1. **Scheduled block ticks** via `level.getBlockTicks().tick(...)`, bounded by
-   `MAX_BLOCK_TICKS_PER_TICK` (4096). Repeaters, observers, pistons, fire,
-   crops and any mod block that calls `scheduleTick` execute here.
-2. **Scheduled fluid ticks** via `level.getFluidTicks().tick(...)`, bounded by
-   `MAX_FLUID_TICKS_PER_TICK` (4096). Water/lava flow, fluid mixing and
-   fluid-related scheduled updates execute here.
+1. **Scheduled block ticks**, bounded by `MAX_BLOCK_TICKS_PER_TICK` (4096).
+   Due ticks are collected from all active chunks, sorted by
+   `TickPriority`/`subTickOrder`, then executed as one batch. Repeaters,
+   observers, pistons, fire, crops and any mod block that calls `scheduleTick`
+   execute here. Ticks scheduled by the batch run on the next game tick.
+2. **Scheduled fluid ticks**, bounded by `MAX_FLUID_TICKS_PER_TICK` (4096),
+   using the same global collect/sort/run order. Water/lava flow, fluid mixing
+   and fluid-related scheduled updates execute here.
 3. **Random block/fluid ticks** per active chunk section, using the same
    `getBlockRandomPos(..., 15)` and section semantics as vanilla
    `ServerLevel#tickChunk`, but without precipitation/thunder.
@@ -54,6 +56,12 @@ spawners and other host-world systems inside an empty copy.
 
 Only chunks in `activeChunks` (chunks that received copied blocks) are read.
 `getChunkNow`/`getAllEntities` paths never force a chunk load.
+
+The whole block-logic pass is limited to one run per `gameTime`. The auxiliary
+clock is a host-delegating `DerivedLevelData`, so it advances and freezes with
+the host. Saved sub-tick orders are relative bookkeeping only: restore assigns
+fresh monotonic orders in the captured priority/order sequence, exactly like
+vanilla pending ticks, and keeps delays relative to the current game time.
 
 ### Phases intentionally not run
 

@@ -656,6 +656,78 @@ world.removeConstraint(handle);
 - 删除刚体时，`BulletPhysicsWorld#removeBody` 会自动删除涉及该刚体的约束；
 - 世界锚定约束在 `rebaseOrigin` 后不会自动重写世界锚点，长距离重定位后建议重建这类约束。
 
+### 7.6 通过 native API 创建约束
+
+```java
+import io.mikaple.crythst.api.physics.PhysicsPipeline;
+import io.mikaple.crythst.api.physics.constraint.FixedConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.FreeConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.RotaryConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.StructureConstraintHandle;
+
+PhysicsPipeline pipeline = CrythstApi.physics(serverLevel);
+
+// 结构局部坐标；世界锚定时 side B 直接使用世界坐标。
+StructureConstraintHandle weld = pipeline.addConstraint(a, b,
+        FixedConstraintConfiguration.between(frameA, frameB));
+
+StructureConstraintHandle hinge = pipeline.addConstraint(a, b,
+        RotaryConstraintConfiguration.between(anchorA, axisA, anchorB, axisB)
+                .withLimits(-Math.PI / 2.0, Math.PI / 2.0)
+                .withMotor(1.5, 200.0)); // rad/s, N·m·s per step
+
+StructureConstraintHandle point = pipeline.addConstraint(a,
+        FreeConstraintConfiguration.toWorld(new Vector3d(100.0, 70.0, 0.0)));
+
+// 也可直接从结构创建：
+StructureConstraintHandle direct = a.addConstraint(b, config);
+StructureConstraintHandle world = a.addConstraintToWorld(config);
+List<StructureConstraintHandle> involvingA = a.constraints();
+a.removeConstraint(direct);
+
+hinge.configuration();   // 创建时的不可变配置
+hinge.structureA();
+hinge.bodyIdA();
+hinge.isWorldAnchored();
+hinge.setEnabled(false);
+```
+
+`GenericConstraintConfiguration` 是沿 frame 局部 X 轴的 prismatic/slider 子集，不是完整
+6-DOF。完整 6-DOF、每个轴独立限位/电机和约束持久化尚未实现；重载后需按结构稳定
+身份和保存的配置重建。
+
+### 7.7 松散箱体与绳索
+
+```java
+import io.mikaple.crythst.api.physics.box.StructureBoxDef;
+import io.mikaple.crythst.api.physics.box.StructureBoxObject;
+import io.mikaple.crythst.api.physics.rope.StructureRope;
+
+StructureBoxObject crate = pipeline.createBox(
+        StructureBoxDef.dynamic(new Vector3d(0.5, 0.5, 0.5),
+                new Vector3d(10.0, 65.0, 10.0))
+                .withMass(80.0)
+                .withDamping(0.05, 0.1));
+crate.applyImpulse(new Vector3d(0.0, 800.0, 0.0));
+crate.applyImpulseAt(new Vector3d(10.0, 65.5, 10.0), new Vector3d(10.0, 0.0, 0.0));
+crate.pose();
+crate.remove();
+
+StructureRope rope = StructureRope.between(pipeline,
+        shipA, new Vector3d(0.0, 0.5, 0.0),
+        shipB, new Vector3d(0.0, 0.5, 0.0));
+rope.setLength(3.0);       // m
+rope.setStiffness(20_000.0); // N/m
+rope.setDamping(1_000.0);    // N·s/m
+rope.setMaxTension(1_000_000.0); // N
+rope.isTaut();
+rope.tension();              // 上一子步张力，N
+rope.close();
+```
+
+绳索是子步级冲量绳，不是 Bullet 约束：会拉伸、依赖子步长、没有碰撞/自碰撞。
+需要完全刚性连接时使用点约束。箱体是普通 loose rigid body，没有体素/辅助 Level。
+
 ---
 
 ## 8. 角色控制器
@@ -1093,6 +1165,42 @@ EntityStructureTracking.clear(entity);
 
 ---
 
+### 18.5 StructureLevelView 的 Level-like 访问
+
+```java
+import io.mikaple.crythst.api.sublevel.view.StructureLevelView;
+
+StructureLevelView view = container.view(bodyId);
+view.getBlockState(localPos);
+view.getFluidState(localPos);
+view.getBlockEntity(localPos);
+view.setBlockAndUpdate(localPos, Blocks.STONE.defaultBlockState());
+view.removeBlock(localPos, false);
+view.registryAccess();
+
+view.dimension();
+view.gameTime();
+view.dayTime();
+view.random();
+
+var world = view.voxelCenterToWorld(x, y, z, new Vector3d());
+var local = view.worldBlockToLocal(worldBlock);
+var box = view.localVoxelBoxToWorldAabb(localVoxelBox); // 粗粒度旋转 AABB
+view.getEntitiesInLocalBox(localVoxelBox, null);
+view.addFreshEntityAtLocal(entity, localMetres);
+view.playSound(null, localPos, sound, SoundSource.BLOCKS, 1.0f, 1.0f);
+view.addParticle(particle, lx, ly, lz, 0.0, 0.0, 0.0);
+
+view.getChunkIfLoaded(localChunkX, localChunkZ); // 不加载 chunk
+view.isChunkLoaded(localChunkX, localChunkZ);
+view.isKeptLoaded(); // 是否有显式 loading ticket
+```
+
+所有 `BlockPos` 都是结构局部体素坐标，辅助 void Level 的 remap 不暴露。Server view
+可写并推进 epoch；client view 只读。实体属于主世界，没有结构实体容器。
+
+---
+
 ## 19. 世界方块组装与拆解
 
 ```java
@@ -1187,6 +1295,67 @@ public final class ThrusterBlockEntity extends BlockEntity
   不需要自己创建。它缓存每个 structure 每个 force group 的累加器，refresh/remove
   会丢弃缓存。
 
+### 20.1 力总量与质量查询
+
+```java
+import io.mikaple.crythst.api.physics.StructureMassTracker;
+import io.mikaple.crythst.api.physics.force.ForceTotals;
+
+ForceTotals totals = pipeline.forceTotals(structure);
+Vector3d totalForce = totals.force();          // N
+Vector3d totalTorque = totals.torque();        // N·m
+double magnitude = totals.forceMagnitude();
+for (ForceTotals.GroupForce group : totals.groups()) {
+    group.group();
+    group.forceNewtons();
+    group.torqueNewtonMetres();
+}
+
+StructureMassTracker mass = pipeline.massTracker(structure);
+double kg = mass.mass();
+double cellKg = mass.cellMass(1, 0, 3);
+double atWorld = mass.massAtWorld(worldPoint);
+Vector3d com = mass.centerOfMassWorld();
+int solidCells = mass.solidCellCount();
+```
+
+`ForceTotals` 只记录 actor force group 的力；直接 impulse 或 pre-step 事件施加的力不
+计入。总量在转 impulse 之前记录，单位保持 N / N·m。质量总量来自 collider（包含自定义
+形状与质量 hook）；逐格质量来自 volume，自定义 fractional collider 时两者可能不同。
+
+### 20.2 Lift / propeller actor
+
+```java
+import io.mikaple.crythst.api.block.BlockStructureLiftProvider;
+import io.mikaple.crythst.api.block.BlockStructurePropeller;
+
+public final class ThrusterBlockEntity extends BlockEntity
+        implements BlockStructureLiftProvider {
+    @Override
+    public Vector3dc structureLift(StructurePhysicsContext context) {
+        return new Vector3d(0.0, 500.0, 0.0); // N, world space
+    }
+}
+
+public final class PropellerBlockEntity extends BlockEntity
+        implements BlockStructurePropeller {
+    @Override
+    public double thrustNewtons(StructurePhysicsContext context) {
+        return 1_200.0;
+    }
+
+    @Override
+    public Vector3dc thrustAxisLocal() {
+        return new Vector3d(0.0, 1.0, 0.0); // 结构局部 +Y
+    }
+}
+```
+
+默认作用点是结构质心（无扭矩），默认 force group 是
+`BlockStructureLiftProvider.DEFAULT_LIFT_GROUP`。需要偏置作用点时覆盖
+`applicationPoint(context)`，用 `context.structurePose()` 做局部→世界转换。它们仍然
+依赖辅助空 Level 的 actor 发现，新增实现后需要 refresh/reindex。
+
 ---
 
 ## 21. 坐标 / 四元数工具
@@ -1207,14 +1376,72 @@ Quaternionf f = StructureMath.toMojang(jomlQuaternion);
 
 ---
 
-## 22. 新 API 的限制
+## 22. Loading tickets / Tracking points
+
+### 22.1 保活结构周围的主世界 chunk
+
+```java
+import io.mikaple.crythst.api.sublevel.ticket.StructureLoadingTickets;
+
+var ticket = StructureLoadingTickets.acquire(serverLevel, structure, 1);
+ticket.isValid();
+ticket.isRegionActive();     // 辅助 ticking region 是否存在
+ticket.chunkCount();         // 已 pin 的主世界 chunk 数
+ticket.refresh();            // 结构移动后重算
+ticket.release();            // 幂等
+
+StructureLoadingTickets.refreshAll(serverLevel);
+StructureLoadingTickets.tickets(serverLevel, structure.body().id());
+StructureLoadingTickets.pinnedChunkCount(serverLevel);
+```
+
+ticket 按 chunk 引用计数，多个句柄可共享。它只 pin **主世界** chunk；结构自身的辅助
+void region 只要结构存活就已经加载。ticket 不持久化，也不会阻止显式 removeStructure。
+
+### 22.2 持久化世界追踪点
+
+```java
+import io.mikaple.crythst.api.sublevel.tracking.StructureTrackingPoint;
+import io.mikaple.crythst.api.sublevel.tracking.StructureTrackingPoints;
+
+StructureTrackingPoints points = CrythstApi.trackingPoints(serverLevel);
+StructureTrackingPoint dock = points.add("dock", structure,
+        new Vector3d(1.0, 2.0, 3.0), true, 1); // keepLoaded, chunk radius
+
+points.get(dock.id());
+points.byName("dock");
+points.forStructure(structure.body().id());
+points.worldPosition(dock);
+points.nearest(worldPoint, 8.0);
+points.nearby(worldPoint, 16.0);
+
+points.refreshTickets();          // 世界重载/结构恢复后重新绑定
+points.captureWorldPositions();   // 刷新保存的世界坐标 fallback
+points.remove(dock);
+points.clear();
+```
+
+点保存在每 dimension 的 `SavedData` 中。解析顺序：当前 body id → 稳定结构身份
+（`StructureSavedData` 可用时）→ 保存的世界位置包含结构。`keepLoaded` 点为该结构
+持有 loading ticket。`StructureTrackingPoint#toTag/fromTag` 和
+`StructureTrackingPoints#writePoints/readPoints` 可用于工具与测试。
+
+---
+
+## 23. 新 API 的限制
 
 - 网络客户端容器返回 `ClientStructureSnapshot`，不是 `PhysicsStructure`；
-  `byId` / `containing` 在多人客户端不会解析网络快照。
+  `byId` / `containing` 在多人客户端不会解析网络快照。可用
+  `snapshotContaining` / `snapshotsIntersecting` 走不可变快照查询。
 - 组装是**世界空间**操作，不提供 plot / plot-yard / 第二 `Level` 视图。
 - actor 需要辅助空 Level；没有它就没有 actor 发现。
 - actor 发现和 force-group 缓存都需要 refresh/reindex/remove 来清理旧状态。
-- 尚未提供：constraints、ropes、box objects、loading tickets、tracking-point
-  SavedData、schematic 上下文、propeller/lift-provider、force totals/debug UI。
+- `StructureLevelView` 不是 `Level` 子类；entities 仍属于主世界，chunk 查询不加载
+  chunk，跨边界邻居图/光照/pathfinding 未实现。
+- 约束只提供 fixed/free/rotary/prismatic 子集；完整 6-DOF、约束持久化未实现。
+- 绳索是子步冲量绳，不是 solver 约束，会拉伸且没有碰撞。
+- loading ticket pin 的是主世界 chunk，不提供 Sable plot-region ticket 语义。
+- 尚未提供：schematic 上下文、完整 force-group debug 面板、block-entity render
+  dispatch、Sable 二进制 shim。
 - 不提供 `dev.ryanhcode.sable.*` shim，也不是 Create Aeronautics 的二进制 drop-in
   替代。完整差距矩阵见 [`API_GAP_ANALYSIS.md`](../API_GAP_ANALYSIS.md)。
