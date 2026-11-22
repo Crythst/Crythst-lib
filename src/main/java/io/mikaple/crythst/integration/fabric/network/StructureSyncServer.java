@@ -1,9 +1,15 @@
 package io.mikaple.crythst.integration.fabric.network;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.network.structure.StructureBlockEntity;
+import io.mikaple.crythst.network.structure.StructureBlockEntityDelta;
+import io.mikaple.crythst.network.structure.StructureBlockEntityPayload;
+import io.mikaple.crythst.network.structure.StructureBlockEntityUpdate;
 import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureRequestPayload;
@@ -13,7 +19,9 @@ import io.mikaple.crythst.network.structure.StructureSyncDebug;
 import io.mikaple.crythst.network.structure.StructureSyncLimits;
 import io.mikaple.crythst.network.structure.StructureSyncProtocol;
 import io.mikaple.crythst.network.structure.StructureTooLargeException;
+import io.mikaple.crythst.network.structure.StructureVoxelPos;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
+import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLevelEvents;
@@ -21,6 +29,8 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
@@ -46,7 +56,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The authoritative structure list lives in {@link LevelPhysics}. This class
  * never mutates it; once per server tick it diffs a cheap fingerprint
  * (pose, volume identity, collider identity) and sends snapshots, removals and
- * batched pose updates to players in the same dimension.</p>
+ * batched pose updates to players in the same dimension. Block-entity NBT is
+ * captured only when the structure's block-entity revision or a chest opener
+ * count changes, and is sent as a minimal dirty set on a separate versioned
+ * payload.</p>
  *
  * <p>Every full sync assigns a fresh per-player {@code syncId}. All subsequent
  * pose/removal packets carry that id, so body ids that collide across
@@ -65,6 +78,7 @@ public final class StructureSyncServer {
     private static final Set<UUID> SYNCED_PLAYERS = new HashSet<>();
 
     private static final AtomicLong NEXT_SYNC_ID = new AtomicLong();
+    private static final AtomicLong NEXT_BLOCK_ENTITY_REVISION = new AtomicLong();
     private static final AtomicBoolean TICK_REGISTERED = new AtomicBoolean();
 
     private static boolean registered;
@@ -74,6 +88,10 @@ public final class StructureSyncServer {
     private static long sentPoseUpdates;
     private static long sentRemovalBatches;
     private static long sentRemovals;
+    private static long sentBlockEntityPayloads;
+    private static long sentBlockEntityUpdates;
+    private static long sentBlockEntityEntries;
+    private static long skippedBlockEntityEntries;
     private static long skippedBodies;
     private static String lastError = "";
 
@@ -149,11 +167,14 @@ public final class StructureSyncServer {
             final List<StructureSnapshot> added = new ArrayList<>();
             final List<Long> removed = new ArrayList<>();
             final List<StructurePosePayload.PoseUpdate> poses = new ArrayList<>();
-            diff(physics, state, added, removed, poses);
+            final List<StructureBlockEntityUpdate> blockEntityUpdates = new ArrayList<>();
+            diff(physics, state, added, removed, poses, blockEntityUpdates);
 
-            if (StructureSyncDebug.enabled() && (!added.isEmpty() || !removed.isEmpty() || !poses.isEmpty())) {
-                StructureSyncDebug.log("tick {} added={} removed={} poses={}",
-                        level.dimension().identifier(), added.size(), removed.size(), poses.size());
+            if (StructureSyncDebug.enabled() && (!added.isEmpty() || !removed.isEmpty()
+                    || !poses.isEmpty() || !blockEntityUpdates.isEmpty())) {
+                StructureSyncDebug.log("tick {} added={} removed={} poses={} blockEntities={}",
+                        level.dimension().identifier(), added.size(), removed.size(), poses.size(),
+                        blockEntityUpdates.size());
             }
 
             if (players.isEmpty()) {
@@ -183,6 +204,9 @@ public final class StructureSyncServer {
                     delivered = sendSnapshotBatches(player, added,
                             level.dimension().identifier(), syncId, false);
                 }
+                if (delivered && !blockEntityUpdates.isEmpty()) {
+                    delivered = sendBlockEntityUpdates(player, blockEntityUpdates, syncId);
+                }
                 if (delivered && !poses.isEmpty()) {
                     delivered = sendPoses(player, poses, syncId);
                 }
@@ -205,7 +229,8 @@ public final class StructureSyncServer {
     private static void diff(LevelPhysics physics, LevelState state,
                              List<StructureSnapshot> added,
                              List<Long> removed,
-                             List<StructurePosePayload.PoseUpdate> poses) {
+                             List<StructurePosePayload.PoseUpdate> poses,
+                             List<StructureBlockEntityUpdate> blockEntityUpdates) {
         final Map<Long, PhysicsStructure> current = new HashMap<>();
         if (physics != null) {
             for (PhysicsStructure structure : physics.structures()) {
@@ -218,6 +243,7 @@ public final class StructureSyncServer {
         for (Long bodyId : List.copyOf(state.tracked.keySet())) {
             if (!current.containsKey(bodyId)) {
                 state.tracked.remove(bodyId);
+                state.blockEntities.remove(bodyId);
                 if (state.sent.remove(bodyId)) {
                     removed.add(bodyId);
                 }
@@ -230,18 +256,28 @@ public final class StructureSyncServer {
                     structure.pose(), structure.volume(), structure.collider());
             final TrackedStructure previous = state.tracked.put(bodyId, now);
 
-            if (previous == null
+            final boolean geometryChanged = previous == null
                     || previous.volume() != now.volume()
-                    || previous.collider() != now.collider()) {
+                    || previous.collider() != now.collider();
+            boolean publishable = true;
+            if (geometryChanged) {
                 if (capture(structure, added)) {
                     state.sent.add(bodyId);
-                } else if (state.sent.remove(bodyId)) {
-                    // The client has an older snapshot that we can no longer
-                    // represent; drop it instead of leaving stale blocks.
-                    removed.add(bodyId);
+                } else {
+                    publishable = false;
+                    state.blockEntities.remove(bodyId);
+                    if (state.sent.remove(bodyId)) {
+                        // The client has an older snapshot that we can no longer
+                        // represent; drop it instead of leaving stale blocks.
+                        removed.add(bodyId);
+                    }
                 }
             } else if (state.sent.contains(bodyId) && poseChanged(previous.pose(), now.pose())) {
                 poses.add(new StructurePosePayload.PoseUpdate(bodyId, now.pose()));
+            }
+
+            if (publishable && state.sent.contains(bodyId)) {
+                queueBlockEntityUpdate(physics, structure, state, geometryChanged, blockEntityUpdates);
             }
         }
     }
@@ -283,6 +319,232 @@ public final class StructureSyncServer {
         return snapshots;
     }
 
+    /**
+     * Captures the authoritative block-entity map for a structure on the server
+     * thread and applies the per-entry and per-structure size caps.
+     *
+     * <p>Non-loading: the auxiliary void level only inspects registered
+     * block-entity positions. When no auxiliary level exists (for example a
+     * headless test or a restored structure that has not been attached yet) the
+     * persistence side table is used instead.</p>
+     */
+    private static Map<StructureVoxelPos, StructureBlockEntityDelta.Value> captureBlockEntityValues(
+            LevelPhysics physics, PhysicsStructure structure) {
+        Map<BlockPos, CompoundTag> raw;
+        Map<BlockPos, Integer> openCounts = Map.of();
+        try {
+            final EmptyPhysicsLevel auxiliary = physics == null ? null : physics.auxiliaryLevel();
+            if (auxiliary != null) {
+                raw = auxiliary.captureBlockEntities(structure);
+                openCounts = auxiliary.captureBlockEntityOpenCounts(structure);
+            } else {
+                raw = StructureBlockEntityData.get(structure);
+            }
+        } catch (RuntimeException e) {
+            lastError = "block entities for body #" + structure.body().id() + ": " + e;
+            Crythst.LOGGER.warn("Could not capture block entities for structure body #{}",
+                    structure.body().id(), e);
+            return Map.of();
+        }
+        if (raw == null || raw.isEmpty()) {
+            return Map.of();
+        }
+
+        final IntBounds3 bounds = structure.volume().bounds();
+        final List<Map.Entry<BlockPos, CompoundTag>> sorted = new ArrayList<>(raw.entrySet());
+        sorted.sort(java.util.Comparator
+                .comparingInt((Map.Entry<BlockPos, CompoundTag> entry) -> entry.getKey().getX())
+                .thenComparingInt(entry -> entry.getKey().getY())
+                .thenComparingInt(entry -> entry.getKey().getZ()));
+
+        final Map<StructureVoxelPos, StructureBlockEntityDelta.Value> result = new java.util.LinkedHashMap<>();
+        long totalBytes = 0L;
+        for (Map.Entry<BlockPos, CompoundTag> entry : sorted) {
+            final BlockPos local = entry.getKey();
+            final CompoundTag data = entry.getValue();
+            if (local == null || data == null) {
+                continue;
+            }
+            final int entryBytes = 8 + data.sizeInBytes() + 15;
+            if (data.sizeInBytes() > StructureSyncLimits.MAX_BLOCK_ENTITY_ENTRY_BYTES) {
+                skippedBlockEntityEntries++;
+                lastError = "block entity at " + local + " of body #" + structure.body().id()
+                        + " exceeds " + StructureSyncLimits.MAX_BLOCK_ENTITY_ENTRY_BYTES + " bytes";
+                continue;
+            }
+            if (result.size() >= StructureSyncLimits.MAX_BLOCK_ENTITY_ENTRIES
+                    || totalBytes + entryBytes
+                    > StructureSyncLimits.MAX_BLOCK_ENTITY_BYTES_PER_STRUCTURE) {
+                skippedBlockEntityEntries++;
+                lastError = "block-entity budget for body #" + structure.body().id() + " exceeded";
+                continue;
+            }
+            if (local.getX() < 0 || local.getY() < 0 || local.getZ() < 0) {
+                // Defensive: side tables store bounds-relative keys.
+                continue;
+            }
+            final int openCount = openCounts.getOrDefault(
+                    new BlockPos(bounds.minX() + local.getX(),
+                            bounds.minY() + local.getY(),
+                            bounds.minZ() + local.getZ()),
+                    -1);
+            result.put(new StructureVoxelPos(local.getX(), local.getY(), local.getZ()),
+                    new StructureBlockEntityDelta.Value(data, openCount));
+            totalBytes += entryBytes;
+        }
+        return StructureBlockEntityDelta.copyOf(result);
+    }
+
+    /**
+     * Captures only the transient chest opener counts. This is cheap (it visits
+     * registered block-entity positions but does not serialise NBT) and lets
+     * the diff run every tick without re-reading inventories.
+     */
+    private static Map<StructureVoxelPos, Integer> captureBlockEntityOpenCounts(
+            LevelPhysics physics, PhysicsStructure structure) {
+        final EmptyPhysicsLevel auxiliary = physics == null ? null : physics.auxiliaryLevel();
+        if (auxiliary == null) {
+            return Map.of();
+        }
+        try {
+            final Map<BlockPos, Integer> live = auxiliary.captureBlockEntityOpenCounts(structure);
+            if (live == null || live.isEmpty()) {
+                return Map.of();
+            }
+            final IntBounds3 bounds = structure.volume().bounds();
+            final Map<StructureVoxelPos, Integer> result = new HashMap<>();
+            for (Map.Entry<BlockPos, Integer> entry : live.entrySet()) {
+                final BlockPos absolute = entry.getKey();
+                final int x = absolute.getX() - bounds.minX();
+                final int y = absolute.getY() - bounds.minY();
+                final int z = absolute.getZ() - bounds.minZ();
+                if (x < 0 || y < 0 || z < 0) {
+                    continue;
+                }
+                result.put(new StructureVoxelPos(x, y, z), entry.getValue());
+            }
+            return Map.copyOf(result);
+        } catch (RuntimeException e) {
+            lastError = "block-entity animation for body #" + structure.body().id() + ": " + e;
+            return Map.of();
+        }
+    }
+
+    private static Map<StructureVoxelPos, StructureBlockEntityDelta.Value> withOpenCounts(
+            Map<StructureVoxelPos, StructureBlockEntityDelta.Value> values,
+            Map<StructureVoxelPos, Integer> openCounts) {
+        final Map<StructureVoxelPos, StructureBlockEntityDelta.Value> updated = new HashMap<>();
+        for (Map.Entry<StructureVoxelPos, StructureBlockEntityDelta.Value> entry : values.entrySet()) {
+            final Integer openCount = openCounts.get(entry.getKey());
+            updated.put(entry.getKey(), openCount == null
+                    ? entry.getValue()
+                    : entry.getValue().withOpenCount(openCount));
+        }
+        return StructureBlockEntityDelta.copyOf(updated);
+    }
+
+    private static void queueBlockEntityUpdate(LevelPhysics physics, PhysicsStructure structure,
+                                               LevelState state, boolean forceFull,
+                                               List<StructureBlockEntityUpdate> out) {
+        final long bodyId = structure.body().id();
+        BodyBlockEntities previous = state.blockEntities.get(bodyId);
+        if (!forceFull && previous == null) {
+            forceFull = true;
+        }
+
+        final Map<StructureVoxelPos, Integer> liveOpenCounts =
+                captureBlockEntityOpenCounts(physics, structure);
+        final boolean sourceChanged = previous == null
+                || previous.sourceRevision() != structure.blockEntityRevision();
+        if (!forceFull && previous != null
+                && !sourceChanged
+                && previous.openCounts().equals(liveOpenCounts)) {
+            return;
+        }
+
+        final Map<StructureVoxelPos, StructureBlockEntityDelta.Value> current;
+        if (!forceFull && previous != null && !sourceChanged) {
+            // Animation-only change: update opener counts in place and skip
+            // serialising inventories/signs entirely.
+            current = withOpenCounts(previous.values(), liveOpenCounts);
+        } else {
+            current = captureBlockEntityValues(physics, structure);
+        }
+
+        final boolean startingFull = forceFull;
+        List<StructureBlockEntity> entries;
+        List<StructureVoxelPos> removed;
+        if (startingFull) {
+            entries = StructureBlockEntityDelta.fullEntries(current);
+            removed = List.of();
+            if (entries.isEmpty() && previous == null) {
+                return;
+            }
+        } else {
+            final StructureBlockEntityDelta.Result delta =
+                    StructureBlockEntityDelta.compute(previous.values(), current);
+            if (delta.isEmpty()) {
+                // Source revision can change for non-renderable state; keep the
+                // new revision so we do not re-capture every tick.
+                state.blockEntities.put(bodyId, new BodyBlockEntities(
+                        previous.revision(), current,
+                        structure.blockEntityRevision(), liveOpenCounts));
+                return;
+            }
+            entries = delta.changed();
+            removed = delta.removed();
+        }
+
+        final long revision = NEXT_BLOCK_ENTITY_REVISION.incrementAndGet();
+        final long baseRevision = previous == null ? 0L : previous.revision();
+        try {
+            final List<StructureBlockEntityUpdate> fragments =
+                    StructureSyncProtocol.fragmentBlockEntityUpdate(bodyId, baseRevision, revision,
+                            startingFull, entries, removed);
+            out.addAll(fragments);
+            state.blockEntities.put(bodyId, new BodyBlockEntities(
+                    revision, current, structure.blockEntityRevision(), liveOpenCounts));
+        } catch (StructureTooLargeException e) {
+            skippedBlockEntityEntries++;
+            lastError = e.getMessage();
+            Crythst.LOGGER.warn("Not syncing structure block entities: {}", e.getMessage());
+        } catch (RuntimeException e) {
+            skippedBlockEntityEntries++;
+            lastError = "block entities for body #" + bodyId + ": " + e;
+            Crythst.LOGGER.warn("Could not build block-entity update for body #{}", bodyId, e);
+        }
+    }
+
+    private static List<StructureBlockEntityUpdate> fullBlockEntityUpdates(
+            LevelState state, List<StructureSnapshot> snapshots) {
+        final List<StructureBlockEntityUpdate> updates = new ArrayList<>();
+        if (state == null) {
+            return updates;
+        }
+        // Reuse the last globally published revision. Advancing it during a
+        // single player's full sync would desynchronise every other player,
+        // because dirty updates carry the global revision as their base.
+        for (StructureSnapshot snapshot : snapshots) {
+            final BodyBlockEntities published = state.blockEntities.get(snapshot.bodyId());
+            if (published == null || published.values().isEmpty()) {
+                // No block entities have been published yet. The next tick's
+                // diff creates the first revision for every player.
+                continue;
+            }
+            final List<StructureBlockEntity> entries =
+                    StructureBlockEntityDelta.fullEntries(published.values());
+            try {
+                updates.addAll(StructureSyncProtocol.fragmentBlockEntityUpdate(
+                        snapshot.bodyId(), 0L, published.revision(), true, entries, List.of()));
+            } catch (StructureTooLargeException e) {
+                skippedBlockEntityEntries++;
+                lastError = e.getMessage();
+                Crythst.LOGGER.warn("Not syncing structure block entities: {}", e.getMessage());
+            }
+        }
+        return updates;
+    }
+
     private static boolean sendFullSync(ServerPlayer player, LevelPhysics physics) {
         final boolean canSend;
         try {
@@ -306,12 +568,19 @@ public final class StructureSyncServer {
         final Identifier dimension = physics != null
                 ? physics.level().dimension().identifier()
                 : player.level().dimension().identifier();
+        final LevelState state = physics == null ? null
+                : LEVEL_STATES.computeIfAbsent(physics.level().dimension(), key -> new LevelState());
+        final List<StructureBlockEntityUpdate> blockEntityUpdates =
+                fullBlockEntityUpdates(state, snapshots);
         if (!sendSnapshotBatches(player, snapshots, dimension, syncId, true)) {
             return false;
         }
+        if (!blockEntityUpdates.isEmpty() && !sendBlockEntityUpdates(player, blockEntityUpdates, syncId)) {
+            return false;
+        }
         PLAYER_SYNC_IDS.put(player.getUUID(), syncId);
-        StructureSyncDebug.log("full sync -> {} dimension={} sync={} structures={}",
-                player.getUUID(), dimension, syncId, snapshots.size());
+        StructureSyncDebug.log("full sync -> {} dimension={} sync={} structures={} blockEntityFragments={}",
+                player.getUUID(), dimension, syncId, snapshots.size(), blockEntityUpdates.size());
         return true;
     }
 
@@ -354,6 +623,42 @@ public final class StructureSyncServer {
             }
             sentRemovalBatches++;
             sentRemovals += ids.length;
+        }
+        return true;
+    }
+
+    private static boolean sendBlockEntityUpdates(ServerPlayer player,
+                                                  List<StructureBlockEntityUpdate> updates,
+                                                  long syncId) {
+        // A v2 client has no receiver for this channel. Skip block entities
+        // instead of disconnecting it; geometry and poses still work.
+        final boolean canSend;
+        try {
+            canSend = ServerPlayNetworking.canSend(player, StructureBlockEntityPayload.TYPE);
+        } catch (RuntimeException e) {
+            lastError = "block-entity channel query: " + e;
+            return false;
+        }
+        if (!canSend) {
+            return true;
+        }
+        final List<List<StructureBlockEntityUpdate>> batches;
+        try {
+            batches = StructureSyncProtocol.batchBlockEntityUpdates(updates);
+        } catch (StructureTooLargeException e) {
+            lastError = e.getMessage();
+            Crythst.LOGGER.warn("Could not batch structure block entities: {}", e.getMessage());
+            return false;
+        }
+        for (List<StructureBlockEntityUpdate> batch : batches) {
+            if (!send(player, new StructureBlockEntityPayload(syncId, batch))) {
+                return false;
+            }
+            sentBlockEntityPayloads++;
+            sentBlockEntityUpdates += batch.size();
+            for (StructureBlockEntityUpdate update : batch) {
+                sentBlockEntityEntries += update.entries().size();
+            }
         }
         return true;
     }
@@ -412,6 +717,10 @@ public final class StructureSyncServer {
                 .append(" poseUpdates=").append(sentPoseUpdates)
                 .append(" removalBatches=").append(sentRemovalBatches)
                 .append(" removals=").append(sentRemovals)
+                .append(" blockEntityPayloads=").append(sentBlockEntityPayloads)
+                .append(" blockEntityFragments=").append(sentBlockEntityUpdates)
+                .append(" blockEntityEntries=").append(sentBlockEntityEntries)
+                .append(" blockEntitySkipped=").append(skippedBlockEntityEntries)
                 .append(" skipped=").append(skippedBodies)
                 .append(" lastError=").append(lastError.isEmpty() ? "none" : lastError);
         for (Map.Entry<ResourceKey<Level>, LevelState> entry : LEVEL_STATES.entrySet()) {
@@ -435,6 +744,10 @@ public final class StructureSyncServer {
         sentPoseUpdates = 0L;
         sentRemovalBatches = 0L;
         sentRemovals = 0L;
+        sentBlockEntityPayloads = 0L;
+        sentBlockEntityUpdates = 0L;
+        sentBlockEntityEntries = 0L;
+        skippedBlockEntityEntries = 0L;
         skippedBodies = 0L;
         lastError = "";
     }
@@ -442,8 +755,16 @@ public final class StructureSyncServer {
     private record TrackedStructure(Transform3d pose, VoxelVolume volume, VoxelColliderData collider) {
     }
 
+    private record BodyBlockEntities(
+            long revision,
+            Map<StructureVoxelPos, StructureBlockEntityDelta.Value> values,
+            long sourceRevision,
+            Map<StructureVoxelPos, Integer> openCounts) {
+    }
+
     private static final class LevelState {
         private final Map<Long, TrackedStructure> tracked = new HashMap<>();
         private final Set<Long> sent = new HashSet<>();
+        private final Map<Long, BodyBlockEntities> blockEntities = new HashMap<>();
     }
 }

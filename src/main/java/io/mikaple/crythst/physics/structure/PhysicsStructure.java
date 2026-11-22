@@ -506,6 +506,22 @@ public final class PhysicsStructure implements AutoCloseable {
         return true;
     }
 
+    /**
+     * Removes every joint involving this structure and returns the number that
+     * were live. Normally unnecessary because closing the body also removes its
+     * joints, but useful before an explicit rebuild/replacement.
+     */
+    public int removeAllConstraints() {
+        int removed = 0;
+        for (StructureConstraintHandle constraint : constraints()) {
+            if (constraint.isValid() && constraint.involves(this)) {
+                constraint.remove();
+                removed++;
+            }
+        }
+        return removed;
+    }
+
     public void close() {
         if (closed) {
             return;

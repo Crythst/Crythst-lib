@@ -161,6 +161,35 @@ public final class PhysicsPipeline {
     }
 
     /**
+     * Removes every constraint involving a structure.
+     *
+     * <p>Useful before replacing/rebuilding a body when callers want the
+     * removal to happen explicitly rather than relying on backend body removal.
+     * Safe to call with a structure that has no constraints.</p>
+     *
+     * @param structure structure whose joints should be removed
+     * @return the number of live constraints removed
+     * @throws IllegalArgumentException when the structure belongs to another
+     *                                  physics world or level
+     */
+    public int removeConstraints(PhysicsStructure structure) {
+        if (structure == null) {
+            throw new NullPointerException("structure");
+        }
+        if (structure.world() != levelPhysics.world()) {
+            throw new IllegalArgumentException("structure belongs to a different physics world");
+        }
+        int removed = 0;
+        for (StructureConstraintHandle handle : constraints()) {
+            if (handle.isValid() && handle.involves(structure)) {
+                handle.remove();
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    /**
      * Returns handles for all constraints in the world, including joints created
      * through the raw physics world.
      *

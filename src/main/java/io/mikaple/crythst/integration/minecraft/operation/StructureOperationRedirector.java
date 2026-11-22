@@ -6,6 +6,7 @@ import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.gameevent.StructurePlayerProgress;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureInteraction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructurePlacementValidation;
@@ -245,6 +246,7 @@ public final class StructureOperationRedirector {
         final BlockPos pos = mapped.live().pos();
         final BlockState state = mapped.live().state();
         final BlockHitResult auxiliaryHit = mapped.auxiliaryHit();
+        final ItemStack usedStack = stack.copy();
 
         // Vanilla ServerPlayerGameMode.useItemOn skips block use entirely while
         // sneaking with a non-empty hand, so Shift+right-click places a block
@@ -269,10 +271,16 @@ public final class StructureOperationRedirector {
                 final InteractionResult empty = state.useWithoutItem(
                         auxiliary, player, auxiliaryHit);
                 if (empty != null && empty.consumesAction()) {
+                    StructurePlayerProgress.triggerDefaultBlockUse(player,
+                            mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                            mapped.voxelZ());
                     return empty;
                 }
             }
             if (result.consumesAction()) {
+                StructurePlayerProgress.triggerItemUsedOnBlock(player,
+                        mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                        mapped.voxelZ(), usedStack);
                 return result;
             }
         }
@@ -286,6 +294,11 @@ public final class StructureOperationRedirector {
                 auxiliary, player, hand, stack, auxiliaryHit));
         if (player.hasInfiniteMaterials() && stack.getCount() != count) {
             stack.setCount(count);
+        }
+        if (item != null && item.consumesAction()) {
+            StructurePlayerProgress.triggerItemUsedOnBlock(player,
+                    mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                    mapped.voxelZ(), usedStack);
         }
         return item == null ? result : item;
     }
@@ -320,6 +333,11 @@ public final class StructureOperationRedirector {
         try {
             final InteractionResult interaction = mapped.live().state().useWithoutItem(
                     mapped.live().level(), player, mapped.auxiliaryHit());
+            if (interaction != null && interaction.consumesAction()) {
+                StructurePlayerProgress.triggerDefaultBlockUse(player,
+                        mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                        mapped.voxelZ());
+            }
             return new Result(Status.HANDLED, interaction);
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level useWithoutItem failed for structure body #{}",

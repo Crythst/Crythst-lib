@@ -1,4 +1,4 @@
-# Multiplayer structure sync (v2)
+# Multiplayer structure sync (v3)
 
 Crythst can mirror server-side physics structures to clients. The server owns the
 authoritative bodies and voxel volumes; clients receive immutable snapshots and
@@ -10,7 +10,8 @@ This first protocol version is intentionally pragmatic:
 - end-of-tick diffs for additions, removals, volume changes and poses,
 - compact palette + VarInt voxel cells,
 - batched snapshots within the vanilla ~1 MiB custom-payload limit,
-- **no block-entity NBT yet**.
+- block-entity NBT/animation sync in a separate dirty-update payload. See
+  [`multiplayer-block-entities.md`](multiplayer-block-entities.md).
 
 ## Files
 
@@ -18,7 +19,7 @@ This first protocol version is intentionally pragmatic:
 | --- | --- |
 | Wire records and codecs | `io.mikaple.crythst.network.structure.*` |
 | Server broadcaster / registration | `io.mikaple.crythst.integration.fabric.network.StructureSync`, `StructureSyncServer`, `StructureSyncClient`, `StructureSnapshotFactory` |
-| Client cache | `io.mikaple.crythst.client.network.ClientStructureCache`, `ClientStructureSnapshot` |
+| Client cache | `io.mikaple.crythst.client.network.ClientStructureCache`, `ClientStructureSnapshot`, `ClientBlockEntitySnapshot` |
 | Codec test | `src/test/java/io/mikaple/crythst/network/structure/StructurePayloadCodecTest.java` |
 
 ## Channels
@@ -29,6 +30,7 @@ both physical sides.
 | Channel | Direction | Record | Purpose |
 | --- | --- | --- | --- |
 | `crythst:structure_snapshot` | S2C | `StructureSnapshotPayload` | full or delta snapshots, one or more structures |
+| `crythst:structure_block_entities` | S2C | `StructureBlockEntityPayload` | dirty/full block-entity NBT and chest animation |
 | `crythst:structure_pose` | S2C | `StructurePosePayload` | batched pose updates for known body ids |
 | `crythst:structure_remove` | S2C | `StructureRemovePayload` | remove body ids from the client cache |
 | `crythst:structure_request` | C2S | `StructureRequestPayload` | ask for a fresh full snapshot |
@@ -143,7 +145,7 @@ Constants live in `StructureSyncLimits`.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `PROTOCOL_VERSION` | 2 | bump when layouts change |
+| `PROTOCOL_VERSION` | 3 | bump when layouts change |
 | `MAX_CELLS` | 1,048,576 | maximum voxels in one structure |
 | `MAX_PALETTE` | 4,096 | maximum distinct block states |
 | `MAX_STRUCTURES_PER_BATCH` | 4,096 | structures / removals per packet |
@@ -154,7 +156,7 @@ Constants live in `StructureSyncLimits`.
 
 Snapshots are batched **at structure granularity**: a batch is flushed before
 the next structure would exceed `TARGET_BATCH_BYTES`. There is no intra-structure
-chunking in v2, so a single structure larger than `MAX_STRUCTURE_BYTES` (or
+chunking in v3, so a single structure larger than `MAX_STRUCTURE_BYTES` (or
 larger than `MAX_CELLS`) is skipped and logged by the server instead of
 disconnecting the client. If intra-structure chunking is added later, it should
 extend `StructureSnapshotPayload` with a volume chunk index rather than change
@@ -295,9 +297,10 @@ whether the client is on the same session/dimension as the server.
   The palette uses `Block.getId(state)` / `Block.stateById(id)`. Client and
   server must have the same block registry. A future version should send block
   registry names plus property values for cross-version compatibility.
-- **No block entities in v2.** Chests, signs, spawners, etc. render as their
-  block state only. Their NBT is not sent. Adding a BE map will bump
-  `PROTOCOL_VERSION`.
+- **Block entities have their own v3 payload.** Chests, signs, spawners, etc.
+  render with their real block-entity renderer when the server can capture their
+  NBT. Extremely large or non-serialisable modded state falls back to the block
+  model; see [`multiplayer-block-entities.md`](multiplayer-block-entities.md).
 - **Mutable volume states come from the interaction side table.**
   `MutableVoxelVolume` only exposes solidity, so after the `BlockVoxelVolume`
   case `StructureSnapshotFactory` reads `StructureBlockStates` and falls back to
@@ -330,7 +333,7 @@ whether the client is on the same session/dimension as the server.
   permission check if the server is exposed to untrusted clients.
 - **No compression.** Palettes and VarInt cells keep the common case small, but
   a large heterogeneous structure can approach the cap. Compression can be
-  added as a new payload flag without breaking v2 decoding if negotiated.
+  added as a new payload flag without breaking v3 decoding if negotiated.
 - **One snapshot per changed structure.** Edits during a tick are coalesced at
   the next `END_SERVER_TICK`; intermediate states are never sent.
 

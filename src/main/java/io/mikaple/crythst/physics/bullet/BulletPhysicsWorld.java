@@ -10,11 +10,14 @@ import com.jme3.bullet.collision.shapes.CollisionShape;
 import com.jme3.bullet.collision.shapes.ConvexShape;
 import com.jme3.bullet.joints.HingeJoint;
 import com.jme3.bullet.joints.JointEnd;
+import com.jme3.bullet.joints.New6Dof;
 import com.jme3.bullet.joints.PhysicsJoint;
 import com.jme3.bullet.joints.Point2PointJoint;
 import com.jme3.bullet.joints.SixDofJoint;
 import com.jme3.bullet.joints.SliderJoint;
+import com.jme3.bullet.joints.motors.MotorParam;
 import com.jme3.bullet.objects.PhysicsRigidBody;
+import com.jme3.bullet.RotationOrder;
 import com.jme3.math.Matrix3f;
 import com.jme3.math.Quaternion;
 import com.jme3.math.Vector3f;
@@ -34,6 +37,7 @@ import io.mikaple.crythst.physics.constraint.ConstraintType;
 import io.mikaple.crythst.physics.constraint.FixedConstraintDef;
 import io.mikaple.crythst.physics.constraint.HingeConstraintDef;
 import io.mikaple.crythst.physics.constraint.PointConstraintDef;
+import io.mikaple.crythst.physics.constraint.SixDofConstraintDef;
 import io.mikaple.crythst.physics.constraint.SliderConstraintDef;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.query.RayHit;
@@ -237,14 +241,23 @@ public final class BulletPhysicsWorld implements PhysicsWorld {
     public ConstraintHandle addConstraint(ConstraintDef definition) {
         ensureOpen();
         Objects.requireNonNull(definition, "definition");
-        final BulletBodyHandle a = requireBody(definition instanceof FixedConstraintDef fixed ? fixed.bodyA()
-                : definition instanceof HingeConstraintDef hinge ? hinge.bodyA()
-                : definition instanceof SliderConstraintDef slider ? slider.bodyA()
-                : ((PointConstraintDef) definition).bodyA());
-        final BodyHandle rawB = definition instanceof FixedConstraintDef fixed ? fixed.bodyB()
-                : definition instanceof HingeConstraintDef hinge ? hinge.bodyB()
-                : definition instanceof SliderConstraintDef slider ? slider.bodyB()
-                : ((PointConstraintDef) definition).bodyB();
+        final BodyHandle rawA = switch (definition) {
+            case FixedConstraintDef fixed -> fixed.bodyA();
+            case HingeConstraintDef hinge -> hinge.bodyA();
+            case SliderConstraintDef slider -> slider.bodyA();
+            case PointConstraintDef point -> point.bodyA();
+            case SixDofConstraintDef sixDof -> sixDof.bodyA();
+            default -> throw new IllegalArgumentException("Unsupported constraint definition: " + definition);
+        };
+        final BodyHandle rawB = switch (definition) {
+            case FixedConstraintDef fixed -> fixed.bodyB();
+            case HingeConstraintDef hinge -> hinge.bodyB();
+            case SliderConstraintDef slider -> slider.bodyB();
+            case PointConstraintDef point -> point.bodyB();
+            case SixDofConstraintDef sixDof -> sixDof.bodyB();
+            default -> throw new IllegalArgumentException("Unsupported constraint definition: " + definition);
+        };
+        final BulletBodyHandle a = requireBody(rawA);
         final BulletBodyHandle b = rawB == null ? null : requireBody(rawB);
         if (b != null && b == a) {
             throw new IllegalArgumentException("A joint needs two distinct bodies");
@@ -256,6 +269,7 @@ public final class BulletPhysicsWorld implements PhysicsWorld {
             case HINGE -> createHinge((HingeConstraintDef) definition, a, b);
             case SLIDER -> createSlider((SliderConstraintDef) definition, a, b);
             case POINT -> createPoint((PointConstraintDef) definition, a, b);
+            case SIX_DOF -> createSixDof((SixDofConstraintDef) definition, a, b);
         };
 
         space.addJoint(joint);
@@ -351,6 +365,52 @@ public final class BulletPhysicsWorld implements PhysicsWorld {
                 BulletConversions.toVector3f(def.pivotB(), new Vector3f()));
     }
 
+    private New6Dof createSixDof(SixDofConstraintDef def, BulletBodyHandle a, BulletBodyHandle b) {
+        final Vector3f pivotA = pivot(def.frameA());
+        final Matrix3f basisA = basis(def.frameA());
+        final New6Dof joint;
+        if (b == null) {
+            final Vector3f pivotWorld = BulletConversions.toLocal(def.frameB().position(), origin, new Vector3f());
+            // libbulletjme's single-ended constructor takes the constrained body
+            // as the B end and the missing side as physics/world space.
+            joint = new New6Dof(a.bulletBody(), pivotA, pivotWorld, basisA,
+                    basis(def.frameB()), RotationOrder.XYZ);
+        } else {
+            joint = new New6Dof(a.bulletBody(), b.bulletBody(), pivotA, pivot(def.frameB()),
+                    basisA, basis(def.frameB()), RotationOrder.XYZ);
+        }
+        joint.setFeedback(true);
+        for (int dofIndex = 0; dofIndex < 6; dofIndex++) {
+            configureDof(joint, dofIndex, def.axis(dofIndex));
+        }
+        return joint;
+    }
+
+    private static void configureDof(New6Dof joint, int dofIndex,
+                                     io.mikaple.crythst.physics.constraint.DofAxisDef axis) {
+        if (axis.freeAxis()) {
+            // Bullet represents a free axis as lowerLimit > upperLimit.
+            joint.set(MotorParam.LowerLimit, dofIndex, 1.0f);
+            joint.set(MotorParam.UpperLimit, dofIndex, -1.0f);
+        } else {
+            joint.set(MotorParam.LowerLimit, dofIndex, (float) axis.lowerLimit());
+            joint.set(MotorParam.UpperLimit, dofIndex, (float) axis.upperLimit());
+        }
+        joint.set(MotorParam.TargetVelocity, dofIndex, (float) axis.motorTargetVelocity());
+        joint.set(MotorParam.MaxMotorForce, dofIndex, (float) axis.maxMotorForce());
+        if (dofIndex >= 3) {
+            joint.getRotationMotor(dofIndex - 3).setMotorEnabled(axis.enableMotor());
+        } else {
+            joint.getTranslationMotor().setMotorEnabled(dofIndex, axis.enableMotor());
+        }
+        joint.enableSpring(dofIndex, axis.enableSpring());
+        if (axis.enableSpring()) {
+            joint.setStiffness(dofIndex, (float) axis.stiffness(), true);
+            joint.setDamping(dofIndex, (float) axis.damping(), true);
+            joint.setEquilibriumPoint(dofIndex);
+        }
+    }
+
     @Override
     public void removeConstraint(ConstraintHandle constraint) {
         ensureOpen();
@@ -358,6 +418,7 @@ public final class BulletPhysicsWorld implements PhysicsWorld {
             throw new IllegalArgumentException("Constraint does not belong to this backend: " + constraint);
         }
         if (constraints.remove(handle.id()) != null) {
+            handle.markRemoved();
             space.removeJoint(handle.bulletJoint());
         }
     }

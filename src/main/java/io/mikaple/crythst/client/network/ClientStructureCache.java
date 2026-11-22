@@ -1,16 +1,23 @@
 package io.mikaple.crythst.client.network;
 
 import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.network.structure.StructureBlockEntity;
+import io.mikaple.crythst.network.structure.StructureBlockEntityPayload;
+import io.mikaple.crythst.network.structure.StructureBlockEntityUpdate;
 import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureSnapshot;
 import io.mikaple.crythst.network.structure.StructureSnapshotPayload;
 import io.mikaple.crythst.network.structure.StructureSyncDebug;
+import io.mikaple.crythst.network.structure.StructureVoxelPos;
 import io.mikaple.crythst.physics.tick.PoseTimeline;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.Identifier;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -28,7 +35,10 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>Renderers should call {@link #snapshots()} or {@link #byId()} once per
  * frame/tick and use {@link #revision()} to avoid rebuilding meshes when
- * nothing changed. The cache never touches a server {@code Level}.</p>
+ * nothing changed. Block-entity NBT/animation is kept in a separate immutable
+ * map keyed by body id and structure-local voxel; see
+ * {@link #blockEntities(long)} and {@link #blockEntityAt(long, int, int, int)}.
+ * The cache never touches a server {@code Level}.</p>
  */
 public final class ClientStructureCache {
     private static volatile Map<Long, ClientStructureSnapshot> snapshots = Map.of();
@@ -40,7 +50,10 @@ public final class ClientStructureCache {
      * internally immutable/volatile and safe to sample from the render thread.
      */
     private static final Map<Long, PoseTimeline> POSE_TIMELINES = new ConcurrentHashMap<>();
+    private static volatile Map<Long, ClientBlockEntitySnapshot> blockEntities = Map.of();
+    private static final Map<Long, PendingBlockEntities> PENDING_BLOCK_ENTITIES = new HashMap<>();
     private static volatile long revision;
+    private static volatile long blockEntityRevision;
     private static volatile long activeSyncId;
     private static volatile Identifier activeDimension;
     private static volatile int lastBatchIndex = -1;
@@ -52,6 +65,11 @@ public final class ClientStructureCache {
     private static volatile long stalePackets;
     private static volatile long unknownPoseUpdates;
     private static volatile long unknownRemovals;
+    private static volatile long appliedBlockEntityPayloads;
+    private static volatile long appliedBlockEntityEntries;
+    private static volatile long blockEntityDesyncs;
+    private static volatile long unknownBlockEntityBodies;
+    private static volatile boolean blockEntityResyncRequested;
 
     private ClientStructureCache() {
     }
@@ -91,16 +109,35 @@ public final class ClientStructureCache {
 
         final Map<Long, ClientStructureSnapshot> next =
                 reset ? new HashMap<>() : new HashMap<>(snapshots);
+        final Map<Long, ClientBlockEntitySnapshot> nextBlockEntities =
+                reset ? new HashMap<>() : new HashMap<>(blockEntities);
+        if (reset) {
+            PENDING_BLOCK_ENTITIES.clear();
+        }
+        boolean blockEntitiesChanged = reset;
         for (StructureSnapshot wire : payload.structures()) {
             next.put(wire.bodyId(), ClientStructureSnapshot.fromWire(wire));
             timeline(wire.bodyId()).reset(wire.pose(), receivedNanos);
+            // Geometry (and therefore the local voxel space) may have changed.
+            // Drop the previous block-entity map; the server follows every
+            // snapshot with a full block-entity replacement for this body.
+            if (nextBlockEntities.remove(wire.bodyId()) != null) {
+                blockEntitiesChanged = true;
+            }
+            if (PENDING_BLOCK_ENTITIES.remove(wire.bodyId()) != null) {
+                blockEntitiesChanged = true;
+            }
         }
         // Drop timelines for bodies that are no longer present. On a batched
         // full sync this only removes bodies from the previous session; later
         // batches create their own timelines when they arrive.
         POSE_TIMELINES.keySet().retainAll(next.keySet());
         snapshots = Map.copyOf(next);
+        blockEntities = Map.copyOf(nextBlockEntities);
         revision++;
+        if (blockEntitiesChanged) {
+            blockEntityRevision++;
+        }
         appliedBatches++;
         lastBatchIndex = payload.batchIndex();
         lastBatchCount = payload.batchCount();
@@ -175,23 +212,231 @@ public final class ClientStructureCache {
             return true;
         }
         final Map<Long, ClientStructureSnapshot> next = new HashMap<>(snapshots);
+        final Map<Long, ClientBlockEntitySnapshot> nextBlockEntities = new HashMap<>(blockEntities);
         boolean changed = false;
+        boolean blockEntitiesChanged = false;
         for (long bodyId : ids) {
             if (next.remove(bodyId) != null) {
                 changed = true;
             } else {
                 unknownRemovals++;
             }
+            if (nextBlockEntities.remove(bodyId) != null) {
+                blockEntitiesChanged = true;
+            }
+            PENDING_BLOCK_ENTITIES.remove(bodyId);
             POSE_TIMELINES.remove(bodyId);
         }
         if (changed) {
             snapshots = Map.copyOf(next);
             revision++;
         }
+        if (blockEntitiesChanged) {
+            blockEntities = Map.copyOf(nextBlockEntities);
+            blockEntityRevision++;
+        }
         appliedRemovals++;
         StructureSyncDebug.log("client remove sync={} ids={} changed={} total={}",
                 payload.syncId(), ids.length, changed, snapshots.size());
         return true;
+    }
+
+    /**
+     * Applies a block-entity payload. Geometry must already be present; updates
+     * for unknown bodies are ignored.
+     *
+     * @return {@code false} when the packet belongs to a stale session
+     */
+    public static synchronized boolean applyBlockEntities(StructureBlockEntityPayload payload) {
+        if (payload.syncId() != activeSyncId) {
+            stalePackets++;
+            StructureSyncDebug.log("client ignored block entities sync={} active={} updates={}",
+                    payload.syncId(), activeSyncId, payload.updates().size());
+            return false;
+        }
+        if (payload.updates().isEmpty()) {
+            return true;
+        }
+
+        final Map<Long, ClientBlockEntitySnapshot> next = new HashMap<>(blockEntities);
+        boolean changed = false;
+        int appliedEntries = 0;
+        for (StructureBlockEntityUpdate update : payload.updates()) {
+            final long bodyId = update.bodyId();
+            final ClientStructureSnapshot geometry = snapshots.get(bodyId);
+            if (geometry == null) {
+                unknownBlockEntityBodies++;
+                continue;
+            }
+
+            // Full replacements and fragmented dirty sets both accumulate in a
+            // pending buffer. This keeps a multi-part update atomic: the client
+            // never exposes half a container map, and dirty fragments share one
+            // base revision instead of advancing it per part.
+            final boolean pendingUpdate = update.replace() || update.partCount() > 1;
+            if (pendingUpdate) {
+                PendingBlockEntities pending = PENDING_BLOCK_ENTITIES.get(bodyId);
+                if (update.partIndex() == 0) {
+                    pending = new PendingBlockEntities(update.revision(), update.baseRevision(),
+                            update.replace(), update.partCount());
+                    PENDING_BLOCK_ENTITIES.put(bodyId, pending);
+                } else if (pending == null
+                        || pending.revision != update.revision()
+                        || pending.baseRevision != update.baseRevision()
+                        || pending.replace != update.replace()
+                        || pending.partCount != update.partCount()) {
+                    PENDING_BLOCK_ENTITIES.remove(bodyId);
+                    blockEntityDesyncs++;
+                    blockEntityResyncRequested = true;
+                    continue;
+                }
+
+                for (StructureBlockEntity entry : update.entries()) {
+                    pending.entries.put(entry.pos().packed(), entry);
+                    appliedEntries++;
+                }
+                pending.removed.addAll(update.removed());
+                if (update.lastPart()) {
+                    if (commitPending(next, bodyId, pending)) {
+                        changed = true;
+                    }
+                    PENDING_BLOCK_ENTITIES.remove(bodyId);
+                }
+                continue;
+            }
+
+            final ClientBlockEntitySnapshot current = next.get(bodyId);
+            if (current == null || update.baseRevision() != current.revision()) {
+                dropForDesync(next, bodyId);
+                changed = true;
+                continue;
+            }
+
+            final Map<Long, ClientBlockEntity> entries = current.mutableEntries();
+            boolean dataChanged = !update.removed().isEmpty();
+            for (StructureBlockEntity entry : update.entries()) {
+                if (applyEntry(entries, entry)) {
+                    appliedEntries++;
+                    dataChanged |= entry.data() != null;
+                }
+            }
+            for (StructureVoxelPos pos : update.removed()) {
+                if (entries.remove(pos.packed()) != null) {
+                    appliedEntries++;
+                }
+            }
+            final long dataRevision = dataChanged ? update.revision() : current.dataRevision();
+            next.put(bodyId, new ClientBlockEntitySnapshot(
+                    bodyId, update.revision(), dataRevision, entries));
+            changed = true;
+        }
+
+        if (changed) {
+            blockEntities = Map.copyOf(next);
+            blockEntityRevision++;
+        }
+        appliedBlockEntityPayloads++;
+        appliedBlockEntityEntries += appliedEntries;
+        StructureSyncDebug.log("client block entities sync={} updates={} changed={} bodies={} entries={}",
+                payload.syncId(), payload.updates().size(), changed, blockEntities.size(), appliedEntries);
+        return true;
+    }
+
+    /**
+     * Applies an accumulated multi-fragment update atomically.
+     *
+     * @return always {@code true}; the caller marks the map as changed
+     */
+    private static boolean commitPending(Map<Long, ClientBlockEntitySnapshot> next,
+                                         long bodyId, PendingBlockEntities pending) {
+        if (pending.replace) {
+            final Map<Long, ClientBlockEntity> entries = new HashMap<>();
+            for (StructureBlockEntity entry : pending.entries.values()) {
+                entries.put(entry.pos().packed(),
+                        new ClientBlockEntity(entry.pos(), entry.data(), entry.openCount()));
+            }
+            next.put(bodyId, new ClientBlockEntitySnapshot(
+                    bodyId, pending.revision, pending.revision, entries));
+            return true;
+        }
+
+        final ClientBlockEntitySnapshot current = next.get(bodyId);
+        if (current == null || pending.baseRevision != current.revision()) {
+            dropForDesync(next, bodyId);
+            return true;
+        }
+        final Map<Long, ClientBlockEntity> entries = current.mutableEntries();
+        boolean dataChanged = !pending.removed.isEmpty();
+        for (StructureBlockEntity entry : pending.entries.values()) {
+            if (applyEntry(entries, entry)) {
+                dataChanged |= entry.data() != null;
+            }
+        }
+        for (StructureVoxelPos pos : pending.removed) {
+            entries.remove(pos.packed());
+        }
+        final long dataRevision = dataChanged ? pending.revision : current.dataRevision();
+        next.put(bodyId, new ClientBlockEntitySnapshot(
+                bodyId, pending.revision, dataRevision, entries));
+        return true;
+    }
+
+    private static boolean applyEntry(Map<Long, ClientBlockEntity> entries,
+                                      StructureBlockEntity entry) {
+        final long key = entry.pos().packed();
+        final ClientBlockEntity previous = entries.get(key);
+        final CompoundTag nbt = entry.data();
+        if (nbt != null) {
+            entries.put(key, new ClientBlockEntity(entry.pos(), nbt, entry.openCount()));
+            return true;
+        }
+        if (previous != null) {
+            // Animation-only update: keep the existing NBT/inventory.
+            entries.put(key, new ClientBlockEntity(
+                    entry.pos(), previous.data(), entry.openCount()));
+            return true;
+        }
+        return false;
+    }
+
+    private static void dropForDesync(Map<Long, ClientBlockEntitySnapshot> next, long bodyId) {
+        blockEntityDesyncs++;
+        blockEntityResyncRequested = true;
+        next.remove(bodyId);
+        PENDING_BLOCK_ENTITIES.remove(bodyId);
+    }
+
+    /** Immutable block-entity state for one body, or {@code null}. */
+    public static ClientBlockEntitySnapshot blockEntities(long bodyId) {
+        return blockEntities.get(bodyId);
+    }
+
+    /** Block entity at a structure-local voxel, or {@code null}. */
+    public static ClientBlockEntity blockEntityAt(long bodyId, int x, int y, int z) {
+        final ClientBlockEntitySnapshot snapshot = blockEntities.get(bodyId);
+        return snapshot == null ? null : snapshot.get(x, y, z);
+    }
+
+    public static int blockEntityBodyCount() {
+        return blockEntities.size();
+    }
+
+    /**
+     * Changes whenever the block-entity map is replaced. Geometry changes also
+     * bump it because they invalidate the local voxel space.
+     */
+    public static long blockEntityRevision() {
+        return blockEntityRevision;
+    }
+
+    /**
+     * Consumes a pending request for a full resync after a block-entity base
+     * revision mismatch. The networking layer rate-limits the actual request.
+     */
+    public static synchronized boolean consumeBlockEntityResyncRequest() {
+        final boolean requested = blockEntityResyncRequested;
+        blockEntityResyncRequested = false;
+        return requested;
     }
 
     public static Collection<ClientStructureSnapshot> snapshots() {
@@ -280,17 +525,54 @@ public final class ClientStructureCache {
                 + " removals=" + appliedRemovals
                 + " stale=" + stalePackets
                 + " unknownPoseIds=" + unknownPoseUpdates
-                + " unknownRemovalIds=" + unknownRemovals;
+                + " unknownRemovalIds=" + unknownRemovals
+                + " blockEntityBodies=" + blockEntities.size()
+                + " blockEntityEntries=" + blockEntityEntryCount()
+                + " blockEntityRevision=" + blockEntityRevision
+                + " blockEntityPayloads=" + appliedBlockEntityPayloads
+                + " blockEntityEntriesApplied=" + appliedBlockEntityEntries
+                + " blockEntityDesyncs=" + blockEntityDesyncs
+                + " unknownBlockEntityIds=" + unknownBlockEntityBodies;
+    }
+
+    private static int blockEntityEntryCount() {
+        int total = 0;
+        for (ClientBlockEntitySnapshot snapshot : blockEntities.values()) {
+            total += snapshot.size();
+        }
+        return total;
     }
 
     public static synchronized void clear() {
         snapshots = Map.of();
+        blockEntities = Map.of();
+        PENDING_BLOCK_ENTITIES.clear();
         POSE_TIMELINES.clear();
         activeSyncId = 0L;
         activeDimension = null;
         lastBatchIndex = -1;
         lastBatchCount = 0;
         lastSnapshotCount = 0;
+        blockEntityResyncRequested = false;
         revision++;
+        blockEntityRevision++;
+    }
+
+    /** Mutable accumulator for a fragmented full replacement. */
+    private static final class PendingBlockEntities {
+        private final long revision;
+        private final long baseRevision;
+        private final boolean replace;
+        private final int partCount;
+        private final Map<Long, StructureBlockEntity> entries = new HashMap<>();
+        private final List<StructureVoxelPos> removed = new ArrayList<>();
+
+        private PendingBlockEntities(long revision, long baseRevision,
+                                     boolean replace, int partCount) {
+            this.revision = revision;
+            this.baseRevision = baseRevision;
+            this.replace = replace;
+            this.partCount = partCount;
+        }
     }
 }

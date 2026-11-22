@@ -3,6 +3,7 @@ package io.mikaple.crythst.integration.fabric.client;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot;
+import io.mikaple.crythst.physics.debug.ForceDebugSnapshot;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.world.TerrainCollisionSnapshot;
 import net.minecraft.client.Minecraft;
@@ -25,6 +26,7 @@ public final class ClientPhysicsView {
     private static volatile List<PhysicsStructure> STRUCTURES = List.of();
     private static volatile PhysicsDebugSnapshot DEBUG;
     private static volatile TerrainCollisionSnapshot TERRAIN;
+    private static volatile List<ForceDebugSnapshot> FORCES = List.of();
 
     private ClientPhysicsView() {
     }
@@ -57,6 +59,7 @@ public final class ClientPhysicsView {
         STRUCTURES = physics.renderStructures();
         DEBUG = physics.renderDebugSnapshot();
         TERRAIN = physics.renderTerrainSnapshot();
+        FORCES = physics.renderForceSnapshots();
     }
 
     /**
@@ -78,9 +81,15 @@ public final class ClientPhysicsView {
         return TERRAIN;
     }
 
+    /** Latest per-structure force/torque snapshot. Never {@code null}. */
+    public static List<ForceDebugSnapshot> forceSnapshots() {
+        return FORCES;
+    }
+
     public static void clear() {
         STRUCTURES = List.of();
         DEBUG = null;
         TERRAIN = null;
+        FORCES = List.of();
     }
 }
