@@ -203,7 +203,7 @@ public final class StructurePlacementValidation {
         if (level == null) {
             return false;
         }
-        final AABB bounds = worldVoxelBounds(pose, x, y, z, blockScale).inflate(1.0e-4);
+        final AABB bounds = worldVoxelBounds(pose, x, y, z, blockScale);
         final BlockPos min = new BlockPos(
                 (int) Math.floor(bounds.minX + 1.0e-6),
                 (int) Math.floor(bounds.minY + 1.0e-6),
@@ -219,7 +219,17 @@ public final class StructurePlacementValidation {
                 continue;
             }
             for (AABB local : shape.toAabbs()) {
-                if (bounds.intersects(local.move(pos))) {
+                final AABB block = local.move(pos);
+                // Require a real overlap volume, not a shared face/corner. An
+                // inflated AABB reports the floor directly under a resting
+                // structure as an obstruction because of floating-point noise.
+                final double overlapX = Math.min(bounds.maxX, block.maxX)
+                        - Math.max(bounds.minX, block.minX);
+                final double overlapY = Math.min(bounds.maxY, block.maxY)
+                        - Math.max(bounds.minY, block.minY);
+                final double overlapZ = Math.min(bounds.maxZ, block.maxZ)
+                        - Math.max(bounds.minZ, block.minZ);
+                if (overlapX > 1.0e-5 && overlapY > 1.0e-5 && overlapZ > 1.0e-5) {
                     return true;
                 }
             }
