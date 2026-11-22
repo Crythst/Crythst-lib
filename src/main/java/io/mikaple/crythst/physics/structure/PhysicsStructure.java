@@ -60,6 +60,8 @@ public final class PhysicsStructure implements AutoCloseable {
     private volatile List<BlockEntityStructureActor> blockEntityActors = List.of();
     /** Incremented whenever the voxel content is rebuilt or edited. */
     private volatile long contentRevision;
+    /** Incremented when mirrored block-entity NBT changes. */
+    private volatile long blockEntityRevision;
     private boolean closed;
 
     public PhysicsStructure(PhysicsWorld world, StructureDef definition) {
@@ -374,6 +376,16 @@ public final class PhysicsStructure implements AutoCloseable {
      */
     public long contentRevision() {
         return contentRevision;
+    }
+
+    /** Monotonic revision for block-entity render data/NBT. */
+    public long blockEntityRevision() {
+        return blockEntityRevision;
+    }
+
+    /** Marks mirrored block-entity data as changed for render snapshots. */
+    public void bumpBlockEntityRevision() {
+        blockEntityRevision++;
     }
 
     public void setMaterial(PhysicsMaterial material) {

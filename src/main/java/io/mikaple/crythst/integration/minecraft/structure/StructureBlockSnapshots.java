@@ -139,7 +139,8 @@ public final class StructureBlockSnapshots {
                 // edits mirrored from the auxiliary void tick. Pose-only
                 // updates do not touch contentRevision and stay free.
                 if (existing != null
-                        && existing.revision() == structure.contentRevision()) {
+                        && existing.revision() == structure.contentRevision()
+                        && existing.blockEntityRevision() == structure.blockEntityRevision()) {
                     continue;
                 }
                 if (existing == null && size() >= MAX_STRUCTURES) {
@@ -263,7 +264,8 @@ public final class StructureBlockSnapshots {
         }
         return new Snapshot(bodyId, bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.sizeX(), bounds.sizeY(), bounds.sizeZ(),
-                copy, nonAir, NEXT_REVISION.incrementAndGet(), List.of());
+                copy, nonAir, NEXT_REVISION.incrementAndGet(), List.of(),
+                Map.of(), 0L);
     }
 
     private static Snapshot build(PhysicsStructure structure) {
@@ -344,7 +346,8 @@ public final class StructureBlockSnapshots {
         return new Snapshot(structure.body().id(),
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 sizeX, bounds.sizeY(), sizeZ,
-                blocks, nonAir, structure.contentRevision(), movingBlocks);
+                blocks, nonAir, structure.contentRevision(), movingBlocks,
+                blockEntities, structure.blockEntityRevision());
     }
 
     /**
@@ -364,11 +367,15 @@ public final class StructureBlockSnapshots {
         private final int nonAirBlocks;
         private final long revision;
         private final List<MovingBlock> movingBlocks;
+        private final Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities;
+        private final long blockEntityRevision;
 
         private Snapshot(long bodyId, int minX, int minY, int minZ,
                          int sizeX, int sizeY, int sizeZ,
                          BlockState[] blocks, int nonAirBlocks, long revision,
-                         List<MovingBlock> movingBlocks) {
+                         List<MovingBlock> movingBlocks,
+                         Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities,
+                         long blockEntityRevision) {
             this.bodyId = bodyId;
             this.minX = minX;
             this.minY = minY;
@@ -380,6 +387,8 @@ public final class StructureBlockSnapshots {
             this.nonAirBlocks = nonAirBlocks;
             this.revision = revision;
             this.movingBlocks = List.copyOf(movingBlocks);
+            this.blockEntities = Map.copyOf(blockEntities);
+            this.blockEntityRevision = blockEntityRevision;
         }
 
         public long bodyId() {
@@ -422,6 +431,15 @@ public final class StructureBlockSnapshots {
         /** Moving-piston entries rendered by the client feature renderer. */
         public List<MovingBlock> movingBlocks() {
             return movingBlocks;
+        }
+
+        /** Structure-local block-entity NBT, copied on the server thread. */
+        public Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities() {
+            return blockEntities;
+        }
+
+        public long blockEntityRevision() {
+            return blockEntityRevision;
         }
 
         /**

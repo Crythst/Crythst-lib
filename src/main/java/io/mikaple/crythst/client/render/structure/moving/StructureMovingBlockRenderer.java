@@ -71,10 +71,13 @@ public final class StructureMovingBlockRenderer {
                     continue;
                 }
                 final double scale = render.blockScale();
+                final int voxelX = snapshot.minX() + moving.x();
+                final int voxelY = snapshot.minY() + moving.y();
+                final int voxelZ = snapshot.minZ() + moving.z();
                 final Vector3d worldCenter = render.pose().transformPoint(new Vector3d(
-                        (moving.x() + 0.5) * scale,
-                        (moving.y() + 0.5) * scale,
-                        (moving.z() + 0.5) * scale));
+                        (voxelX + 0.5) * scale,
+                        (voxelY + 0.5) * scale,
+                        (voxelZ + 0.5) * scale));
                 final BlockPos tintPos = BlockPos.containing(
                         worldCenter.x, worldCenter.y, worldCenter.z);
 
@@ -87,8 +90,7 @@ public final class StructureMovingBlockRenderer {
                 state.lightEngine = level.getLightEngine();
 
                 final Matrix4f matrix = StructureOutlineTransform.cameraRelativeMatrix(
-                        render.pose(), moving.x(), moving.y(), moving.z(),
-                        scale, cameraPos);
+                        render.pose(), voxelX, voxelY, voxelZ, scale, cameraPos);
                 final PoseStack poseStack = context.poseStack();
                 poseStack.pushPose();
                 try {
