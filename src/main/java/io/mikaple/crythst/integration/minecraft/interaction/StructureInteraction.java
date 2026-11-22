@@ -405,6 +405,21 @@ public final class StructureInteraction {
         // still alive keeps the ordering obvious.
         StructureFeedback.breakBlock(level, feedbackPose, x, y, z,
                 previousState, blockScale, level.getRandom());
+        // The redirected path uses vanilla destroyBlock, which already handles
+        // drops/tool durability/stats. This custom fallback must do the same
+        // rather than silently deleting the block.
+        if (!player.preventsBlockDrops()) {
+            final Vector3d center = structure.blockCenter(x, y, z);
+            final BlockPos dropPos = BlockPos.containing(center.x, center.y, center.z);
+            final ItemStack tool = player.getMainHandItem().copy();
+            for (ItemStack drop : Block.getDrops(previousState, level, dropPos,
+                    null, player, tool)) {
+                Block.popResource(level, dropPos, drop);
+            }
+            player.getMainHandItem().mineBlock(level, previousState, dropPos, player);
+            player.awardStat(net.minecraft.stats.Stats.BLOCK_MINED.get(previousState.getBlock()));
+            player.causeFoodExhaustion(0.005F);
+        }
         // Removing a block can disconnect the remaining solid cells. The
         // refresh pass also performs that split and returns the bodies that now
         // represent the structure.

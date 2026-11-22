@@ -18,36 +18,36 @@ for some cases; **MISSING** = not implemented.
 
 | Logic | Status | Notes / gap |
 |---|---|---|
-| Break a structure block | PARTIAL | Authoritative break + particles/sound + splitting exist. **No item drops, XP, stats, tool durability or enchantment effects.** Survival progress is being redesigned. |
-| Place a block | PARTIAL | Server-authoritative placement, orientation is being moved into structure-local frame, validity checks are being added. No neighbour-shape updates (fences, walls, stairs) beyond `getStateForPlacement`. |
-| Right-click block use | PARTIAL | Being added: block entities/`MenuProvider` and `useWithoutItem`/`useItemOn` in the auxiliary level. Sounds/menus need host projection. |
+| Break a structure block | OK / PARTIAL fallback | The redirect path uses vanilla `destroyBlock` (drops, XP, stats, durability, tool rules). The custom expanding fallback still lacks drops/XP/stats. |
+| Place a block | OK / PARTIAL fallback | Redirected placement runs vanilla `BlockItem.place` in the void copy with structure-local look/context and host-world occlusion checks. Neighbour-sensitive shape updates still see the virtual structure neighbourhood. |
+| Right-click block use | OK | Vanilla `useItemOn`/`useWithoutItem`/`ItemStack.useOn` run against the live auxiliary block; menus, buttons, doors, dispensers and sounds are projected. |
 | Block action restrictions / cooldowns | PARTIAL | Reach/occlusion exists; adventure/spectator/tool cooldown rules are incomplete. |
-| Block entity GUI | PARTIAL | Live void-level BEs exist; opening a menu needs a stable host-facing position/provider. |
-| Block drops and item entities | MISSING | Breaks do not call `Block.getDrops`/`dropResources`; dispenser/dropper items are being projected from the void level but generic drops are not. |
+| Block entity GUI | OK | Menus open from auxiliary BEs; `AuxiliaryMenuPositionMixin` maps validity back to the structure position. |
+| Block drops and item entities | OK / PARTIAL fallback | Redirect breaks use vanilla `destroyBlock` and project drops/XP. The custom fallback still does not generate drops. |
 | Block placement context / orientation | PARTIAL | Being fixed for structure rotation and directional gravity. |
-| Block support and `canSurvive` | PARTIAL | Being added; neighbour-sensitive shapes currently see a virtual structure neighbourhood only. |
+| Block support and `canSurvive` | OK | `canSurvive` and placement checks see the virtual structure neighbourhood; cross-boundary support is still missing. |
 
 ## 2. Ticking and redstone
 
 | Logic | Status | Notes / gap |
 |---|---|---|
-| Random ticks | PARTIAL | `EmptyPhysicsLevel.tick` calls `tickChunk(chunk, randomTickSpeed)`, so grass/crops/leaves inside the void copy can random-tick. Rate is global config, not per-structure. |
-| Scheduled block ticks | MISSING | The void level is never `tick()`ed; repeater/observer/piston/fire/fluid scheduled ticks do not run. |
-| Fluid ticks / flow | MISSING | Water/lava copied into the void level do not flow or update neighbours; host fluid is a separate world. |
-| Block entity ticks | OK/PARTIAL | `tickBlockEntities()` runs; some global/BE systems expect the level tick or game events. |
+| Random ticks | OK | Active sections random-tick in the auxiliary level; rate is global config, not per-structure. |
+| Scheduled block ticks | OK | Due ticks are collected globally and run by priority/subtick order; delays survive save/load, refresh and split. |
+| Fluid ticks / flow | OK inside copy | Water/lava flow inside the void copy. Host fluid and cross-boundary flow are still separate. |
+| Block entity ticks | OK | Vanilla `tickBlockEntities` plus a bounded fallback closes chunk/entity-section gates; some global/BE systems still expect a full level. |
 | Neighbour updates | PARTIAL | Edits can update the void copy, but cross-boundary updates (structure ↔ host, structure ↔ structure) are missing. |
-| Redstone propagation | MISSING | No scheduled ticks/neighbour graph means repeaters, observers, comparators and most redstone are inert or stale. |
-| Pistons / moving blocks | MISSING | Piston movement creates moving-block state in the void level, not a change to the structure volume/body. |
-| Falling blocks (sand/gravel) | MISSING | Vanilla falling-block entities are created in the void level and are not projected back into the structure. |
-| Fire/spread/decay | PARTIAL | Random-tick-only paths may run; scheduled fire/leaf decay is missing. |
-| Crops/bonemeal | PARTIAL | Random ticks may grow crops; bonemeal use/neighbour effects are not bridged. |
-| Note blocks/jukeboxes | PARTIAL | Playback inside the void level needs host sound projection. |
+| Redstone propagation | OK inside copy | Repeaters, observers, torches and comparators work inside the structure copy. Host↔structure and structure↔structure redstone are missing. |
+| Pistons / moving blocks | OK inside copy | Piston movement edits the void copy and mirrors into the structure; moving pistons render through the vanilla moving-block feature. |
+| Falling blocks (sand/gravel) | PARTIAL | Falling-block entities spawned in the void are ejected to the host; they do not become structure voxels. |
+| Fire/spread/decay | PARTIAL | Scheduled fire and random decay run inside the copy; cross-boundary spread is missing. |
+| Crops/bonemeal | PARTIAL | Random growth runs inside the copy; bonemeal is still routed as a normal item use and needs in-game validation. |
+| Note blocks/jukeboxes | OK | Auxiliary sounds and level events project to host coordinates. |
 
 ## 3. Fluids, buoyancy and environment
 
 | Logic | Status | Notes / gap |
 |---|---|---|
-| Water/lava inside a structure | MISSING | Not simulated as fluid; buoyancy reads host-world fluid at the body position. |
+| Water/lava inside a structure | PARTIAL | Fluid ticks/flow run in the void copy; buoyancy still reads host-world fluid at the body position. |
 | Buoyancy | PARTIAL | Uses host water, not structure-contained water; exact shape uses coarse collider boxes (documented fallback). |
 | Rain/snow/weather | PARTIAL | Host weather renders; structure blocks do not receive weather ticks/lightning. |
 | Sky/light occlusion | PARTIAL | Batched renderer samples world light and applies AO; structure geometry does not occlude the world light engine or sky light propagation. |
@@ -64,20 +64,20 @@ for some cases; **MISSING** = not implemented.
 | AI/pathfinding | MISSING | Mob navigation queries the host world, where structure blocks are air. Mobs cannot path on/around structures. |
 | Entity block interactions | PARTIAL | Arrows/projectiles collide, but their `onHitBlock` sees the real world block, not the structure state. |
 | Minecarts/boats on structure rails/water | MISSING | Vehicle movement queries host blocks/fluids. |
-| Entity projection from void level | IN PROGRESS | Dispenser/dropper items and other void-spawned entities need projection to the host world. |
+| Entity projection from void level | OK | Ordinary entities are ejected to the host with pose/velocity mapping; decorations/seats stay as host mirrors. |
 | Explosions affecting structure/entities | MISSING | TNT in the void level affects the void copy; it does not damage host entities or apply structure impulses. |
 | Mob griefing / enderman pickup | MISSING | Host AI cannot edit structure blocks. |
-| Leashes, seats, item frames | PARTIAL | Item frames are fixed to the surface but do not follow a moving body; seats/handlers are being added. |
+| Leashes, seats, item frames | OK / PARTIAL | Item frames and seats are host mirrors that follow the structure pose; riders are repositioned. Split/removal lifecycle is handled. |
 
 ## 5. Rendering, sound and feedback
 
 | Logic | Status | Notes / gap |
 |---|---|---|
 | Structure block rendering | OK | Batched renderer with exact partial models. |
-| Break/place particles and sound | PARTIAL | Block break event is projected; generic void-level block events (dispenser, note block, piston) need projection. |
-| Block entity rendering | PARTIAL | Supported for copied BEs; client-sync of BE NBT is incomplete. |
-| Breaking crack overlay | PARTIAL | Being added for structure mining; a rotated/scaled crack mesh may be approximate. |
-| Selection/outline | PARTIAL | Vanilla outline; exact block-shape raycast is being fixed. |
+| Break/place particles and sound | OK | Break/place feedback uses exact pose-aware world positions; auxiliary block events/sounds/particles project to the host. |
+| Block entity rendering | OK singleplayer | Vanilla BERs are recreated from snapshot NBT and submitted at the structure pose; chest lid animation and sign editing are structure-aware. Multiplayer BE NBT sync is still incomplete. |
+| Breaking crack overlay | OK | Vanilla breaking model submitted with the structure voxel pose/scale. |
+| Selection/outline | OK | Exact `BlockState` shape raycast; vanilla outline from the same hit. |
 | Light/weather/clouds | Host world | Structure does not participate in world light/weather volumes. |
 
 ## 6. Persistence, networking and world boundaries
@@ -86,22 +86,22 @@ for some cases; **MISSING** = not implemented.
 |---|---|---|
 | Block/entity persistence | PARTIAL | Structure blocks/BE NBT persist; void-level transient entities do not. |
 | Multiplayer block/BE sync | PARTIAL | Block states sync; BE NBT is not fully networked. |
-| Chunk loading / tickets | PARTIAL | Auxiliary chunks are ticketed; host chunks around a structure are terrain-collision-loaded. No Sable-style loading tickets/tracking points. |
+| Chunk loading / tickets | PARTIAL | Auxiliary chunks are ticketed; native API now has host loading tickets/tracking points, but they are not Sable plot tickets. |
 | World border / build height | PARTIAL | Host-level checks exist; structure-local edits at extreme positions need explicit policy. |
-| Game events / sculk / vibrations | MISSING | Void-level game events are not forwarded to the host level. |
-| Statistics/advancements | MISSING | Structure edits do not award stats/advancements. |
+| Game events / sculk / vibrations | PARTIAL | Interaction sounds/particles/events project; sculk/vibration/sculk-sensor graphs are not bridged. |
+| Statistics/advancements | PARTIAL | Redirected break/use runs vanilla stats/advancement triggers; custom fallback edits do not. |
 | Commands/selectors | PARTIAL | Structure command argument exists; vanilla selectors do not see structure blocks. |
 
 ## 7. Automation and cross-boundary logic
 
 | Logic | Status | Notes / gap |
 |---|---|---|
-| Dispenser/dropper | PARTIAL | Use path being added; spawned entities need host projection. |
+| Dispenser/dropper | OK | Vanilla use runs in the void copy and spawned entities/items project to the host. |
 | Hoppers/containers inside structure | PARTIAL | Void-level BEs transfer between structure containers; host containers across the boundary are not connected. |
-| Comparators/observers | MISSING | Depend on scheduled ticks/neighbour updates. |
+| Comparators/observers | OK inside copy | Both work inside the structure copy; host↔structure signals are missing. |
 | Redstone input from host | MISSING | A host lever/button does not power structure blocks, and vice versa. |
 | Structure-to-structure power/hoppers | MISSING | No shared neighbour graph. |
-| Create contraptions / modded automation | PARTIAL | Soft compatibility exists, but modded BEs often assume a real `Level`. |
+| Create contraptions / modded automation | PARTIAL | Soft compatibility exists; modded BEs that require a full `Level`/plot still need a structure level facade. |
 
 ---
 
@@ -110,17 +110,18 @@ for some cases; **MISSING** = not implemented.
 1. **The auxiliary level is not the host level.** Blocks are copied; anything
    that reads the host grid (AI, minecarts, redstone from outside, explosions,
    game events, host fluid) sees air.
-2. **Only part of a level tick runs.** `tickChunk` + `tickBlockEntities` is not
-   the full `ServerLevel.tick` (scheduled block ticks, fluid ticks, entity
-   ticks, game events, etc.).
+2. **The auxiliary level runs block logic, not a full world tick.**
+   Scheduled/fluid/random ticks, block events, neighbour updates, block
+   entities and edit mirroring now run. Entity AI, weather, natural spawning,
+   raids and world-border rules intentionally do not.
 3. **No structure level view.** Most vanilla logic needs a `Level`/`BlockGetter`
    that maps structure-local coordinates; the void copy is hidden behind a
    region remap and is not a public level. A lightweight `StructureLevelView`
    now exists (P2), but there is still no full `Level` facade or AI/pathfinding
    bridge.
-4. **Interactions are implemented per action**, not by letting vanilla run
-   against a real level. This is why drops, tool rules, menus, projectiles and
-   redstone each need separate bridges.
+4. **Interactions are redirected to the void copy**, so most vanilla use/break
+   rules work. Entity items, signs, menus and custom fallback edits still need
+   structure-aware bridges.
 5. **Cross-boundary graphs are missing** (structure ↔ host, structure ↔
    structure): neighbour updates, redstone, hoppers, fluids and explosions.
 
@@ -128,19 +129,22 @@ for some cases; **MISSING** = not implemented.
 
 ## 9. Recommended order
 
-### P0 — make the void copy a real ticking world
-- Run scheduled block/fluid ticks and neighbour updates in the void level, not
-  only `tickChunk`/`tickBlockEntities`.
-- Map edits back to the structure volume (and reindex/split/collision/render).
-- Project void-level block events/sounds/particles to host coordinates.
-- Project void-level entities (dispenser items, TNT, arrows) to the host.
-- Real block drops/tool rules for structure breaking/placement.
+### P0 — void world ticking — **implemented**
+- Scheduled block/fluid ticks, random ticks, block events, neighbour updates
+  and block entities run on active regions.
+- Edits mirror back to the structure volume and refresh reindex/split/collision/
+  render.
+- Void block events/sounds/particles and ordinary entities project to the host.
+- Redirected break/placement uses vanilla drops/tool rules.
 
-### P1 — interaction parity
-- Structure-local `BlockPlaceContext` (orientation) — in progress.
-- Structure-local block use (`useWithoutItem`/`useItemOn`, menus) — in progress.
-- Survival mining progress + crack overlay — in progress.
-- Item-frame/seat stability and moving-structure attachment.
+### P1 — interaction parity — **implemented with fallbacks**
+- Structure-local `BlockPlaceContext` orientation and validation.
+- Structure-local `useItemOn`/`useWithoutItem`/`ItemStack.useOn`, menus and
+  sign editing.
+- Survival mining progress, creative cooldown, crack overlay and pose-aware
+  break particles.
+- Item-frame/seat host mirrors and moving-structure attachment.
+- Custom expanding placement/break fallback still lacks full drops/stats.
 
 ### P2 — structure level view — **implemented (lightweight view)**
 - Public `StructureLevelView` over the auxiliary void region, with
@@ -159,6 +163,7 @@ for some cases; **MISSING** = not implemented.
 - Structure light occlusion/sky light, weather, mob spawning and vehicle logic.
 - Sable-style plot/assembly/tickets if a true drop-in ecosystem is required.
 
-The honest summary: **rendering, collision and basic edit interactions work;
-world simulation parity is still partial.** The void level gives us block
-entities and random ticks, but not a full world.
+The honest summary: **rendering, collision and block-world simulation inside a
+structure are broadly working. Cross-boundary world logic, AI/pathfinding,
+explosions, host light/weather and mods that require a full structure `Level`
+remain the real gaps.**
