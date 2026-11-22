@@ -33,6 +33,7 @@ public final class CrythstClient implements ClientModInitializer {
         CrythstItemSpecialRenderers.register();
         SpecialBlockRenderManager.register();
         BatchedStructureRenderer.register();
+        io.mikaple.crythst.client.render.structure.moving.StructureMovingBlockRenderer.register();
         ClientStructureInteraction.register();
         StructureSync.registerClient();
         PortalRenderer.register();

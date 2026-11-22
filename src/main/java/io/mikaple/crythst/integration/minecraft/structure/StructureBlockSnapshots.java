@@ -18,12 +18,15 @@ import net.minecraft.nbt.NbtOps;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -260,7 +263,7 @@ public final class StructureBlockSnapshots {
         }
         return new Snapshot(bodyId, bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.sizeX(), bounds.sizeY(), bounds.sizeZ(),
-                copy, nonAir, NEXT_REVISION.incrementAndGet());
+                copy, nonAir, NEXT_REVISION.incrementAndGet(), List.of());
     }
 
     private static Snapshot build(PhysicsStructure structure) {
@@ -281,6 +284,7 @@ public final class StructureBlockSnapshots {
         // renderer (the animation itself is not interpolated here).
         final Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities =
                 StructureBlockEntityData.get(structure);
+        final List<MovingBlock> movingBlocks = new ArrayList<>();
 
         int nonAir = 0;
 
@@ -313,7 +317,18 @@ public final class StructureBlockSnapshots {
                                     .parse(NbtOps.INSTANCE, data.get("blockState"))
                                     .result().orElse(null);
                             if (moved != null && !moved.isAir()) {
-                                state = moved;
+                                final Direction facing = Direction.byName(
+                                        data.getStringOr("facing", "up"));
+                                movingBlocks.add(new MovingBlock(
+                                        localX, localY, localZ, moved,
+                                        data.getFloatOr("progress", 0.0f),
+                                        facing == null ? Direction.UP : facing,
+                                        data.getBooleanOr("extending", false),
+                                        data.getBooleanOr("source", false)));
+                                // The moving-block feature renderer draws this
+                                // entry with interpolation; do not bake it into
+                                // the static section mesh as well.
+                                state = Blocks.AIR.defaultBlockState();
                             }
                         }
                     }
@@ -329,7 +344,7 @@ public final class StructureBlockSnapshots {
         return new Snapshot(structure.body().id(),
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 sizeX, bounds.sizeY(), sizeZ,
-                blocks, nonAir, structure.contentRevision());
+                blocks, nonAir, structure.contentRevision(), movingBlocks);
     }
 
     /**
@@ -348,10 +363,12 @@ public final class StructureBlockSnapshots {
         private final BlockState[] blocks;
         private final int nonAirBlocks;
         private final long revision;
+        private final List<MovingBlock> movingBlocks;
 
         private Snapshot(long bodyId, int minX, int minY, int minZ,
                          int sizeX, int sizeY, int sizeZ,
-                         BlockState[] blocks, int nonAirBlocks, long revision) {
+                         BlockState[] blocks, int nonAirBlocks, long revision,
+                         List<MovingBlock> movingBlocks) {
             this.bodyId = bodyId;
             this.minX = minX;
             this.minY = minY;
@@ -362,6 +379,7 @@ public final class StructureBlockSnapshots {
             this.blocks = blocks;
             this.nonAirBlocks = nonAirBlocks;
             this.revision = revision;
+            this.movingBlocks = List.copyOf(movingBlocks);
         }
 
         public long bodyId() {
@@ -401,6 +419,11 @@ public final class StructureBlockSnapshots {
             return revision;
         }
 
+        /** Moving-piston entries rendered by the client feature renderer. */
+        public List<MovingBlock> movingBlocks() {
+            return movingBlocks;
+        }
+
         /**
          * Block state at an absolute voxel coordinate (the same coordinate
          * space used by the structure's {@link VoxelVolume}). Air is returned
@@ -417,5 +440,15 @@ public final class StructureBlockSnapshots {
             final int localZ = z - minZ;
             return blocks[(localY * sizeZ + localZ) * sizeX + localX];
         }
+    }
+
+
+    /**
+     * One moving-piston block: the moved state, piston progress and direction.
+     * Coordinates are structure-local voxels, like the snapshot grid.
+     */
+    public record MovingBlock(int x, int y, int z, BlockState state,
+                              float progress, Direction direction,
+                              boolean extending, boolean source) {
     }
 }
