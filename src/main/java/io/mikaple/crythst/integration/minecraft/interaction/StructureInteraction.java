@@ -9,6 +9,7 @@ import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
+import io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
@@ -109,6 +110,14 @@ public final class StructureInteraction {
      * authoritative raycast anyway.
      */
     private static final Map<ServerPlayer, Long> LAST_MINE_TICK = new WeakHashMap<>();
+    /**
+     * Collapses the vanilla {@code UseBlockCallback}/{@code UseItemCallback}
+     * and the explicit payload for one physical use click when the void-level
+     * redirect path owns the action. The legacy placement guard remains
+     * separate because an out-of-bounds redirect deliberately falls back to
+     * custom volume expansion.
+     */
+    private static final Map<ServerPlayer, Long> LAST_USE_TICK = new WeakHashMap<>();
 
     /**
      * Minimal edit surface shared by {@link MutableVoxelVolume} and restored
@@ -298,6 +307,27 @@ public final class StructureInteraction {
             return false;
         }
         LAST_MINE_TICK.put(player, now);
+        return true;
+    }
+
+    /**
+     * Server-side duplicate guard for right-click use/placement when the void
+     * redirector owns the action. Fabric callbacks and the explicit payload can
+     * describe the same physical click; vanilla use/placement must run once.
+     *
+     * @return {@code false} when this player already used a structure during
+     *         this tick or the previous one
+     */
+    public static boolean beginInteraction(ServerPlayer player) {
+        if (player == null) {
+            return false;
+        }
+        final long now = player.level().getGameTime();
+        final Long previous = LAST_USE_TICK.get(player);
+        if (previous != null && now - previous >= 0L && now - previous <= 1L) {
+            return false;
+        }
+        LAST_USE_TICK.put(player, now);
         return true;
     }
 
@@ -898,42 +928,26 @@ public final class StructureInteraction {
             return false;
         }
         return switch (action) {
-            case MINE -> {
+            // Legacy one-shot break request. New clients use START/TICK/STOP;
+            // retaining MINE keeps older clients working while still preferring
+            // the void-level vanilla path.
+            case MINE -> mineOnce(player);
+            case START_MINE -> startMining(player);
+            // Heartbeat plus an optional fresh hit for reach/occlusion. The
+            // server tick remains authoritative; a missed client look raycast
+            // never kills an otherwise valid long-press.
+            case TICK_MINE -> {
                 final StructureBlockHitResult hit = raycast(player);
-                yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
-                        && beginMine(player)
-                        && breakBlock(player, hit).success();
+                yield StructureMiningSessions.heartbeat(
+                        player, hit != null && isStructureInFrontOfRealBlocks(player, hit)
+                                ? hit : null);
             }
-            case PLACE -> {
-                final ItemStack stack = player.getMainHandItem();
-                if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-                    yield false;
-                }
-                final StructureBlockHitResult hit = raycast(player);
-                if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)
-                        || !beginPlacement(player)) {
-                    yield false;
-                }
-                if (stack.getItem() instanceof BlockItem) {
-                    final PlaceResult result = placeBlock(player, hit, stack);
-                    if (result.success()) {
-                        stack.consume(1, player);
-                    }
-                    yield result.success();
-                }
-                final StructureEntityPlacementHandler.Result result =
-                        StructureEntityPlacement.place(player, stack, hit,
-                                InteractionHand.MAIN_HAND);
-                if (result.success()) {
-                    stack.consume(1, player);
-                }
-                yield result.success();
+            case STOP_MINE -> {
+                StructureMiningSessions.stop(player);
+                yield true;
             }
-            case USE -> {
-                final StructureBlockHitResult hit = raycast(player);
-                yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
-                        && interactBlock(player, hit).consumesAction();
-            }
+            case PLACE -> placeFromAction(player);
+            case USE -> useFromAction(player);
             case PICK, PICK_WITH_DATA -> {
                 final StructureBlockHitResult hit = raycast(player);
                 yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
@@ -942,6 +956,125 @@ public final class StructureInteraction {
             }
             case SHOVEL_WATER -> shovelWater(player);
         };
+    }
+
+    /**
+     * Legacy one-shot MINE. The void redirector breaks through vanilla
+     * {@code destroyBlock} when possible, otherwise the old custom volume edit
+     * is used.
+     */
+    static boolean mineOnce(ServerPlayer player) {
+        final StructureBlockHitResult hit = raycast(player);
+        if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
+            return false;
+        }
+        if (StructureOperationRedirector.enabled()) {
+            final StructureOperationRedirector.Result result =
+                    StructureOperationRedirector.breakBlock(player, hit);
+            if (result.handled()) {
+                return true;
+            }
+            if (!StructureOperationRedirector.shouldFallback(result.status())) {
+                return false;
+            }
+        }
+        return beginMine(player) && breakBlock(player, hit).success();
+    }
+
+    /**
+     * START_MINE: begin/refresh a server-authoritative held-mining session.
+     * If the auxiliary block/region is unavailable the custom edit is used so
+     * the click is not lost.
+     */
+    private static boolean startMining(ServerPlayer player) {
+        final StructureBlockHitResult hit = raycast(player);
+        if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
+            return false;
+        }
+        if (StructureOperationRedirector.enabled()
+                && StructureMiningSessions.start(player, hit)) {
+            return true;
+        }
+        // Preserve the real game mode's restrictions (adventure) and use the
+        // expanding/custom fallback only when the redirector itself declines.
+        return mineOnce(player);
+    }
+
+    /**
+     * Right-click placement action. Block items route through vanilla
+     * {@code ServerPlayerGameMode.useItemOn} in the void level; a target outside
+     * the copied volume falls back to the expanding custom placement. Entity
+     * items keep their structure-surface handler because a vanilla aux spawn
+     * would sit inside the copied block cell.
+     */
+    private static boolean placeFromAction(ServerPlayer player) {
+        final ItemStack stack = player.getMainHandItem();
+        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
+            return false;
+        }
+        final StructureBlockHitResult hit = raycast(player);
+        if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
+            return false;
+        }
+        if (stack.getItem() instanceof BlockItem
+                && StructureOperationRedirector.enabled()) {
+            if (!beginInteraction(player)) {
+                return true;
+            }
+            final StructureOperationRedirector.Result result =
+                    StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
+            if (result.handled() || result.status() == StructureOperationRedirector.Status.FAILED) {
+                return true;
+            }
+            if (!StructureOperationRedirector.shouldFallback(result.status())) {
+                return true;
+            }
+            // OUT_OF_BOUNDS and unavailable-region statuses fall through to
+            // the custom path below.
+        }
+        if (!beginPlacement(player)) {
+            return true;
+        }
+        if (stack.getItem() instanceof BlockItem) {
+            final PlaceResult result = placeBlock(player, hit, stack);
+            if (result.success()) {
+                stack.consume(1, player);
+            }
+            return result.success();
+        }
+        final StructureEntityPlacementHandler.Result result =
+                StructureEntityPlacement.place(player, stack, hit, InteractionHand.MAIN_HAND);
+        if (result.success()) {
+            stack.consume(1, player);
+        }
+        return result.success();
+    }
+
+    /**
+     * Right-click use action. All ordinary items and empty hands run vanilla
+     * use-on/use-without-item logic in the auxiliary level. The custom
+     * interaction is only a fallback when the redirector is disabled or the
+     * auxiliary block/region is unavailable.
+     */
+    private static boolean useFromAction(ServerPlayer player) {
+        final StructureBlockHitResult hit = raycast(player);
+        if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
+            return false;
+        }
+        if (StructureOperationRedirector.enabled()) {
+            if (!beginInteraction(player)) {
+                return true;
+            }
+            final StructureOperationRedirector.Result result =
+                    StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
+            if (result.handled() || result.status() == StructureOperationRedirector.Status.FAILED) {
+                return true;
+            }
+            if (!StructureOperationRedirector.shouldFallback(result.status())) {
+                return true;
+            }
+        }
+        return interactBlock(player, hit).consumesAction();
     }
 
     /**

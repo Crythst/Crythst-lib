@@ -64,6 +64,34 @@ class StructureOperationRedirectorTest {
     }
 
     @Test
+    void redirectIsEnabledByDefault() {
+        assertTrue(new io.mikaple.crythst.config.CrythstConfig().useVoidLevelOperations);
+    }
+
+    @Test
+    void routedResultsConsumeWithoutLegacyFallback() {
+        assertFalse(StructureOperationRedirector.shouldFallback(
+                StructureOperationRedirector.Status.HANDLED));
+        assertFalse(StructureOperationRedirector.shouldFallback(
+                StructureOperationRedirector.Status.FAILED));
+    }
+
+    @Test
+    void unavailableAndDisabledResultsFallBack() {
+        assertTrue(StructureOperationRedirector.shouldFallback(
+                StructureOperationRedirector.Status.DISABLED));
+        assertTrue(StructureOperationRedirector.shouldFallback(
+                StructureOperationRedirector.Status.NOT_HANDLED),
+                "an unloaded auxiliary chunk must use the custom edit");
+    }
+
+    @Test
+    void outOfBoundsPlacementFallsBackToVolumeExpansion() {
+        assertTrue(StructureOperationRedirector.shouldFallback(
+                StructureOperationRedirector.Status.OUT_OF_BOUNDS));
+    }
+
+    @Test
     void auxiliaryHitClampsNumericalFractions() {
         final Transform3d pose = Transform3d.identity();
         final Vec3 worldHit = new Vec3(3.999999999, 4.000000001, 5.5);

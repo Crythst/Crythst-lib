@@ -3,6 +3,7 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
+import io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
@@ -55,6 +56,7 @@ public final class StructureInteractionEvents {
                 (payload, context) -> context.server().execute(
                         () -> StructureInteraction.handleAction(context.player(), payload.action())));
 
+        StructureMiningSessions.register();
         AttackBlockCallback.EVENT.register(StructureInteractionEvents::onAttackBlock);
         UseBlockCallback.EVENT.register(StructureInteractionEvents::onUseBlock);
         UseItemCallback.EVENT.register(StructureInteractionEvents::onUseItem);
@@ -80,7 +82,14 @@ public final class StructureInteractionEvents {
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
         }
-        StructureInteraction.breakBlock(serverPlayer, hit);
+        if (StructureOperationRedirector.enabled()
+                && StructureMiningSessions.start(serverPlayer, hit)) {
+            // Vanilla game-mode progress now owns this held attack.
+            return InteractionResult.SUCCESS_SERVER;
+        }
+        // Auxiliary region/block unavailable: preserve the redirector's
+        // game-mode restrictions and use the custom edit only when it declines.
+        StructureInteraction.mineOnce(serverPlayer);
         // Any non-PASS value cancels the vanilla break on the logical server.
         return InteractionResult.SUCCESS_SERVER;
     }
@@ -106,33 +115,7 @@ public final class StructureInteractionEvents {
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
         }
-        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-            // Empty hand, tools, buckets, food, ...: run the vanilla block-use
-            // path against the live structure voxel instead of letting the item
-            // use through the structure.
-            return StructureInteraction.interactBlock(serverPlayer, hit).consumesAction()
-                    ? InteractionResult.SUCCESS_SERVER
-                    : InteractionResult.PASS;
-        }
-        if (!StructureInteraction.beginPlacement(serverPlayer)) {
-            return InteractionResult.SUCCESS_SERVER;
-        }
-        if (stack.getItem() instanceof BlockItem) {
-            final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                    serverPlayer, hit, stack);
-            if (!result.success()) {
-                return InteractionResult.FAIL;
-            }
-            stack.consume(1, serverPlayer);
-            return InteractionResult.SUCCESS_SERVER;
-        }
-        final StructureEntityPlacementHandler.Result result = StructureEntityPlacement.place(
-                serverPlayer, stack, hit, InteractionHand.MAIN_HAND);
-        if (!result.success()) {
-            return InteractionResult.FAIL;
-        }
-        stack.consume(1, serverPlayer);
-        return InteractionResult.SUCCESS_SERVER;
+        return useStructure(serverPlayer, hit, stack);
     }
 
     /**
@@ -154,31 +137,68 @@ public final class StructureInteractionEvents {
         if (hit == null || !StructureInteraction.isStructureInFrontOfRealBlocks(serverPlayer, hit)) {
             return InteractionResult.PASS;
         }
-        if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-            // Use-on-air with an ordinary item over a structure is still a
-            // structure use, not an item use through the body.
-            return StructureInteraction.interactBlock(serverPlayer, hit).consumesAction()
+        return useStructure(serverPlayer, hit, stack);
+    }
+
+    /**
+     * Shared right-click routing for the Fabric callbacks.
+     *
+     * <p>Block items and ordinary use items first run vanilla
+     * {@code ServerPlayerGameMode.useItemOn} against the auxiliary void level.
+     * A handled/failed redirect consumes the click; an out-of-bounds block
+     * placement or an unavailable auxiliary region/chunk falls back to the
+     * legacy custom path. Entity items keep the structure-surface handler
+     * because vanilla would spawn them in the copied block cell.</p>
+     */
+    private static InteractionResult useStructure(
+            net.minecraft.server.level.ServerPlayer player,
+            StructureBlockHitResult hit, ItemStack stack) {
+        final boolean placementItem = StructureItemUse.shouldHandleStructureUse(stack);
+        final boolean redirectable = StructureOperationRedirector.enabled()
+                && (!placementItem || stack.getItem() instanceof BlockItem);
+        if (redirectable) {
+            if (!StructureInteraction.beginInteraction(player)) {
+                // The payload or the other use callback already ran this click.
+                return InteractionResult.SUCCESS_SERVER;
+            }
+            final StructureOperationRedirector.Result result =
+                    StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
+            if (result.handled()
+                    || result.status() == StructureOperationRedirector.Status.FAILED) {
+                return InteractionResult.SUCCESS_SERVER;
+            }
+            if (!StructureOperationRedirector.shouldFallback(result.status())) {
+                return InteractionResult.SUCCESS_SERVER;
+            }
+            // OUT_OF_BOUNDS placement and NOT_HANDLED (unloaded aux chunk)
+            // continue to the legacy custom path below.
+        }
+
+        if (!placementItem) {
+            // Empty hand, tools, buckets, food, ...: fallback vanilla block-use
+            // against the structure side table/live block.
+            return StructureInteraction.interactBlock(player, hit).consumesAction()
                     ? InteractionResult.SUCCESS_SERVER
                     : InteractionResult.PASS;
         }
-        if (!StructureInteraction.beginPlacement(serverPlayer)) {
+        if (!StructureInteraction.beginPlacement(player)) {
             return InteractionResult.SUCCESS_SERVER;
         }
         if (stack.getItem() instanceof BlockItem) {
             final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
-                    serverPlayer, hit, stack);
+                    player, hit, stack);
             if (!result.success()) {
                 return InteractionResult.FAIL;
             }
-            stack.consume(1, serverPlayer);
+            stack.consume(1, player);
             return InteractionResult.SUCCESS_SERVER;
         }
         final StructureEntityPlacementHandler.Result result = StructureEntityPlacement.place(
-                serverPlayer, stack, hit, InteractionHand.MAIN_HAND);
+                player, stack, hit, InteractionHand.MAIN_HAND);
         if (!result.success()) {
             return InteractionResult.FAIL;
         }
-        stack.consume(1, serverPlayer);
+        stack.consume(1, player);
         return InteractionResult.SUCCESS_SERVER;
     }
 }

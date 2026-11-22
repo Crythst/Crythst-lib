@@ -24,7 +24,18 @@ public enum StructureAction {
      * Use/activate the structure block under the crosshair. The server
      * re-raycasts and runs vanilla block use against the live auxiliary block.
      */
-    USE;
+    USE,
+    /**
+     * Begin a server-authoritative held-mining session. The server raycasts,
+     * maps the voxel into the auxiliary void level and lets vanilla
+     * {@code ServerPlayerGameMode} own progress until TICK heartbeats stop or
+     * the block completes.
+     */
+    START_MINE,
+    /** Keep the active mining session alive and confirm the same target. */
+    TICK_MINE,
+    /** Release the attack key and abort the active mining session. */
+    STOP_MINE;
 
     private static final StructureAction[] VALUES = values();
 

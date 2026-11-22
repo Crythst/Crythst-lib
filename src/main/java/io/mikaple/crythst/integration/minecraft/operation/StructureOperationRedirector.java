@@ -5,6 +5,7 @@ import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -38,16 +39,21 @@ import org.joml.Vector3d;
  *
  * <p><strong>Feature flag:</strong> all entry points return
  * {@link Status#DISABLED} unless {@link CrythstConfig#useVoidLevelOperations}
- * is enabled. The existing custom interaction path therefore remains the
- * default fallback while this path stabilizes.</p>
+ * is enabled. It is enabled by default; the existing custom interaction path is
+ * retained only as a fallback when the auxiliary region/block is unavailable or
+ * when a placement would grow the copied volume.</p>
  *
- * <p><strong>Integration points:</strong> the server right-click handler can
- * call {@link #useOn(ServerPlayer, StructureBlockHitResult, InteractionHand)}
- * before its custom use logic; the mining/break handler can call
- * {@link #breakBlock(ServerPlayer, StructureBlockHitResult)} after its normal
- * reach/occupancy validation. Callers should treat {@link Status#HANDLED} as
- * consuming vanilla's real-world action and {@link Status#NOT_HANDLED} as
- * permission to run the custom path.</p>
+ * <p><strong>Integration points:</strong> the server right-click handler calls
+ * {@link #useOn(ServerPlayer, StructureBlockHitResult, InteractionHand)} before
+ * its custom use logic; the mining/break handler calls
+ * {@link #breakBlock(ServerPlayer, StructureBlockHitResult)} (or
+ * {@link #breakMapped(ServerPlayer, Mapped)} for a session) after its normal
+ * reach/occupancy validation. Callers must treat {@link Status#HANDLED} and
+ * {@link Status#FAILED} as consuming the real-world action;
+ * {@link #shouldFallback(Status)} marks the statuses that may run the custom
+ * path. In particular {@link Status#OUT_OF_BOUNDS} falls back to volume
+ * expansion, and {@link Status#NOT_HANDLED} (for example an unloaded auxiliary
+ * chunk) falls back to the custom edit.</p>
  */
 public final class StructureOperationRedirector {
     private StructureOperationRedirector() {
@@ -103,6 +109,21 @@ public final class StructureOperationRedirector {
     }
 
     /**
+     * Whether a redirect result permits the legacy custom interaction path.
+     *
+     * <p>{@link Status#HANDLED} and {@link Status#FAILED} already ran vanilla
+     * logic (or deliberately decided not to edit), so falling back would apply
+     * a second edit. Only a disabled redirect, an unavailable auxiliary region
+     * and an out-of-bounds placement are safe to retry; the last one uses the
+     * volume-expanding custom placement.</p>
+     */
+    public static boolean shouldFallback(Status status) {
+        return status == Status.DISABLED
+                || status == Status.NOT_HANDLED
+                || status == Status.OUT_OF_BOUNDS;
+    }
+
+    /**
      * Maps an authoritative structure hit to the auxiliary level.
      *
      * @return the mapping, or {@code null} when the redirect is disabled, the
@@ -151,16 +172,32 @@ public final class StructureOperationRedirector {
             return Result.of(Status.OUT_OF_BOUNDS);
         }
         final ServerLevel hostLevel = (ServerLevel) player.level();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
+        final boolean projecting = physics != null
+                && physics.beginAuxiliaryAudioProjection(mapped.structure());
+        // Block placement derives its orientation from the player's view and
+        // horizontal facing. The auxiliary level is structure-local, so expose
+        // the gravity-adjusted look and yaw in that frame for the duration of
+        // the call. The real rotation is restored before the server tick sends
+        // position packets, so the player never sees a camera snap.
+        final LookRestore look = stack.getItem() instanceof BlockItem
+                ? LookRestore.apply(player, mapped.structure()) : null;
         try {
             final InteractionResult interaction = player.gameMode.useItemOn(
                     player, mapped.live().level(), stack, hand, mapped.auxiliaryHit());
-            finish(player, hostLevel);
             return new Result(Status.HANDLED, interaction);
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level useItemOn failed for structure body #{}",
                     mapped.structure().body().id(), t);
-            finish(player, hostLevel);
             return Result.of(Status.FAILED);
+        } finally {
+            if (look != null) {
+                look.restore(player);
+            }
+            if (projecting) {
+                physics.endAuxiliaryAudioProjection();
+            }
+            finish(player, hostLevel);
         }
     }
 
@@ -174,16 +211,22 @@ public final class StructureOperationRedirector {
             return Result.of(enabled() ? Status.NOT_HANDLED : Status.DISABLED);
         }
         final ServerLevel hostLevel = (ServerLevel) player.level();
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
+        final boolean projecting = physics != null
+                && physics.beginAuxiliaryAudioProjection(mapped.structure());
         try {
             final InteractionResult interaction = mapped.live().state().useWithoutItem(
                     mapped.live().level(), player, mapped.auxiliaryHit());
-            finish(player, hostLevel);
             return new Result(Status.HANDLED, interaction);
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level useWithoutItem failed for structure body #{}",
                     mapped.structure().body().id(), t);
-            finish(player, hostLevel);
             return Result.of(Status.FAILED);
+        } finally {
+            if (projecting) {
+                physics.endAuxiliaryAudioProjection();
+            }
+            finish(player, hostLevel);
         }
     }
 
@@ -199,8 +242,23 @@ public final class StructureOperationRedirector {
         if (mapped == null) {
             return Result.of(enabled() ? Status.NOT_HANDLED : Status.DISABLED);
         }
+        return breakMapped(player, mapped);
+    }
+
+    /**
+     * Runs vanilla {@link ServerPlayerGameMode#destroyBlock} for an already
+     * mapped session target. The mining state machine uses this so a completed
+     * long-press cannot re-map a different block between validation and break.
+     */
+    public static Result breakMapped(ServerPlayer player, Mapped mapped) {
+        if (!enabled() || player == null || mapped == null) {
+            return Result.of(enabled() ? Status.NOT_HANDLED : Status.DISABLED);
+        }
         final ServerLevel hostLevel = (ServerLevel) player.level();
         final ServerPlayerGameMode gameMode = player.gameMode;
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
+        final boolean projecting = physics != null
+                && physics.beginAuxiliaryAudioProjection(mapped.structure());
         try {
             gameMode.setLevel(mapped.live().level());
             final boolean destroyed = gameMode.destroyBlock(mapped.live().pos());
@@ -212,6 +270,9 @@ public final class StructureOperationRedirector {
             return Result.of(Status.FAILED);
         } finally {
             gameMode.setLevel(hostLevel);
+            if (projecting) {
+                physics.endAuxiliaryAudioProjection();
+            }
             finish(player, hostLevel);
         }
     }
@@ -258,6 +319,18 @@ public final class StructureOperationRedirector {
                 && mapped.live().state().canBeReplaced();
     }
 
+    /**
+     * Mirrors and projects the consequences of an operation that was driven
+     * through vanilla game-mode calls outside {@link #useOn}/
+     * {@link #breakMapped} (for example a mining session's vanilla
+     * {@code handleBlockBreakAction}). Safe to call when nothing changed.
+     */
+    public static void finishOperation(ServerPlayer player) {
+        if (player != null && player.level() instanceof ServerLevel hostLevel) {
+            finish(player, hostLevel);
+        }
+    }
+
     private static void finish(ServerPlayer player, ServerLevel hostLevel) {
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
         if (physics == null) {
@@ -267,6 +340,13 @@ public final class StructureOperationRedirector {
             // This mirrors the changed volume, reindexes/refreshes/splits and
             // re-discovers actors.
             physics.flushAuxiliaryBlockStates();
+            // Placing/using a block entity (chest, furnace, ...) can create NBT
+            // that has no state change of its own. Mirror it in the same pass
+            // instead of waiting for the periodic block-entity mirror.
+            final EmptyPhysicsLevel auxiliary = physics.auxiliaryLevel();
+            if (auxiliary != null) {
+                auxiliary.mirrorBlockEntities();
+            }
             // Break/use may have spawned drops, XP orbs or TNT in the void.
             physics.projectAuxiliaryEntities();
         } catch (Throwable t) {
@@ -277,5 +357,40 @@ public final class StructureOperationRedirector {
 
     private static double clampFraction(double value) {
         return Math.max(0.0, Math.min(1.0, value));
+    }
+
+    /**
+     * Temporarily exposes the player's gravity-adjusted look in the structure's
+     * local frame, so vanilla {@code BlockPlaceContext} chooses the same stair /
+     * log / slab orientation a player standing in the structure would choose.
+     */
+    private record LookRestore(float yaw, float pitch, float yawO, float pitchO) {
+        static LookRestore apply(ServerPlayer player, PhysicsStructure structure) {
+            final Vector3d world = PlayerGravity.lookDirection(player);
+            if (world.lengthSquared() < 1.0e-12) {
+                return new LookRestore(player.getYRot(), player.getXRot(),
+                        player.yRotO, player.xRotO);
+            }
+            final Vector3d local = structure.pose().inverseTransformDirection(world).normalize();
+            final float yaw = io.mikaple.crythst.integration.minecraft.interaction
+                    .StructurePlacementMath.lookYaw(local);
+            final float pitch = io.mikaple.crythst.integration.minecraft.interaction
+                    .StructurePlacementMath.lookPitch(local);
+            final LookRestore restore = new LookRestore(
+                    player.getYRot(), player.getXRot(), player.yRotO, player.xRotO);
+            player.setYRot(yaw);
+            player.setXRot(pitch);
+            // Make partial-tick look sampling return the same local direction.
+            player.yRotO = yaw;
+            player.xRotO = pitch;
+            return restore;
+        }
+
+        void restore(ServerPlayer player) {
+            player.setYRot(yaw);
+            player.setXRot(pitch);
+            player.yRotO = yawO;
+            player.xRotO = pitchO;
+        }
     }
 }

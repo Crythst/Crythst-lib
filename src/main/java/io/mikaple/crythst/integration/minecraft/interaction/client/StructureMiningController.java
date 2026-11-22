@@ -14,41 +14,39 @@ import org.jetbrains.annotations.Nullable;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Client-side vanilla-like mining controller for physics-structure voxels.
+ * Client half of held structure mining.
  *
- * <p>This replaces the old "instant break on click, then one voxel every five
- * ticks" shortcut. The controller is driven once per client tick by
- * {@code ClientPreAttackCallback} while the attack key is held:</p>
+ * <p>The server owns progress (see {@code StructureMiningSessions}). This
+ * controller only decides which mining protocol packet the attack callback
+ * should send:</p>
  *
  * <ul>
- *   <li>Creative breaks a valid target with one {@code MINE} packet and does
- *       not repeat until the crosshair reaches another voxel.</li>
- *   <li>Survival accumulates {@code state.getDestroyProgress(...)}-equivalent
- *       progress from hardness, held-tool speed, enchantments and mob effects;
- *       {@code MINE} is sent only when progress reaches {@code 1.0}.</li>
- *   <li>Releasing attack, moving to another voxel, changing the held item,
- *       leaving reach, losing the structure hit or a state change resets the
- *       session.</li>
- *   <li>Vanilla action restrictions, item cooldowns and
- *       {@code ItemStack#canDestroyBlock} are checked before progress starts.</li>
+ *   <li>{@link Update#START} on a fresh target/tool. The server raycasts and
+ *       creates the authoritative session.</li>
+ *   <li>{@link Update#TICK} on every following held tick. This is a heartbeat,
+ *       not a progress claim; it also keeps the vanilla crack overlay fed
+ *       locally.</li>
+ *   <li>{@link Update#STOP} when the target becomes invalid or the attack key
+ *       is released.</li>
  * </ul>
  *
- * <p>The controller publishes an immutable {@link StructureBreakProgress}
- * snapshot for {@code StructureBreakOverlay}. It never touches vanilla
- * {@code blockDestruction} state, because a rotated or scaled structure voxel
- * does not have a matching axis-aligned real block position.</p>
+ * <p>The local {@link MiningProgress} is used only for the crack overlay. It
+ * never decides when the block breaks; the server's vanilla
+ * {@code ServerPlayerGameMode} does that. Vanilla action restrictions, item
+ * cooldowns and {@code ItemStack#canDestroyBlock} are still checked before a
+ * session starts so blocked targets do not send pointless heartbeats.</p>
  */
 public final class StructureMiningController {
-    /** What the attack callback should do with the current tick. */
+    /** What the attack callback should send for the current tick. */
     public enum Update {
-        /** Nothing to do; the callback should still suppress vanilla mining. */
+        /** Nothing to send. */
         NONE,
-        /** A new survival target was started; swing once but send no packet. */
-        STARTED,
-        /** Progress was accumulated; no packet is sent. */
-        PROGRESSING,
-        /** Progress reached 1.0, or creative mode broke the target. Send MINE. */
-        BREAK
+        /** Begin a new server mining session. */
+        START,
+        /** Keep the active session alive. */
+        TICK,
+        /** Abort the active server mining session. */
+        STOP
     }
 
     /** Pure routing decision for the attack callback. */
@@ -65,6 +63,9 @@ public final class StructureMiningController {
     private static @Nullable Target currentTarget;
     private static @Nullable ItemStack currentTool;
     private static int lastTick = Integer.MIN_VALUE;
+    private static boolean completed;
+    private static boolean creativeStarted;
+    private static boolean stopRequested;
     private static volatile @Nullable StructureBreakProgress breakProgress;
 
     private StructureMiningController() {
@@ -81,7 +82,7 @@ public final class StructureMiningController {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.player == null || client.level == null
                     || !client.options.keyAttack.isDown()) {
-                reset();
+                stop();
                 return;
             }
             // Defensive reset for a cancelled callback or a crosshair that
@@ -89,7 +90,7 @@ public final class StructureMiningController {
             final StructureBlockHitResult hit = ClientStructureSelection.current(client);
             if (hit == null || currentTarget == null || !currentTarget.matches(hit)
                     || !CrythstFabric.config().structureBlockInteractionEnabled) {
-                reset();
+                stop();
             }
         });
     }
@@ -103,12 +104,11 @@ public final class StructureMiningController {
     public static Update tick(Minecraft client, LocalPlayer player,
                               StructureBlockHitResult hit, int clickCount) {
         if (client == null || player == null || hit == null) {
-            reset();
-            return Update.NONE;
+            return stop();
         }
         if (player.tickCount == lastTick) {
             // The callback is once per tick, but a future caller (or a mod
-            // chaining the event) must not advance progress twice.
+            // chaining the event) must not advance twice.
             return Update.NONE;
         }
         lastTick = player.tickCount;
@@ -123,40 +123,84 @@ public final class StructureMiningController {
             PROGRESS.reset();
             currentTarget = target;
             currentTool = tool.copy();
+            completed = false;
+            creativeStarted = false;
             breakProgress = null;
         }
 
         if (!isMineable(player, hit, state, tool)) {
-            PROGRESS.reset();
-            breakProgress = null;
-            return Update.NONE;
+            return stop();
+        }
+
+        final boolean creative = player.gameMode().isCreative();
+        if (targetChanged) {
+            creativeStarted = creative;
+            return Update.START;
+        }
+        if (creative) {
+            if (!creativeStarted) {
+                creativeStarted = true;
+                return Update.START;
+            }
+            return Update.TICK;
+        }
+        if (creativeStarted) {
+            // Creative -> survival while holding the same target: the server
+            // has no survival session for it yet.
+            creativeStarted = false;
+            return Update.START;
+        }
+        if (completed) {
+            // Keep the server session alive until its vanilla break removes the
+            // voxel and the authoritative crosshair changes.
+            return Update.TICK;
         }
 
         final float hardness = state.getDestroySpeed(player.level(), hit.getBlockPos());
         final float destroySpeed = player.getDestroySpeed(state);
         final boolean correctTool = player.hasCorrectToolForDrops(state);
         final float perTick = MiningMath.progressPerTick(hardness, destroySpeed, correctTool);
-        final boolean creative = player.gameMode().isCreative();
 
-        final MiningProgress.Step step = PROGRESS.tick(target, tool.getItem(), perTick, creative);
+        final MiningProgress.Step step =
+                PROGRESS.tick(target, tool.getItem(), perTick, false);
         if (step == MiningProgress.Step.BREAK) {
+            completed = true;
             breakProgress = null;
-            return Update.BREAK;
+            // No BREAK packet exists any more: the server completes the session
+            // itself. The next TICK is just a heartbeat while the block update
+            // travels back.
+            return Update.TICK;
         }
         if (PROGRESS.isMining()) {
             breakProgress = StructureBreakProgress.of(hit, PROGRESS.progress());
-            return targetChanged ? Update.STARTED : Update.PROGRESSING;
         }
-        breakProgress = null;
-        return targetChanged ? Update.STARTED : Update.NONE;
+        return Update.TICK;
     }
 
-    /** Stops the current session immediately. */
+    /** Stops the current session immediately and requests a STOP packet. */
+    public static Update stop() {
+        final boolean wasActive = currentTarget != null || PROGRESS.hasTarget();
+        clear();
+        if (wasActive) {
+            stopRequested = true;
+            return Update.STOP;
+        }
+        return Update.NONE;
+    }
+
+    /** Clears local state without requesting a STOP packet. */
     public static void reset() {
-        PROGRESS.reset();
-        currentTarget = null;
-        currentTool = null;
-        breakProgress = null;
+        clear();
+    }
+
+    /**
+     * Whether the client asked to send one STOP packet since the last poll.
+     * Used by the release listener in {@link ClientStructureInteraction}.
+     */
+    public static boolean consumeStopRequest() {
+        final boolean requested = stopRequested;
+        stopRequested = false;
+        return requested;
     }
 
     /**
@@ -176,6 +220,15 @@ public final class StructureMiningController {
             return AttackRoute.MINE;
         }
         return waterHit ? AttackRoute.SHOVEL_WATER : AttackRoute.PASS;
+    }
+
+    private static void clear() {
+        PROGRESS.reset();
+        currentTarget = null;
+        currentTool = null;
+        completed = false;
+        creativeStarted = false;
+        breakProgress = null;
     }
 
     private static boolean isMineable(LocalPlayer player, StructureBlockHitResult hit,

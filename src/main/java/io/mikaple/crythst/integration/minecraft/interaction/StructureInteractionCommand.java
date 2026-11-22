@@ -81,6 +81,23 @@ public final class StructureInteractionCommand {
             source.sendFailure(Component.literal("Crythst: no physics structure in reach"));
             return 0;
         }
+        if (io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector.enabled()) {
+            final var redirected =
+                    io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector
+                            .breakBlock(player, hit);
+            if (redirected.handled()) {
+                source.sendSuccess(() -> Component.literal("Crythst mined structure #"
+                        + hit.structure().body().id() + " voxel (" + hit.voxelX() + ","
+                        + hit.voxelY() + "," + hit.voxelZ() + ") through the void level"), true);
+                return 1;
+            }
+            if (!io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector
+                    .shouldFallback(redirected.status())) {
+                source.sendFailure(Component.literal(
+                        "Crythst: void-level break failed (" + redirected.status() + ")"));
+                return 0;
+            }
+        }
         final StructureInteraction.BreakResult result = StructureInteraction.breakBlock(player, hit);
         if (!result.success()) {
             source.sendFailure(Component.literal("Crythst: structure voxel is read-only or already empty"
@@ -109,6 +126,30 @@ public final class StructureInteractionCommand {
         if (hit == null) {
             source.sendFailure(Component.literal("Crythst: no physics structure in reach"));
             return 0;
+        }
+        if (io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector.enabled()) {
+            final var redirected =
+                    io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector
+                            .useOn(player, hit, net.minecraft.world.InteractionHand.MAIN_HAND);
+            if (redirected.handled() || redirected.status()
+                    == io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector
+                    .Status.FAILED) {
+                if (redirected.handled()) {
+                    source.sendSuccess(() -> Component.literal("Crythst used "
+                            + blockItem.getBlock().getName().getString()
+                            + " through the void level"), true);
+                    return 1;
+                }
+                source.sendFailure(Component.literal(
+                        "Crythst: void-level placement failed (" + redirected.status() + ")"));
+                return 0;
+            }
+            if (!io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector
+                    .shouldFallback(redirected.status())) {
+                source.sendFailure(Component.literal(
+                        "Crythst: void-level placement refused (" + redirected.status() + ")"));
+                return 0;
+            }
         }
         final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(
                 player, hit, stack);

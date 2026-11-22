@@ -7,6 +7,7 @@ import io.mikaple.crythst.integration.minecraft.interaction.StructureAction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureActionPayload;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureItemUse;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.client.player.ClientPreAttackCallback;
 import net.minecraft.client.Minecraft;
@@ -54,6 +55,9 @@ public final class ClientStructureInteraction {
         }
         ClientPreAttackCallback.EVENT.register(ClientStructureInteraction::onPreAttack);
         StructureMiningController.register();
+        // Registered after the controller so a key release in the controller's
+        // END_CLIENT_TICK pass can be turned into one STOP packet here.
+        ClientTickEvents.END_CLIENT_TICK.register(ClientStructureInteraction::flushMiningStop);
         StructureBreakOverlay.register();
         // Register the vanilla-outline override here because the client
         // entrypoint already calls this method. It must run after vanilla has
@@ -65,7 +69,7 @@ public final class ClientStructureInteraction {
         if (player == null
                 || !CrythstFabric.config().structureBlockInteractionEnabled
                 || player.isSpectator()) {
-            StructureMiningController.reset();
+            stopMining(player);
             return false;
         }
         final double reach = player.blockInteractionRange();
@@ -90,26 +94,34 @@ public final class ClientStructureInteraction {
         final StructureMiningController.AttackRoute route =
                 StructureMiningController.route(structureHit != null, waterHit != null);
         if (route == StructureMiningController.AttackRoute.PASS) {
-            StructureMiningController.reset();
+            stopMining(player);
             return false;
         }
         if (!ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
             // If the channel is unavailable, leave vanilla behaviour alone.
-            StructureMiningController.reset();
+            stopMining(player);
             return false;
         }
 
         if (route == StructureMiningController.AttackRoute.MINE) {
-            // The controller owns survival progress and creative instant
-            // breaking. It sends MINE only on a completed target, so holding
-            // the key no longer emits a packet every five ticks.
+            // The server owns progress and completion. START creates the
+            // authoritative void-level session, TICK is a heartbeat and STOP
+            // aborts it; no progress value crosses the wire.
             final StructureMiningController.Update update =
                     StructureMiningController.tick(client, player, structureHit, clickCount);
             switch (update) {
-                case BREAK -> send(player, StructureAction.MINE);
-                case STARTED -> player.swing(InteractionHand.MAIN_HAND,
-                        SwingAnimation.DEFAULT, true);
-                case NONE, PROGRESSING -> {
+                case START -> {
+                    // Drop any previous session before starting a new target.
+                    StructureMiningController.consumeStopRequest();
+                    send(player, StructureAction.STOP_MINE, false);
+                    send(player, StructureAction.START_MINE);
+                }
+                case TICK -> send(player, StructureAction.TICK_MINE, false);
+                case STOP -> {
+                    StructureMiningController.consumeStopRequest();
+                    send(player, StructureAction.STOP_MINE, false);
+                }
+                case NONE -> {
                     // Progress is rendered by StructureBreakOverlay.
                 }
             }
@@ -119,11 +131,37 @@ public final class ClientStructureInteraction {
         }
 
         // Shovel + water is still a one-shot action, not a held break.
-        StructureMiningController.reset();
+        stopMining(player);
         if (clickCount != 0) {
             send(player, StructureAction.SHOVEL_WATER);
         }
         return true;
+    }
+
+    /**
+     * END_CLIENT_TICK flush for a STOP requested by the controller's release
+     * or target-loss reset.
+     */
+    private static void flushMiningStop(Minecraft client) {
+        if (!StructureMiningController.consumeStopRequest()) {
+            return;
+        }
+        final LocalPlayer player = client.player;
+        if (player != null && ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
+            ClientPlayNetworking.send(new StructureActionPayload(StructureAction.STOP_MINE));
+        }
+    }
+
+    /**
+     * Stops a held session immediately and sends one STOP if it was active.
+     */
+    private static void stopMining(LocalPlayer player) {
+        if (StructureMiningController.stop() == StructureMiningController.Update.STOP) {
+            StructureMiningController.consumeStopRequest();
+            if (player != null && ClientPlayNetworking.canSend(StructureActionPayload.TYPE)) {
+                ClientPlayNetworking.send(new StructureActionPayload(StructureAction.STOP_MINE));
+            }
+        }
     }
 
     /**
@@ -166,7 +204,7 @@ public final class ClientStructureInteraction {
         // Do not send ServerboundUseItemOnPacket. Only the authoritative
         // structure action is sent; the server re-raycasts from the player's
         // look vector and never runs BlockItem.place for this click.
-        StructureMiningController.reset();
+        stopMining(player);
         return send(player, StructureItemUse.actionForUse(player.getMainHandItem()));
     }
 
@@ -196,7 +234,7 @@ public final class ClientStructureInteraction {
                 ? StructureAction.PICK_WITH_DATA
                 : StructureAction.PICK;
         // Pick-block does not swing the arm.
-        StructureMiningController.reset();
+        stopMining(player);
         return send(player, action, false);
     }
 

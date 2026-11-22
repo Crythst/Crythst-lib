@@ -22,6 +22,13 @@ class StructureActionTest {
     }
 
     @Test
+    void miningSessionActionsAppendAfterUse() {
+        assertEquals(StructureAction.START_MINE, StructureAction.fromId(6));
+        assertEquals(StructureAction.TICK_MINE, StructureAction.fromId(7));
+        assertEquals(StructureAction.STOP_MINE, StructureAction.fromId(8));
+    }
+
+    @Test
     void unknownIdsStillFallBackToMine() {
         assertEquals(StructureAction.MINE, StructureAction.fromId(99));
         assertEquals(StructureAction.MINE, StructureAction.fromId(-1));

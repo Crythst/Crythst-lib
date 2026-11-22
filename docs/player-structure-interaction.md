@@ -17,15 +17,15 @@ hand-off are described in [selection-targeting.md](selection-targeting.md).
 
 | Requirement | Implemented path |
 | --- | --- |
-| Left-click a structure block to break it | survival uses vanilla hardness/tool/effect progress and sends `MINE` only at 1.0; creative sends one immediate `MINE` |
-| Breaking applies a reaction impulse to the body | `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)` |
-| Break progress overlay | `StructureBreakOverlay` submits the vanilla breaking model with the structure voxel's rotated/scaled pose |
-| Right-click a structure block to place a block | `StructureInteraction.placeBlock(...)` via `UseBlockCallback`, `UseItemCallback`, and the `PLACE` payload for virtual-air targets |
-| Right-click a structure block to use it (empty hand, tool, bucket, food) | `StructureInteraction.interactBlock(...)` via the `USE` payload: live auxiliary state, vanilla `useItemOn`/`useWithoutItem`, containers open their menu |
+| Left-click a structure block to break it | `START_MINE`/`TICK_MINE`/`STOP_MINE` drive `StructureMiningSessions`: server-owned vanilla progress completes with vanilla `destroyBlock`; creative breaks on START |
+| Breaking applies a reaction impulse to the body | the legacy custom break fallback keeps `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)`; the redirected vanilla path does not fabricate an impulse |
+| Break progress overlay | `StructureBreakOverlay` submits the vanilla breaking model with the structure voxel's rotated/scaled pose; the server owns the actual break |
+| Right-click a structure block to place a block | `StructureOperationRedirector.useOn(...)` runs vanilla `BlockItem`/`BlockPlaceContext` in the void level; outside-volume targets fall back to `StructureInteraction.placeBlock(...)` for expansion |
+| Right-click a structure block to use it (empty hand, tool, bucket, food) | `StructureOperationRedirector.useOn(...)` runs vanilla `ServerPlayerGameMode.useItemOn` against the live auxiliary block, so menus, buttons, dispensers and `useWithoutItem` are vanilla |
 | Right-click with a spawn egg / item frame / registered entity item | `StructureEntityPlacement.place(...)`: server re-raycast, surface-point math, vanilla entity spawn, no real support block required |
 | Middle-click a structure block to pick it | `StructureInteraction.pickBlock(...)` via the client `PICK` / `PICK_WITH_DATA` payload and vanilla `tryPickItem` |
-| Placement validation | `StructurePlacementValidation` rejects solid/non-replaceable targets, unsupported interior cells, `canSurvive` failures and exact-shape entity obstruction before any mutation |
-| Structure-local orientation | `StructurePlacementContext` transforms the click point and look into the structure frame, so stairs/slabs/logs/pillars use local yaw/pitch/face/click fraction; no world-frame leakage |
+| Placement validation | in-volume placement uses vanilla `BlockItem.canPlace` (`canSurvive`, obstruction, replaceability); the volume-expanding fallback uses `StructurePlacementValidation` before any mutation |
+| Structure-local orientation | for redirected block placement the player's gravity-adjusted look is temporarily expressed in structure yaw/pitch, so vanilla `BlockPlaceContext` chooses local stairs/slabs/logs/pillars; the fallback uses `StructurePlacementContext` with local click point/face |
 | Selection outline | vanilla outline state built from the same `StructureBlockHitResult`; no custom white box |
 | Real selection target | `ClientLevel.clip(ClipContext)` merges the nearest structure hit into the vanilla clip result; `Minecraft.hitResult` is authoritative without a post-pick override |
 | Shovel + left-click water applies player recoil | `StructureInteraction.shovelWater(...)` via the client `SHOVEL_WATER` payload |
@@ -49,28 +49,32 @@ may mine".
 
 ### 1.2 Mining progress algorithm
 
-`StructureMiningController` replaces the old instant break plus five-tick
-repeat. Every held-attack tick:
+The server owns mining progress; the client only sends a small protocol:
 
-1. Builds a target token from `bodyId`, structure voxel and `BlockState`
-   identity, plus the held `ItemStack`. A change in any of these resets the
-   session to zero. Releasing attack, losing the structure hit, leaving reach or
-   a state change also resets it.
-2. Checks `blockActionRestricted`, the item cooldown, `ItemStack#canDestroyBlock`
-   and (in creative) the `GameMasterBlock` permission. A blocked target still
-   suppresses vanilla block breaking but accumulates no progress.
-3. Reads `state.getDestroySpeed(level, pos)`, `player.getDestroySpeed(state)` and
-   `player.hasCorrectToolForDrops(state)`. `Player#getDestroySpeed` already
-   includes tool speed, Efficiency, Haste/Mining Fatigue, the block-break-speed
-   attribute, submerged mining and the off-ground penalty.
-4. Computes `destroySpeed / hardness / (correctTool ? 30 : 100)` and adds it to
-   the session. Creative returns a break immediately instead. `MINE` is sent
-   **only** when progress reaches `1.0`; a completed target is marked so a
-   stale hit cannot emit repeated packets until the crosshair moves.
-5. Publishes the progress for the break overlay.
+| Packet | Server behaviour |
+| --- | --- |
+| `START_MINE` | Re-raycast, reach/occlusion check, map the voxel into the void level. Creative calls vanilla `destroyBlock` immediately. Survival starts a server-side session with zero progress. |
+| `TICK_MINE` | Heartbeat only. It carries no progress value. The server tick advances vanilla `BlockState#getDestroyProgress` for the session. |
+| `STOP_MINE` | Abort/remove the session. A missing heartbeat for four ticks has the same effect. |
 
-The pure state machine (`MiningProgress`) and formula (`MiningMath`) do not
-reference Minecraft classes and are unit-tested directly.
+At server-side progress `1.0` the session calls vanilla
+`ServerPlayerGameMode.destroyBlock` against the auxiliary level, so it supplies
+drops, XP, statistics, durability and tool/game-master rules. Every server tick
+also revalidates reach, real-block occlusion, the held item type, the live
+auxiliary block state and the game mode; a changed target or an unloaded
+auxiliary chunk drops the session. The client's
+`MiningProgress`/`MiningMath` remain a local visual estimate for the crack
+overlay only and never decide when the block breaks.
+
+Vanilla `handleBlockBreakAction` is intentionally not used for the start/stop
+transitions. It requires the player to be within interaction range of the
+target `BlockPos`, but the target is an auxiliary-region coordinate far from
+the player; calling it would silently reject every session and leave
+long-press mining inert. Progress and completion still use the vanilla
+`getDestroyProgress` / `destroyBlock` rules.
+
+The pure `VoidMiningSession` state machine (start/restart/heartbeat/expiry/
+complete, creative instant, no double break) is unit-tested without a server.
 
 ### 1.3 Break overlay
 
@@ -110,6 +114,11 @@ New server/integration files:
 - `.../interaction/StructureActionPayload.java`
 - `.../interaction/StructureInteractionEvents.java`
 - `.../interaction/StructureInteractionCommand.java`
+- `.../interaction/StructureMiningSessions.java` — server-authoritative
+  START/TICK/STOP sessions with vanilla progress and `destroyBlock` completion
+- `.../operation/StructureOperationRedirector.java` — void-level
+  `useItemOn`/`destroyBlock` redirect and fallback routing
+- `.../operation/VoidMiningSession.java` — pure session state machine
 - `.../interaction/StructureFeedback.java` — shared server-side break particles
   and positional break/place sound (placement is sound-only)
 - `.../interaction/StructureRayMath.java`
@@ -735,6 +744,27 @@ overlay are now implemented. Remaining work:
 
 ---
 
+## 8.1 Limitations
+
+- The client crack overlay is a local visual estimate. The actual break is
+  server-side and may complete a tick earlier/later than the overlay; the
+  overlay never triggers the break.
+- Vanilla mining progress and completion use the vanilla
+  `BlockState#getDestroyProgress` / `ServerPlayerGameMode.destroyBlock` rules
+  against the auxiliary level. `handleBlockBreakAction` is not used because its
+  interaction-range check targets the far auxiliary coordinate; the structure
+  crack overlay is the visible crack.
+- Container menus open from the auxiliary block position. The
+  `AuxiliaryMenuPositionMixin` maps that position back to the host structure
+  voxel for range validation, but a menu's block-entity coordinates remain
+  auxiliary internally.
+- Entity items (spawn eggs, item frames, registered handlers) keep the custom
+  surface-placement path; vanilla placement in the void would use the copied
+  block cell rather than the rotated/scaled structure surface.
+- If the auxiliary region/chunk is unavailable, mining/placement/use falls back
+  to the legacy custom edit. Mining then breaks on START rather than after a
+  held-progress session.
+
 ## 9. Diagnostics and tests
 
 - `/crythstinteraction ray` isolates server-side raycast/volume problems from
@@ -783,6 +813,17 @@ overlay are now implemented. Remaining work:
   creative breaks once immediately, and losing the target clears the session.
 - `StructureMiningRoutingTest` verifies structure-vs-water routing and that no
   target leaves vanilla attack handling alone.
+- `VoidMiningSessionTest` covers the server session state machine: creative
+  completes exactly once on START, survival long-hold accumulates to BREAK,
+  STOP aborts, missing heartbeats expire, target/tool changes restart at zero,
+  duplicate START keeps progress, and a completed target never emits a second
+  break.
+- `StructureOperationRedirectorTest` verifies the redirect/fallback routing
+  (`HANDLED`/`FAILED` consume, `DISABLED`/`NOT_HANDLED` fall back,
+  `OUT_OF_BOUNDS` uses volume expansion), the default-enabled config flag and
+  auxiliary hit geometry.
+- `StructureActionTest` keeps the original action ids stable and covers the
+  appended START_MINE/TICK_MINE/STOP_MINE ids.
 - `RestoredStructureVolumeEditTest` verifies that a restored volume supports
   break and place edits (mass/material included).
 
