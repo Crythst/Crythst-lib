@@ -3097,7 +3097,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
         @Override
         public int getSignal(BlockPos pos, Direction direction) {
-            if (owner != null && !owner.isInsideRegion(pos)) {
+            if (owner != null && owner.boundaryBridge() != null
+                    && !owner.isInsideRegion(pos)) {
                 return owner.boundarySignal(pos, direction);
             }
             final BlockState state = getBlockState(pos);
@@ -3110,7 +3111,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
         @Override
         public int getDirectSignal(BlockPos pos, Direction direction) {
-            if (owner != null && !owner.isInsideRegion(pos)) {
+            if (owner != null && owner.boundaryBridge() != null
+                    && !owner.isInsideRegion(pos)) {
                 return owner.boundaryDirectSignal(pos, direction);
             }
             return getBlockState(pos).getDirectSignal(this, pos, direction);

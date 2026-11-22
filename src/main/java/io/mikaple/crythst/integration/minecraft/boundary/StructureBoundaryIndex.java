@@ -25,6 +25,9 @@ import java.util.List;
  * {@link BoundaryFaceMapping}.</p>
  */
 public final class StructureBoundaryIndex {
+    /** Safety cap for the geometric shell of an extremely large body. */
+    private static final long MAX_SHELL_FACES = 262_144L;
+
     private final IntBounds3 bounds;
     private final long contentRevision;
     private final List<BoundaryFace> faces;
@@ -39,7 +42,17 @@ public final class StructureBoundaryIndex {
     public static StructureBoundaryIndex build(PhysicsStructure structure) {
         final VoxelVolume volume = structure.volume();
         final IntBounds3 bounds = volume.bounds();
-        final List<BoundaryFace> faces = new ArrayList<>();
+        final long sizeX = bounds.sizeX();
+        final long sizeY = bounds.sizeY();
+        final long sizeZ = bounds.sizeZ();
+        final long faceCount = 2L * (sizeX * sizeZ + sizeX * sizeY + sizeY * sizeZ);
+        if (faceCount > MAX_SHELL_FACES) {
+            // Do not allocate an unbounded shell for a pathological body. The
+            // rest of the boundary graph still works; only fluid/hopper face
+            // scans are skipped for this structure.
+            return new StructureBoundaryIndex(bounds, structure.contentRevision(), List.of());
+        }
+        final List<BoundaryFace> faces = new ArrayList<>((int) Math.max(16L, faceCount));
         // The external shell is purely geometric. Generate the six bound
         // planes directly instead of scanning the whole volume; a 64^3 solid
         // structure then costs ~24k faces, not 262k interior cells.
