@@ -223,6 +223,13 @@ authoritative `player.connection.teleport(...)` correction.
 -Dcrythst.portal.fade=true                opt-in legacy debug fade
 ```
 
+Two F3 + F6 entries come from the mod itself (both off by default):
+
+| Entry | What it shows |
+| --- | --- |
+| `crythst:portal` | opening outline, plane normal, right/up axes, destination outline + link line (same dimension only), the traversal box, and a label with name, size, link and carrier body id. |
+| `crythst:portal_stats` | portals rendered, deepest recursion layer, extracted chunk sections, extraction and pass-recording milliseconds, and the active recursion/per-round/target caps. |
+
 ## 9. Acceptance against the guide's section 10
 
 | Criterion | State |
@@ -233,7 +240,7 @@ authoritative `player.connection.teleport(...)` correction.
 | Destination entities / block entities / particles / sky / fog | **Implemented** for entities, block entities, particles, sky, fog, clouds, weather and world border. OIT/see-through/always-on-top features, block-breaking overlays, transient blocks and destination gizmos are not yet submitted. |
 | At least 2 recursion layers | **Implemented** (layer 1 + layer 2); layer 2 is depth-tested against layer 1's destination depth and depth is restored only outside `mask2 * mask1`. |
 | Same-dimension + cross-dimension + multiplayer | Same-dimension render + teleport, cross-dimension teleport, multiplayer registry sync. Cross-dimension **rendering** is blocked (one `ClientLevel`). |
-| Moving portals | Pose updates and per-frame recapture work through `PortalManager.move`; automatic carrier binding is not implemented. |
+| Moving portals | **Implemented** through `PortalAnchor`: the server samples `PhysicsStructure#pose()` and the client samples `ClientStructureCache#interpolatedPose` every frame (see §7). |
 | Cost scales with opening pixels, not whole-world redraw | **Partial.** Destination terrain/entities are scissored to the opening bounds, but the destination section extraction is full visible-set extraction and the sky/snapshot are full-frame. See §10. |
 | In-game automated test + screenshot regression | **Blocked in this change.** No client/gametest run was permitted; pure tests cover the math. |
 

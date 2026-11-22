@@ -37,6 +37,8 @@ public abstract class DebugScreenEntriesMixin {
         }
         merged.put(CrythstDebugEntries.STRUCTURE_TARGET,
                 CrythstDebugEntries.STRUCTURE_TARGET_ENTRY);
+        merged.put(CrythstDebugEntries.PORTAL_STATS,
+                CrythstDebugEntries.PORTAL_STATS_ENTRY);
         cir.setReturnValue(Collections.unmodifiableMap(merged));
     }
 
@@ -48,6 +50,10 @@ public abstract class DebugScreenEntriesMixin {
         }
         if (id.equals(CrythstDebugEntries.STRUCTURE_TARGET)) {
             cir.setReturnValue(CrythstDebugEntries.STRUCTURE_TARGET_ENTRY);
+            return;
+        }
+        if (id.equals(CrythstDebugEntries.PORTAL_STATS)) {
+            cir.setReturnValue(CrythstDebugEntries.PORTAL_STATS_ENTRY);
             return;
         }
         if (CrythstDebugEntries.ALL_RENDERERS.contains(id)) {

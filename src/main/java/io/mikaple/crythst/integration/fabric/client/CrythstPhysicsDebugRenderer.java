@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.fabric.client;
 
 import io.mikaple.crythst.client.render.debug.ForceDebugOverlay;
+import io.mikaple.crythst.client.render.portal.PortalDebugGizmos;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.client.renderer.debug.DebugRenderer;
@@ -45,6 +46,9 @@ public final class CrythstPhysicsDebugRenderer implements DebugRenderer.SimpleDe
         }
         if (all || enabled(CrythstDebugEntries.PHYSICS_FORCES)) {
             ForceDebugOverlay.emit();
+        }
+        if (all || enabled(CrythstDebugEntries.PHYSICS_PORTAL)) {
+            PortalDebugGizmos.emit();
         }
     }
 

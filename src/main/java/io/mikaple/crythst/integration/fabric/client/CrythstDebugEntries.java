@@ -1,5 +1,6 @@
 package io.mikaple.crythst.integration.fabric.client;
 
+import io.mikaple.crythst.client.render.portal.PortalDebugText;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.debug.DebugEntryCategory;
@@ -53,6 +54,12 @@ public final class CrythstDebugEntries {
     /** Per-structure force/torque totals and force-group arrows. */
     public static final Identifier PHYSICS_FORCES =
             Identifier.fromNamespaceAndPath("crythst", "physics_forces");
+    /** Portal openings, plane normals, destination outlines and traversal boxes. */
+    public static final Identifier PHYSICS_PORTAL =
+            Identifier.fromNamespaceAndPath("crythst", "portal");
+    /** F3 text entry for the portal renderer's per-frame cost. */
+    public static final Identifier PORTAL_STATS =
+            Identifier.fromNamespaceAndPath("crythst", "portal_stats");
     /** F3 text entry for the structure voxel under the crosshair. */
     public static final Identifier STRUCTURE_TARGET =
             Identifier.fromNamespaceAndPath("crythst", "structure_target");
@@ -60,13 +67,17 @@ public final class CrythstDebugEntries {
     /** All renderer ids, in registration order. */
     public static final List<Identifier> ALL_RENDERERS = List.of(
             PHYSICS, PHYSICS_COLLIDERS, PHYSICS_BOUNDS, PHYSICS_DYNAMICS,
-            PHYSICS_CONTACTS, PHYSICS_BODIES, PHYSICS_TERRAIN, PHYSICS_FORCES);
+            PHYSICS_CONTACTS, PHYSICS_BODIES, PHYSICS_TERRAIN, PHYSICS_FORCES,
+            PHYSICS_PORTAL);
 
     /** Shared entry implementation; the debug options screen labels by id path. */
     public static final DebugScreenEntry ENTRY = new PhysicsEntry();
 
     /** Text entry for the targeted structure voxel. */
     public static final DebugScreenEntry STRUCTURE_TARGET_ENTRY = new StructureTargetEntry();
+
+    /** Text entry for the portal renderer cost. */
+    public static final DebugScreenEntry PORTAL_STATS_ENTRY = new PortalStatsEntry();
 
     private CrythstDebugEntries() {
     }
@@ -98,6 +109,21 @@ public final class CrythstDebugEntries {
         @Override
         public DebugEntryCategory category() {
             return DebugEntryCategory.RENDERER;
+        }
+    }
+
+    private static final class PortalStatsEntry implements DebugScreenEntry {
+        @Override
+        public void display(DebugScreenDisplayer displayer, @Nullable Level level,
+                            @Nullable LevelChunk clientChunk, @Nullable LevelChunk serverChunk) {
+            for (String line : PortalDebugText.lines()) {
+                displayer.addLine(line);
+            }
+        }
+
+        @Override
+        public DebugEntryCategory category() {
+            return DebugEntryCategory.SCREEN_TEXT;
         }
     }
 

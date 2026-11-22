@@ -63,7 +63,11 @@ public final class PortalRenderManager {
     private volatile List<PortalRenderData> layers = List.of();
     private volatile int lastSectionCount;
     private volatile int lastVisiblePortals;
+    private volatile int lastMaxLayer;
+    private volatile double lastExtractMillis;
+    private volatile double lastPassMillis;
     private long lastExtractStartNanos;
+    private static volatile PortalRenderStats stats = PortalRenderStats.EMPTY;
 
     private PortalRenderManager() {
     }
@@ -74,6 +78,14 @@ public final class PortalRenderManager {
 
     public static boolean isDestinationExtracting() {
         return INSTANCE.destinationExtracting;
+    }
+
+    /**
+     * Statistics for the most recent frame, for the {@code crythst:portal_stats}
+     * F3 entry. Never allocates unless the caller reads it.
+     */
+    public static PortalRenderStats stats() {
+        return stats;
     }
 
     /** Legacy name used by older portal hooks. */
@@ -110,6 +122,7 @@ public final class PortalRenderManager {
             // portal definition take down the main frame; drop the whole cache
             // so addFramePass cannot consume a half-built previous frame.
             INSTANCE.layers = List.of();
+            INSTANCE.publishExtract(0, 0, 0);
             PortalRenderDiagnostics.failure(
                     "Crythst portal extraction failed; skipping frame", error);
         }
@@ -131,7 +144,11 @@ public final class PortalRenderManager {
         if (data.isEmpty()) {
             return main;
         }
-        return INSTANCE.pass.addPass(frame, main, data);
+        final long passStart = System.nanoTime();
+        final ResourceHandle<RenderTarget> result = INSTANCE.pass.addPass(frame, main, data);
+        INSTANCE.lastPassMillis = (System.nanoTime() - passStart) / 1.0e6;
+        stats = stats.withPassMillis(INSTANCE.lastPassMillis, System.nanoTime());
+        return result;
     }
 
     private void registerInternal() {
@@ -156,6 +173,7 @@ public final class PortalRenderManager {
                 || mainState == null || mainState.cameraRenderState == null
                 || mainState.cameraRenderState.pos == null) {
             layers = List.of();
+            publishExtract(0, 0, 0);
             return;
         }
         final CameraRenderState mainCamera = mainState.cameraRenderState;
@@ -164,12 +182,14 @@ public final class PortalRenderManager {
             layers = List.of();
             lastVisiblePortals = 0;
             lastSectionCount = 0;
+            publishExtract(0, 0, 0);
             return;
         }
 
         final RenderTarget mainTarget = gameRenderer.mainRenderTarget();
         if (mainTarget == null || mainTarget.width <= 0 || mainTarget.height <= 0) {
             layers = List.of();
+            publishExtract(0, 0, 0);
             return;
         }
         final int width = mainTarget.width;
@@ -264,10 +284,29 @@ public final class PortalRenderManager {
         layers = List.copyOf(extracted);
         lastVisiblePortals = rootsRendered;
         lastSectionCount = sectionCount;
+        int maxLayer = 0;
+        for (PortalRenderData data : extracted) {
+            maxLayer = Math.max(maxLayer, data.layer());
+        }
+        publishExtract(rootsRendered, maxLayer, sectionCount);
         if (PortalCaptureSettings.TRACE) {
             PortalRenderDiagnostics.round(lastVisiblePortals, lastSectionCount, 0.0,
                     (System.nanoTime() - lastExtractStartNanos) / 1.0e6, 0L);
         }
+    }
+
+    /**
+     * Publishes the per-frame counters for the F3 stats entry.
+     *
+     * @param portals    root portals rendered this frame
+     * @param maxLayer   deepest recursion layer rendered
+     * @param sections   chunk sections extracted for all layers
+     */
+    private void publishExtract(int portals, int maxLayer, int sections) {
+        final long now = System.nanoTime();
+        lastExtractMillis = (now - lastExtractStartNanos) / 1.0e6;
+        stats = new PortalRenderStats(portals, maxLayer, sections,
+                lastExtractMillis, lastPassMillis, now);
     }
 
     private PortalRenderData extractChild(Minecraft minecraft, Camera camera,
