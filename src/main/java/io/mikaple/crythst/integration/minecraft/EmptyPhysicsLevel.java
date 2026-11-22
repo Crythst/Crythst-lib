@@ -1808,6 +1808,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     MinecraftPhysics.blockPhysics().properties(state);
             restored.setBlock(x, y, z, solid, properties.mass(), properties.material(), state);
             volumeChanged = true;
+        } else if (volume instanceof EditableStatefulVolume stateful) {
+            // Split components: keep the collision grid and the recorded state
+            // in sync so a later break/place still sees the right block.
+            final BlockPhysicsMapper.BlockProperties properties =
+                    MinecraftPhysics.blockPhysics().properties(state);
+            stateful.setBlock(x, y, z, solid, properties.mass(), properties.material(),
+                    state.isAir() ? null : state);
+            volumeChanged = true;
         } else if (volume instanceof MutableVoxelVolume mutable) {
             final BlockPhysicsMapper.BlockProperties properties =
                     MinecraftPhysics.blockPhysics().properties(state);

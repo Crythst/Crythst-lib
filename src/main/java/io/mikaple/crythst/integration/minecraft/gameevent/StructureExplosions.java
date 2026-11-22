@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.minecraft.gameevent;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
+import io.mikaple.crythst.integration.minecraft.EditableStatefulVolume;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
@@ -281,7 +282,8 @@ public final class StructureExplosions {
                                                List<ExplosionBlast.Hit> hits) {
         final VoxelVolume volume = structure.volume();
         final boolean editable = volume instanceof MutableVoxelVolume
-                || volume instanceof RestoredStructureVolume;
+                || volume instanceof RestoredStructureVolume
+                || volume instanceof EditableStatefulVolume;
         if (!editable) {
             return;
         }
@@ -292,6 +294,9 @@ public final class StructureExplosions {
             final ExplosionBlast.Cell cell = hit.cell();
             if (volume instanceof RestoredStructureVolume restored) {
                 restored.setBlock(cell.x(), cell.y(), cell.z(), false, 0.0,
+                        PhysicsMaterial.DEFAULT, null);
+            } else if (volume instanceof EditableStatefulVolume stateful) {
+                stateful.setBlock(cell.x(), cell.y(), cell.z(), false, 0.0,
                         PhysicsMaterial.DEFAULT, null);
             } else if (volume instanceof MutableVoxelVolume mutable) {
                 mutable.setSolid(cell.x(), cell.y(), cell.z(), false);

@@ -5,6 +5,7 @@ import io.mikaple.crythst.api.sublevel.view.StructureLevelView;
 import io.mikaple.crythst.api.sublevel.view.StructureLevelViews;
 import io.mikaple.crythst.api.sublevel.view.StructureOperationTarget;
 import io.mikaple.crythst.integration.minecraft.BlockPhysicsMapper;
+import io.mikaple.crythst.integration.minecraft.EditableStatefulVolume;
 import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
@@ -527,8 +528,9 @@ public final class ServerStructureLevelView implements StructureLevelView {
     }
 
     /**
-     * Editable-volume bridge for the two volume types the interaction layer can
-     * already grow or mutate. Read-only volumes deliberately return {@code null}.
+     * Editable-volume bridge for the volume types the interaction layer can
+     * already grow or mutate, including split components. Read-only volumes
+     * deliberately return {@code null}.
      */
     private interface Editable {
         void set(int x, int y, int z, boolean solid, double mass,
@@ -536,6 +538,9 @@ public final class ServerStructureLevelView implements StructureLevelView {
     }
 
     static @Nullable Editable editable(VoxelVolume volume) {
+        if (volume instanceof EditableStatefulVolume stateful) {
+            return stateful::setBlock;
+        }
         if (volume instanceof RestoredStructureVolume restored) {
             return restored::setBlock;
         }
