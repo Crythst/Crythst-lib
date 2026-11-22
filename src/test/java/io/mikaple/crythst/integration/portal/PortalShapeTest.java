@@ -64,6 +64,22 @@ class PortalShapeTest {
     }
 
     @Test
+    void rejectsNonFinitePlaneVectors() {
+        assertThrows(IllegalArgumentException.class, () -> new PortalPlane(
+                new Vector3d(Double.NaN, 64.0, 0.0),
+                new Vector3d(0.0, 0.0, 1.0),
+                new Vector3d(1.0, 0.0, 0.0), 2.0, 3.0));
+        assertThrows(IllegalArgumentException.class, () -> new PortalPlane(
+                new Vector3d(0.0, 64.0, 0.0),
+                new Vector3d(Double.POSITIVE_INFINITY, 0.0, 1.0),
+                new Vector3d(1.0, 0.0, 0.0), 2.0, 3.0));
+        assertThrows(IllegalArgumentException.class, () -> new PortalPlane(
+                new Vector3d(0.0, 64.0, 0.0),
+                new Vector3d(0.0, 0.0, 1.0),
+                new Vector3d(1.0, Double.NaN, 0.0), 2.0, 3.0));
+    }
+
+    @Test
     void movingShapeKeepsLocalOutline() {
         final PortalShape shape = PortalShape.rectangle(plane());
         final PortalPlane moved = new PortalPlane(

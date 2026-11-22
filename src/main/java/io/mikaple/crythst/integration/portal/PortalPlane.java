@@ -42,6 +42,13 @@ public final class PortalPlane {
         if (origin == null || normal == null || right == null) {
             throw new IllegalArgumentException("Portal plane vectors must not be null");
         }
+        if (!isFinite(origin) || !isFinite(normal) || !isFinite(right)) {
+            // A NaN/Inf plane would poison every mask, transform and crossing
+            // test downstream. Network snapshots and saved data can carry
+            // arbitrary doubles, so reject them at the single construction
+            // point instead of relying on every consumer.
+            throw new IllegalArgumentException("Portal plane vectors must be finite");
+        }
         if (!(width > 0.0) || !(height > 0.0)
                 || !Double.isFinite(width) || !Double.isFinite(height)) {
             throw new IllegalArgumentException("Portal size must be positive and finite: "
@@ -199,6 +206,12 @@ public final class PortalPlane {
         }
         final double extentUp = projectedExtent(axes, half, up);
         return Math.abs(rel.dot(up)) <= height * 0.5 + extentUp;
+    }
+
+    private static boolean isFinite(Vector3dc vector) {
+        return Double.isFinite(vector.x())
+                && Double.isFinite(vector.y())
+                && Double.isFinite(vector.z());
     }
 
     private static double projectedExtent(Vector3d[] axes, Vector3dc half, Vector3dc axis) {

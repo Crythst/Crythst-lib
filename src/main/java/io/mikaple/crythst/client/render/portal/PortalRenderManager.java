@@ -92,7 +92,16 @@ public final class PortalRenderManager {
                 || PortalCaptureSettings.OFFSCREEN_FALLBACK) {
             return;
         }
-        INSTANCE.extractFrame(camera, deltaTracker, partialTick);
+        try {
+            INSTANCE.extractFrame(camera, deltaTracker, partialTick);
+        } catch (Throwable error) {
+            // Extraction runs inside LevelExtractor.extract. Never let one bad
+            // portal definition take down the main frame; drop the whole cache
+            // so addFramePass cannot consume a half-built previous frame.
+            INSTANCE.layers = List.of();
+            PortalRenderDiagnostics.failure(
+                    "Crythst portal extraction failed; skipping frame", error);
+        }
     }
 
     /**

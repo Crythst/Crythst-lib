@@ -5,6 +5,7 @@ import org.joml.Vector3d;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PortalTeleportMathTest {
@@ -90,6 +91,19 @@ class PortalTeleportMathTest {
                 exit(), new Vector3d(), new Vector3d(0.0, 0.0, 0.2));
         assertTrue(biasFront.dot(exit().normal()) > 0.0);
         assertTrue(biasBack.dot(exit().normal()) < 0.0);
+    }
+
+    @Test
+    void rejectsNonFiniteNetworkSamples() {
+        final Vector3d finite = new Vector3d(1.0, 2.0, 3.0);
+        assertTrue(PortalTeleportMath.isFinite(finite));
+        assertFalse(PortalTeleportMath.isFinite(new Vector3d(Double.NaN, 0.0, 0.0)));
+        assertFalse(PortalTeleportMath.isFinite(
+                new Vector3d(0.0, Double.POSITIVE_INFINITY, 0.0)));
+        assertFalse(PortalTeleportMath.isFiniteSample(
+                finite, new Vector3d(0.0, 0.0, Double.NaN), finite));
+        assertFalse(PortalTeleportMath.isFiniteSample(finite, finite, null));
+        assertTrue(PortalTeleportMath.isFiniteSample(finite, finite, finite));
     }
 
     @Test

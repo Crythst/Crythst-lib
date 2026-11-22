@@ -80,6 +80,24 @@ public final class PortalTeleportMath {
         return normal.mul(side);
     }
 
+    /** True when every component of {@code vector} is finite. */
+    public static boolean isFinite(Vector3dc vector) {
+        return vector != null
+                && Double.isFinite(vector.x())
+                && Double.isFinite(vector.y())
+                && Double.isFinite(vector.z());
+    }
+
+    /**
+     * Network samples must be finite before they reach the crossing solver:
+     * {@code NaN} compares false against every bound, so a naive
+     * {@code distance > limit} check silently accepts it.
+     */
+    public static boolean isFiniteSample(Vector3dc previous, Vector3dc current,
+                                         Vector3dc eye) {
+        return isFinite(previous) && isFinite(current) && isFinite(eye);
+    }
+
     /**
      * Swept point test: returns the segment parameter in {@code [0,1]} at which
      * the point crosses the plane, or {@code NaN}.

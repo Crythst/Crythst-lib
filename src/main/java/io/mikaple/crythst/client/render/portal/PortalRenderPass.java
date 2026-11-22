@@ -24,6 +24,7 @@ import net.minecraft.client.CloudStatus;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
+import net.minecraft.client.renderer.RenderBuffers;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.ProjectionMatrixBuffer;
@@ -32,7 +33,6 @@ import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.SubmitNodeStorage;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
-import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
 import net.minecraft.client.renderer.state.OptionsRenderState;
@@ -49,8 +49,10 @@ import org.joml.Vector4f;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.OptionalDouble;
 
 /**
@@ -79,8 +81,14 @@ final class PortalRenderPass {
     private FogRenderer fogRenderer;
     private GlobalSettingsUniform globalSettings;
     private ProjectionMatrixBuffer projectionBuffer;
-    /** Dedicated dispatcher: the main frame's PreparedFrame is already in use. */
+    /**
+     * Dedicated dispatcher + buffers: the main frame's single PreparedFrame is
+     * already in use while this framegraph pass executes, so reusing
+     * {@code gameRenderer.featureRenderDispatcher()} throws
+     * "PreparedFrame already in use".
+     */
     private FeatureRenderDispatcher featureDispatcher;
+    private RenderBuffers featureBuffers;
     private GpuBuffer maskBuffer;
     private int maskBufferBytes;
     private final List<LayerTargets> layerTargets = new ArrayList<>();
@@ -109,6 +117,16 @@ final class PortalRenderPass {
         }
         if (projectionBuffer == null) {
             projectionBuffer = new ProjectionMatrixBuffer("crythst portal");
+        }
+        if (featureDispatcher == null) {
+            final Minecraft minecraft = Minecraft.getInstance();
+            featureBuffers = new RenderBuffers(4);
+            featureDispatcher = new FeatureRenderDispatcher(
+                    featureBuffers,
+                    minecraft.getModelManager(),
+                    minecraft.getAtlasManager(),
+                    minecraft.font,
+                    minecraft.gameRenderer.gameRenderState());
         }
         if (maskBuffer == null) {
             maskBuffer = RenderSystem.getDevice().createBuffer(
@@ -140,13 +158,23 @@ final class PortalRenderPass {
 
         modelViewStack.pushMatrix();
         try {
+            final Set<Integer> failedLayers = new HashSet<>();
             for (PortalRenderData layer : data) {
                 if (!layer.visible()) {
+                    continue;
+                }
+                // A child composite multiplies its mask by the parent's mask.
+                // If the parent layer failed, its mask may be empty or stale,
+                // so rendering the child could paint outside the outer opening.
+                // Skip the whole subtree for this frame.
+                if (layer.parentLayer() > 0 && failedLayers.contains(layer.parentLayer())) {
+                    failedLayers.add(layer.layer());
                     continue;
                 }
                 try {
                     renderLayer(minecraft, main, layer);
                 } catch (Throwable error) {
+                    failedLayers.add(layer.layer());
                     if (!failureLogged) {
                         failureLogged = true;
                         PortalRenderDiagnostics.failure(
@@ -171,6 +199,20 @@ final class PortalRenderPass {
                 mainCamera.attributeProbe().tick(level, mainPos);
             }
             fogRenderer.endFrame();
+            if (featureBuffers != null) {
+                featureBuffers.endFrame();
+            }
+        }
+    }
+
+    private void discardFeatureDispatcher() {
+        if (featureDispatcher != null) {
+            featureDispatcher.close();
+            featureDispatcher = null;
+        }
+        if (featureBuffers != null) {
+            featureBuffers.close();
+            featureBuffers = null;
         }
     }
 
@@ -191,6 +233,8 @@ final class PortalRenderPass {
         encoder.copyTextureToTexture(main.getDepthTexture(), targets.snapshot.getDepthTexture(),
                 0, 0, 0, 0, 0, main.width, main.height);
 
+        boolean completed = false;
+        try {
         // 2. Build the opening mask.
         drawMask(encoder, targets, mask);
 
@@ -251,6 +295,29 @@ final class PortalRenderPass {
         composite(minecraft, main, targets, layer);
         encoder.copyTextureToTexture(targets.snapshot.getDepthTexture(), main.getDepthTexture(),
                 0, 0, 0, 0, 0, main.width, main.height);
+        completed = true;
+        } finally {
+            if (!completed) {
+                // The destination sky pass can overwrite the full screen before a
+                // later step fails. Restore the pre-portal pixels so a failure
+                // degrades to "no portal this frame", not "screen explosion".
+                restoreSnapshot(encoder, main, targets);
+            }
+        }
+    }
+
+    private static void restoreSnapshot(CommandEncoder encoder, RenderTarget main,
+                                        LayerTargets targets) {
+        try {
+            encoder.copyTextureToTexture(targets.snapshot.getColorTexture(),
+                    main.getColorTexture(), 0, 0, 0, 0, 0, main.width, main.height);
+            encoder.copyTextureToTexture(targets.snapshot.getDepthTexture(),
+                    main.getDepthTexture(), 0, 0, 0, 0, 0, main.width, main.height);
+        } catch (Throwable restoreError) {
+            PortalRenderDiagnostics.failure(
+                    "Crythst portal pass could not restore the main framebuffer",
+                    restoreError);
+        }
     }
 
     private void renderDestinationWorld(Minecraft minecraft, LevelRenderer levelRenderer,
@@ -266,13 +333,27 @@ final class PortalRenderPass {
                 savedNearby = List.copyOf(levelRenderer.nearbyVisibleSections());
         FeatureRenderDispatcher.PreparedFrame featureFrame = null;
         try {
+            if (featureDispatcher == null) {
+                // Rebuild after a failed prepare on a previous layer/frame.
+                ensureResources();
+            }
             visible.clear();
             visible.addAll(layer.sections());
 
             final SubmitNodeStorage submits = new SubmitNodeStorage();
             submits.setUseImprovedTransparency(false);
             submitFeatures(minecraft, levelRenderer, state, submits);
-            featureFrame = featureDispatcher.prepareFrame(submits);
+            try {
+                featureFrame = featureDispatcher.prepareFrame(submits);
+            } catch (Throwable error) {
+                // prepareFrame checks out the dispatcher's single PreparedFrame
+                // before doing the actual prepare work. If that work throws, no
+                // PreparedFrame was returned to close, so the dispatcher would
+                // otherwise stay poisoned ("PreparedFrame already in use") for
+                // the rest of the session. Drop and rebuild it next frame.
+                discardFeatureDispatcher();
+                throw error;
+            }
 
             final net.minecraft.client.renderer.CloudRenderer cloudRenderer =
                     levelRenderer.cloudRenderer();
@@ -292,8 +373,18 @@ final class PortalRenderPass {
 
             final Matrix4f terrainMatrix = new Matrix4f(
                     state.cameraRenderState.viewRotationMatrix);
+            // Match the main pass's chunk-render mode. DynamicGpuData keeps ONE
+            // chunk-section storage: calling prepareChunkRenders() while the main
+            // pass used prepareChunkRendersIndirect() (or vice versa) closes and
+            // recreates that storage at initial capacity every frame, producing
+            // the endless "Resizing Chunk Sections UBO/Instanced" log spam and
+            // per-frame buffer churn.
             final ChunkSectionsToRender chunkSections =
-                    levelRenderer.prepareChunkRenders(terrainMatrix, true);
+                    levelRenderer.isChunkRenderingUsingMultiDrawIndirect()
+                            ? levelRenderer.prepareChunkRendersIndirect(terrainMatrix,
+                                    !minecraft.gameRenderer.useImprovedTransparency())
+                            : levelRenderer.prepareChunkRenders(terrainMatrix,
+                                    !minecraft.gameRenderer.useImprovedTransparency());
             final GpuSampler sampler = RenderSystem.getSamplerCache()
                     .getClampToEdge(FilterMode.LINEAR);
             final var blockAtlas = minecraft.getTextureManager()
@@ -462,6 +553,14 @@ final class PortalRenderPass {
         if (projectionBuffer != null) {
             projectionBuffer.close();
             projectionBuffer = null;
+        }
+        if (featureDispatcher != null) {
+            featureDispatcher.close();
+            featureDispatcher = null;
+        }
+        if (featureBuffers != null) {
+            featureBuffers.close();
+            featureBuffers = null;
         }
     }
 

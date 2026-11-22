@@ -21,6 +21,7 @@ import net.minecraft.world.phys.Vec3;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -63,6 +64,14 @@ public final class PortalTeleporter {
     public static final double ENTITY_EXIT_OFFSET = 0.05;
     /** Ticks before the same entity/body may traverse again. */
     public static final int COOLDOWN_TICKS = 10;
+    /**
+     * Upper bound for a client-reported crossing velocity. This is only a
+     * sanity cap (10 blocks/tick) so a malformed packet cannot launch the
+     * player; normal movement is far below it.
+     */
+    private static final double MAX_CLIENT_TRAVERSAL_SPEED = 10.0;
+    private static final double MAX_CLIENT_TRAVERSAL_SPEED_SQUARED =
+            MAX_CLIENT_TRAVERSAL_SPEED * MAX_CLIENT_TRAVERSAL_SPEED;
 
     private static final Map<UUID, Integer> ENTITY_READY = new ConcurrentHashMap<>();
     private static final Map<String, Integer> BODY_READY = new ConcurrentHashMap<>();
@@ -108,6 +117,15 @@ public final class PortalTeleporter {
                 || !destination.dimension().equals(player.level().dimension())) {
             return;
         }
+        // Reject non-finite samples first: NaN compares false against every
+        // upper bound below, so a naive "too far" check silently accepts it and
+        // then writes a NaN position/rotation into the player.
+        if (!PortalTeleportMath.isFiniteSample(payload.previousCentre(),
+                payload.currentCentre(), payload.eye())
+                || !PortalTeleportMath.isFinite(payload.velocity())
+                || !Float.isFinite(payload.yaw()) || !Float.isFinite(payload.pitch())) {
+            return;
+        }
         // The samples must be close to the entry opening, and the eye must be
         // consistent with the body centre. This bounds both replay and spoofing.
         if (portal.plane().distanceSquared(payload.currentCentre()) > 64.0
@@ -135,9 +153,20 @@ public final class PortalTeleporter {
 
         final PortalTransform transform =
                 PortalTransform.between(portal.plane(), destination.plane());
+        // Derive the eye from the validated body centre and the server's own
+        // dimensions. The packet's eye is only a proximity check; using it for
+        // placement would let a client shift the destination by several blocks.
+        final Vector3d centre = payload.currentCentre();
+        final double halfHeight = player.getBbHeight() * 0.5;
+        final Vector3d serverEye = new Vector3d(
+                centre.x, centre.y - halfHeight + player.getEyeHeight(), centre.z);
         final Vector3d feet = PortalTeleportMath.playerFeetForTransformedEye(
-                transform, payload.eye(), player.getEyeHeight());
+                transform, serverEye, player.getEyeHeight());
         final Vector3d velocity = transform.transformDirection(payload.velocity());
+        final double speedSquared = velocity.lengthSquared();
+        if (speedSquared > MAX_CLIENT_TRAVERSAL_SPEED_SQUARED) {
+            velocity.mul(MAX_CLIENT_TRAVERSAL_SPEED / Math.sqrt(speedSquared));
+        }
         final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
                 PortalTransform.viewDirection(payload.yaw(), payload.pitch())));
         if (player.connection != null) {
@@ -174,6 +203,13 @@ public final class PortalTeleporter {
             if (portals.isEmpty()) {
                 continue;
             }
+            // Snapshot the entity list once per level. A cross-dimension
+            // teleport removes the source entity from the live, non-fail-fast
+            // visible-entity map while it is being iterated, which can skip or
+            // repeat other entities. A copy also avoids re-iterating the live
+            // collection once per portal.
+            final List<Entity> entities = new ArrayList<>();
+            level.getAllEntities().forEach(entities::add);
 
             for (Portal portal : portals) {
                 final Portal destination = PortalManager.linkedPortal(portal);
@@ -193,7 +229,7 @@ public final class PortalTeleporter {
 
                 // Entities first: they are cheap and keep the player experience
                 // consistent even when the physics backend is unavailable.
-                for (Entity entity : level.getAllEntities()) {
+                for (Entity entity : entities) {
                     if (!isEligible(entity) || teleportedEntities.contains(entity.getUUID())) {
                         continue;
                     }
@@ -366,8 +402,10 @@ public final class PortalTeleporter {
         final double fallDistance = entity.fallDistance;
         final boolean onGround = entity.onGround();
         final Vector3d oldPosition = new Vector3d(entity.getX(), entity.getY(), entity.getZ());
+        final boolean sameDimension = destination.dimension().equals(level.dimension());
+        Entity teleported = entity;
 
-        if (destination.dimension().equals(level.dimension())) {
+        if (sameDimension) {
             applyLocalTeleport(entity, target, rotation[0], rotation[1], transformedVelocity);
             // A locally teleported vehicle carries its passengers with the same
             // rigid offset; vanilla's position packet path does this itself for
@@ -385,6 +423,7 @@ public final class PortalTeleporter {
             if (result == null) {
                 return false;
             }
+            teleported = result;
             if (result != entity) {
                 result.setDeltaMovement(transformedVelocity.x, transformedVelocity.y,
                         transformedVelocity.z);
@@ -393,14 +432,17 @@ public final class PortalTeleporter {
             }
         }
 
-        entity.fallDistance = fallDistance;
-        entity.setOnGround(onGround);
-        if (!destination.dimension().equals(level.dimension())
-                && entity instanceof net.minecraft.world.entity.Leashable leashable
+        teleported.fallDistance = fallDistance;
+        teleported.setOnGround(onGround);
+        if (!sameDimension
+                && teleported instanceof net.minecraft.world.entity.Leashable leashable
                 && leashable.isLeashed()) {
             // A leash cannot follow a dimension change. Same-dimension crossings
             // keep the leash intact; the vanilla leash tick then updates the
-            // rope between the transformed endpoints.
+            // rope between the transformed endpoints. Use the teleported copy:
+            // Entity.teleport copies the leash state *before* removing it from
+            // the old entity, so checking the source leaves the new entity
+            // leashed to an entity in the old dimension.
             leashable.removeLeash();
         }
         return true;

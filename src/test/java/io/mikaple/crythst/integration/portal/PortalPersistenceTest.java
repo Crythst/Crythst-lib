@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PortalPersistenceTest {
@@ -166,6 +167,24 @@ class PortalPersistenceTest {
             assertNull(loadedA.linkedPortalId());
             assertEquals(c, loadedB.linkedPortalId());
             assertEquals(b, loadedC.linkedPortalId());
+        } finally {
+            PortalManager.clearAll();
+        }
+    }
+
+    @Test
+    void createTreatsWhitespaceAsTheSameName() {
+        final ResourceKey<Level> dimension = ResourceKey.create(
+                Registries.DIMENSION, Identifier.parse("minecraft:overworld"));
+        PortalManager.clearAll();
+        try {
+            final Portal first = PortalManager.create(dimension, "gate", planeAt(0.0));
+            assertThrows(IllegalArgumentException.class,
+                    () -> PortalManager.create(dimension, " gate ", planeAt(4.0)));
+            assertEquals(1, PortalManager.size());
+            final Portal existing = PortalManager.findByName("gate");
+            assertNotNull(existing);
+            assertEquals(first.id(), existing.id());
         } finally {
             PortalManager.clearAll();
         }

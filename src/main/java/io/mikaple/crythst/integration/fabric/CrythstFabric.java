@@ -36,10 +36,12 @@ public final class CrythstFabric implements ModInitializer {
         StructurePersistence.register();
         CreateCompat.register();
         StructureSync.registerCommon();
-        PortalManager.register();
 
         CommandRegistrationCallback.EVENT.register(CrythstCommand::register);
+        // Physics first: the portal teleport pass reads the poses/velocities
+        // produced by the current physics tick and must run after it.
         PhysicsTicker.register();
+        PortalManager.register();
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> MinecraftPhysics.closeAll());
 
         Crythst.LOGGER.info("Crythst initialised (backend available: {})", MinecraftPhysics.available());

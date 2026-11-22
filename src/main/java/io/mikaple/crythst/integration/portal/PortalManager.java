@@ -183,12 +183,17 @@ public final class PortalManager {
      * @throws IllegalArgumentException when the name is already in use
      */
     public static Portal create(ResourceKey<Level> dimension, String name, PortalShape shape) {
+        // Portal trims names. Normalize before the uniqueness check, otherwise
+        // "gate " would pass the check and then overwrite the existing "gate"
+        // entry in BY_NAME while leaving its UUID orphaned in BY_ID.
+        final String normalizedName = name == null ? "" : name.trim();
         final Portal portal;
         synchronized (LOCK) {
-            if (BY_NAME.containsKey(name)) {
-                throw new IllegalArgumentException("A portal named '" + name + "' already exists");
+            if (BY_NAME.containsKey(normalizedName)) {
+                throw new IllegalArgumentException(
+                        "A portal named '" + normalizedName + "' already exists");
             }
-            portal = new Portal(UUID.randomUUID(), name, dimension, shape, null);
+            portal = new Portal(UUID.randomUUID(), normalizedName, dimension, shape, null);
             BY_NAME.put(portal.name(), portal);
             BY_ID.put(portal.id(), portal);
             revision++;

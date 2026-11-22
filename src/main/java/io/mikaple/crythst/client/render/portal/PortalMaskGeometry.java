@@ -62,23 +62,20 @@ public final class PortalMaskGeometry {
         if (outline.size() < 3) {
             return Mask.EMPTY;
         }
-        final List<Vector4f> clipped = new ArrayList<>(outline.size() + 2);
-        for (int i = 0; i < outline.size(); i++) {
-            final Vector3d current = outline.get(i);
-            final Vector3d next = outline.get((i + 1) % outline.size());
-            final Vector4f currentClip = project(viewProjection, cameraPosition, current);
-            final Vector4f nextClip = project(viewProjection, cameraPosition, next);
-            final boolean currentInside = currentClip.w > W_EPSILON;
-            final boolean nextInside = nextClip.w > W_EPSILON;
-            if (currentInside && nextInside) {
-                clipped.add(nextClip);
-            } else if (currentInside) {
-                clipped.add(intersect(currentClip, nextClip));
-            } else if (nextInside) {
-                clipped.add(intersect(currentClip, nextClip));
-                clipped.add(nextClip);
-            }
+        List<Vector4f> clipped = new ArrayList<>(outline.size() + 2);
+        for (Vector3d point : outline) {
+            clipped.add(project(viewProjection, cameraPosition, point));
         }
+        // Clip in homogeneous clip space BEFORE the perspective divide. Clipping
+        // only on w > 0 is not enough: a polygon crossing the near plane has huge
+        // NDC coordinates, and clamping those to [-1, 1] turns the opening into a
+        // full-screen mask (the destination world then covers the whole frame).
+        clipped = clip(clipped, 0.0f, 0.0f, 0.0f, 1.0f, W_EPSILON); // w > 0
+        clipped = clip(clipped, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);      // near: z + w >= 0
+        clipped = clip(clipped, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f);      // left: x + w >= 0
+        clipped = clip(clipped, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f);     // right: w - x >= 0
+        clipped = clip(clipped, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f);      // bottom: y + w >= 0
+        clipped = clip(clipped, 0.0f, -1.0f, 0.0f, 1.0f, 0.0f);     // top: w - y >= 0
         if (clipped.size() < 3) {
             return Mask.EMPTY;
         }
@@ -131,6 +128,35 @@ public final class PortalMaskGeometry {
         return new Mask(triangles, x0, y0, width, height);
     }
 
+    private static List<Vector4f> clip(List<Vector4f> polygon, float a, float b,
+                                       float c, float d, float epsilon) {
+        if (polygon.isEmpty()) {
+            return polygon;
+        }
+        final List<Vector4f> result = new ArrayList<>(polygon.size() + 2);
+        Vector4f previous = polygon.getLast();
+        float previousDistance = a * previous.x + b * previous.y + c * previous.z
+                + d * previous.w - epsilon;
+        for (Vector4f current : polygon) {
+            final float currentDistance = a * current.x + b * current.y + c * current.z
+                    + d * current.w - epsilon;
+            final boolean previousInside = previousDistance >= 0.0f;
+            final boolean currentInside = currentDistance >= 0.0f;
+            if (previousInside != currentInside) {
+                final float denominator = previousDistance - currentDistance;
+                final float t = Math.abs(denominator) < 1.0e-9f
+                        ? 0.0f : previousDistance / denominator;
+                result.add(new Vector4f(previous).lerp(current, clamp(t, 0.0f, 1.0f)));
+            }
+            if (currentInside) {
+                result.add(current);
+            }
+            previous = current;
+            previousDistance = currentDistance;
+        }
+        return result;
+    }
+
     private static Vector4f project(Matrix4fc viewProjection, Vector3dc cameraPosition,
                                     Vector3dc worldPoint) {
         return viewProjection.transform(new Vector4f(
@@ -138,15 +164,6 @@ public final class PortalMaskGeometry {
                 (float) (worldPoint.y() - cameraPosition.y()),
                 (float) (worldPoint.z() - cameraPosition.z()),
                 1.0f));
-    }
-
-    private static Vector4f intersect(Vector4f from, Vector4f to) {
-        final float denominator = to.w - from.w;
-        final float t = Math.abs(denominator) < 1.0e-9f
-                ? 0.0f : (W_EPSILON - from.w) / denominator;
-        final Vector4f result = new Vector4f(from).lerp(to, clamp(t, 0.0f, 1.0f));
-        result.w = Math.max(result.w, W_EPSILON);
-        return result;
     }
 
     private static int clampPixel(int value, int size) {
