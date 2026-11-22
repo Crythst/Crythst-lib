@@ -39,6 +39,28 @@ class PortalCameraMathTest {
     }
 
     @Test
+    void cameraPathAcrossThePlaneIsContinuous() {
+        final PortalTransform transform = PortalTransform.between(entry(), exit());
+        final Vector3d before = new Vector3d(0.3, 65.2, 0.25);
+        final Vector3d after = new Vector3d(0.3, 65.2, -0.25);
+        final Vector3d transformedBefore = transform.transformPoint(before);
+        final Vector3d transformedAfter = transform.transformPoint(after);
+
+        assertEquals(before.distance(after), transformedBefore.distance(transformedAfter), 1.0e-9,
+                "the rigid transform preserves the camera's per-tick path length");
+        assertEquals(0.0, exit().signedDistance(transform.transformPoint(
+                new Vector3d(0.3, 65.2, 0.0))), 1.0e-9,
+                "the crossing instant lands exactly on the exit plane");
+
+        final Vector3d beforeVelocity = new Vector3d(0.0, 0.0, -0.5);
+        final Vector3d afterVelocity = transform.transformDirection(beforeVelocity);
+        assertEquals(beforeVelocity.length(), afterVelocity.length(), 1.0e-9,
+                "speed is continuous across the seam");
+        assertTrue(afterVelocity.dot(exit().normal()) > 0.0,
+                "the transformed camera leaves through the exit front");
+    }
+
+    @Test
     void transformedCameraUsesRigidLinkPose() {
         final PortalTransform transform = PortalTransform.between(entry(), exit());
         final Vector3d mainPosition = new Vector3d(0.3, 65.2, 4.0);

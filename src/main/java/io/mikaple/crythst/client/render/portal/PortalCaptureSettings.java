@@ -12,33 +12,39 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
  *
  * <pre>
  * -Dcrythst.portal.render=false          disable portal rendering entirely
- * -Dcrythst.portal.capture=false         force the procedural fallback
- * -Dcrythst.portal.procedural=true       alias for forcing the fallback
+ * -Dcrythst.portal.stencil=true          force the mask/destination world path
+ * -Dcrythst.portal.offscreenFallback=true legacy offscreen texture debug path
  * -Dcrythst.portal.debugMask=true        draw the portal opening outline
+ * -Dcrythst.portal.debugClip=true        draw the exit-plane clip outline
  * -Dcrythst.portal.trace=true            one aggregated timing line per second
- * -Dcrythst.portal.recursion=1           max nested portal layers (1 = none)
- * -Dcrythst.portal.capture.scale=1.0     capture resolution scale (0.125..1]
- * -Dcrythst.portal.capture.dump=true     dump the first captured target
+ * -Dcrythst.portal.recursion=2           max nested portal layers (1 = none)
+ * -Dcrythst.portal.capture.scale=1.0     legacy texture fallback scale
  * </pre>
  */
 final class PortalCaptureSettings {
     static final boolean RENDER_ENABLED = !"false".equalsIgnoreCase(
             System.getProperty("crythst.portal.render", "true"));
+    static final boolean STENCIL_PATH = !"false".equalsIgnoreCase(
+            System.getProperty("crythst.portal.stencil", "true"));
+    /** Explicit debug escape hatch. Never enabled by default. */
+    static final boolean OFFSCREEN_FALLBACK = Boolean.getBoolean(
+            "crythst.portal.offscreenFallback");
     static final boolean CAPTURE_ENABLED = RENDER_ENABLED
             && !"false".equalsIgnoreCase(System.getProperty("crythst.portal.capture", "true"));
     static final boolean FORCE_PROCEDURAL = !CAPTURE_ENABLED
             || Boolean.getBoolean("crythst.portal.procedural")
             || Boolean.getBoolean("crythst.portal.forceProcedural");
     static final boolean DEBUG_MASK = Boolean.getBoolean("crythst.portal.debugMask");
+    static final boolean DEBUG_CLIP = Boolean.getBoolean("crythst.portal.debugClip");
     static final boolean TRACE = Boolean.getBoolean("crythst.portal.trace");
     static final boolean DUMP_TARGET = Boolean.getBoolean("crythst.portal.capture.dump");
-    static final int MAX_RECURSION = readInt("crythst.portal.recursion", 1, 0, 2);
+    static final int MAX_RECURSION = readInt("crythst.portal.recursion", 2, 1, 2);
 
     static final float SCALE = readScale();
     static final int MAX_WIDTH = 1920;
     static final int MAX_HEIGHT = 1080;
-    /** One destination render per frame keeps the capture budget bounded. */
-    static final int MAX_PORTALS_PER_ROUND = 1;
+    /** Root portals rendered per frame. Recursion adds one child per root. */
+    static final int MAX_PORTALS_PER_ROUND = 2;
     static final int MAX_ACTIVE_TARGETS = 4;
     static final int SECTION_COMPILE_BUDGET = 8;
     static final double MAX_CAPTURE_DISTANCE = 128.0;

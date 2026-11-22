@@ -36,6 +36,17 @@ record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
 
     static Result build(PortalSnapshot portal, CameraRenderState main,
                         LevelRenderState levelState, OptionsRenderState options) {
+        return build(portal, main, levelState, options, null);
+    }
+
+    /**
+     * Variant for nested portals: {@code baseProjection} is the parent portal
+     * camera's already-composed projection (including its exit clip). Reusing
+     * it avoids applying view bob/hurt a second time.
+     */
+    static Result build(PortalSnapshot portal, CameraRenderState main,
+                        LevelRenderState levelState, OptionsRenderState options,
+                        Matrix4f baseProjection) {
         if (main == null || main.pos == null || main.projectionMatrix == null
                 || main.orientation == null) {
             return Result.failure("missing main camera matrix");
@@ -46,8 +57,10 @@ record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
 
         final PortalTransform transform = PortalTransform.between(
                 portal.plane(), portal.destinationPlane());
-        final Matrix4f mainProjection = PortalProjection.worldProjection(
-                main, levelState.playerRenderState, options);
+        final Matrix4f mainProjection = baseProjection != null
+                ? new Matrix4f(baseProjection)
+                : PortalProjection.worldProjection(
+                        main, levelState.playerRenderState, options);
         final PortalCameraMath.Pose camera = PortalCameraMath.portalCamera(
                 transform,
                 new Vector3d(main.pos.x, main.pos.y, main.pos.z),

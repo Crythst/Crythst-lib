@@ -105,6 +105,28 @@ public final class PortalTeleportMath {
         return velocity.dot(destination.normal()) > 0.0;
     }
 
+    /**
+     * Swept crossing test used for projectiles and other fast movers. The
+     * segment, not just the two endpoints, is tested against the opening.
+     */
+    public static boolean sweptCrossing(PortalShape shape, Vector3dc previous,
+                                        Vector3dc current) {
+        final PortalCrossing.Crossing crossing =
+                PortalCrossing.findCrossing(shape, previous, current);
+        return crossing != null && crossing.inside();
+    }
+
+    /**
+     * True while an object is still inside the destination opening and moving
+     * through/away from it. The server cooldown is the primary anti-return
+     * mechanism; this predicate documents and tests the secondary guard.
+     */
+    public static boolean insideExitSafeZone(PortalPlane destination, Vector3dc position,
+                                             Vector3dc velocity, double thickness) {
+        return destination.contains(position, thickness)
+                && velocity.dot(destination.normal()) >= 0.0;
+    }
+
     /** Small nudge so an entity does not re-enter the exit on the next tick. */
     public static Vector3d applyExitBias(Vector3dc position, Vector3dc bias, double distance) {
         return new Vector3d(position).fma(distance, bias);

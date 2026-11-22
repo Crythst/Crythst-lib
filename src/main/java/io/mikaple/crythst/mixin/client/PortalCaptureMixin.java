@@ -10,22 +10,19 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Captures portal destination views <em>before</em> the main camera's level
- * state is extracted.
+ * Extracts portal destination states after the main camera's state is complete.
  *
- * <p>Running at {@code HEAD} means the nested extraction for the portal camera
- * can fill the shared {@code LevelRenderState} and be rendered immediately;
- * the outer invocation then resets and fills the same state for the main
- * camera as usual. Running at {@code END_EXTRACTION} (the previous approach)
- * was too late: the state had already been extracted for the main camera, so a
- * second {@code LevelRenderer.render} could not draw the destination's
- * entities/sections correctly.</p>
+ * <p>Running at {@code RETURN} is important: the main {@code LevelRenderState}
+ * and the main visible-section list are fully populated, so each destination is
+ * extracted into its own {@code LevelRenderState} without consuming the resets
+ * or chunk-delta sets that belong to the main extraction. The nested extraction
+ * is guarded by {@link PortalRenderManager#isDestinationExtracting()}.</p>
  */
 @Mixin(LevelExtractor.class)
 public abstract class PortalCaptureMixin {
-    @Inject(method = "extract", at = @At("HEAD"))
-    private void crythst$capturePortalViews(DeltaTracker deltaTracker, Camera camera,
-                                            float worldPartialTicks, CallbackInfo ci) {
-        PortalRenderManager.onExtractStart(camera, deltaTracker, worldPartialTicks);
+    @Inject(method = "extract", at = @At("RETURN"))
+    private void crythst$extractPortalDestinations(DeltaTracker deltaTracker, Camera camera,
+                                                   float worldPartialTicks, CallbackInfo ci) {
+        PortalRenderManager.onExtractEnd(camera, deltaTracker, worldPartialTicks);
     }
 }

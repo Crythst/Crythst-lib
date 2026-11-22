@@ -1,8 +1,9 @@
 package io.mikaple.crythst.client.render.portal;
 
+import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.resource.ResourceHandle;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
-import io.mikaple.crythst.mixin.client.PortalLevelExtractorAccessor;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
@@ -12,9 +13,9 @@ import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
-import net.minecraft.resources.Identifier;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -25,39 +26,33 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Entry point and orchestrator for the portal view pipeline.
+ * Portal frame orchestration for the same-frame destination pass.
  *
- * <p>Per frame:</p>
- * <ol>
- *     <li>select visible linked portals in the current dimension;</li>
- *     <li>ask {@link PortalCaptureScheduler} whether a capture is due (the
- *     default is immediately when the camera or a portal moved);</li>
- *     <li>build the destination camera with {@link PortalViewCamera} (rigid
- *     link transform + oblique exit-plane near clip);</li>
- *     <li>extract destination state in a scoped pass and render it through
- *     {@link PortalRenderPass} into the portal's bounded view target;</li>
- *     <li>{@link PortalSurfaceRenderer} samples that texture on the portal
- *     quad in the main pass.</li>
- * </ol>
+ * <p>At the end of {@code LevelExtractor.extract}, every visible linked portal
+ * gets its own destination {@link LevelRenderState} extracted by
+ * {@link PortalVisibility}. At the end of {@code LevelRenderer.addMainPass}, a
+ * framegraph pass that reads/writes the <em>main</em> colour+depth handle is
+ * added. {@link PortalRenderPass} then rasterizes the destination world into
+ * that same framebuffer, masks it to the opening polygon, and composites the
+ * previous main pixels back outside the mask.</p>
  *
- * <p>The shared main {@code ViewArea} is never re-centred; target-camera
- * visibility is selected from the existing storage. Recursive capture is
- * disabled (the surface renderer is skipped while capturing), and at most one
- * destination render is performed per frame.</p>
+ * <p>No per-portal colour texture exists on the default path. The only
+ * temporary attachments are one mask + one colour/depth snapshot per recursion
+ * layer, used to implement the RenderPearl mask equivalent because the public
+ * {@code DepthStencilState} exposes no stencil operations.</p>
  */
 public final class PortalRenderManager {
     private static final PortalRenderManager INSTANCE = new PortalRenderManager();
 
-    private final PortalViewRegistry registry = new PortalViewRegistry();
-    private final PortalDestinationExtractor extractor = new PortalDestinationExtractor();
+    private final PortalVisibility visibility = new PortalVisibility();
     private final PortalRenderPass pass = new PortalRenderPass();
-    private final PortalCaptureScheduler scheduler = new PortalCaptureScheduler(
-            PortalCaptureSettings.BASE_INTERVAL_NANOS,
-            PortalCaptureSettings.MAX_INTERVAL_NANOS,
-            PortalCaptureSettings.IDLE_REFRESH_NANOS);
 
-    private boolean registered;
-    private int captureCursor;
+    private volatile boolean registered;
+    private volatile boolean destinationExtracting;
+    private volatile List<PortalRenderData> layers = List.of();
+    private volatile int lastSectionCount;
+    private volatile int lastVisiblePortals;
+    private long lastExtractStartNanos;
 
     private PortalRenderManager() {
     }
@@ -66,51 +61,57 @@ public final class PortalRenderManager {
         INSTANCE.registerInternal();
     }
 
+    public static boolean isDestinationExtracting() {
+        return INSTANCE.destinationExtracting;
+    }
+
+    /** Legacy name used by older portal hooks. */
     public static boolean isCapturing() {
-        return INSTANCE.pass.capturing();
+        return INSTANCE.destinationExtracting;
     }
 
-    public static boolean hasView(UUID portalId) {
-        final PortalViewTarget target = INSTANCE.registry.get(portalId);
-        return target != null && target.ready();
-    }
-
-    public static Identifier textureId(UUID portalId) {
-        final PortalViewTarget target = INSTANCE.registry.get(portalId);
-        return target == null ? null : target.textureId();
-    }
-
-    /** True when the registered texture wrapper exposes the target's live colour view. */
+    /**
+     * Legacy diagnostics probe. The default path has no per-portal texture, so
+     * there is no view target to compare.
+     */
     static boolean textureViewMatches(UUID portalId) {
-        final PortalViewTarget target = INSTANCE.registry.get(portalId);
-        if (target == null || target.target() == null || target.target().getColorTextureView() == null) {
-            return false;
+        return false;
+    }
+
+    static void beginDestinationExtraction() {
+        INSTANCE.destinationExtracting = true;
+    }
+
+    static void endDestinationExtraction() {
+        INSTANCE.destinationExtracting = false;
+    }
+
+    public static void onExtractEnd(Camera camera, DeltaTracker deltaTracker, float partialTick) {
+        if (INSTANCE.destinationExtracting || !PortalCaptureSettings.RENDER_ENABLED
+                || !PortalCaptureSettings.STENCIL_PATH
+                || PortalCaptureSettings.OFFSCREEN_FALLBACK) {
+            return;
         }
-        try {
-            final var texture = Minecraft.getInstance().getTextureManager()
-                    .getTexture(target.textureId());
-            return texture.getTextureView() == target.target().getColorTextureView();
-        } catch (Throwable ignored) {
-            return false;
+        INSTANCE.extractFrame(camera, deltaTracker, partialTick);
+    }
+
+    /**
+     * Called after vanilla's {@code addMainPass} has created the main handle.
+     * The portal pass is ordered after it by declaring a read/write dependency
+     * on the same resource handle.
+     */
+    public static ResourceHandle<RenderTarget> addFramePass(FrameGraphBuilder frame,
+                                                            ResourceHandle<RenderTarget> main) {
+        if (frame == null || main == null || !PortalCaptureSettings.RENDER_ENABLED
+                || !PortalCaptureSettings.STENCIL_PATH
+                || PortalCaptureSettings.OFFSCREEN_FALLBACK) {
+            return main;
         }
-    }
-
-    static org.joml.Matrix4f captureViewProjection(UUID portalId) {
-        final PortalViewTarget target = INSTANCE.registry.get(portalId);
-        return target == null || !target.ready() ? null : target.captureViewProjection();
-    }
-
-    static Vec3 captureCameraPos(UUID portalId) {
-        final PortalViewTarget target = INSTANCE.registry.get(portalId);
-        return target == null || !target.ready() ? null : target.captureCameraPos();
-    }
-
-    public static RenderTarget renderTargetOverride() {
-        return INSTANCE.pass.targetOverride();
-    }
-
-    public static void onExtractStart(Camera camera, DeltaTracker deltaTracker, float partialTick) {
-        INSTANCE.capture(camera, deltaTracker, partialTick);
+        final List<PortalRenderData> data = INSTANCE.layers;
+        if (data.isEmpty()) {
+            return main;
+        }
+        return INSTANCE.pass.addPass(frame, main, data);
     }
 
     private void registerInternal() {
@@ -121,190 +122,175 @@ public final class PortalRenderManager {
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> close());
     }
 
-    private void capture(Camera camera, DeltaTracker deltaTracker, float partialTick) {
-        if (!PortalCaptureSettings.RENDER_ENABLED || pass.capturing()) {
-            return;
-        }
-        if (!PortalCaptureSettings.CAPTURE_ENABLED || PortalCaptureSettings.FORCE_PROCEDURAL) {
-            return;
-        }
-
+    private void extractFrame(Camera camera, DeltaTracker deltaTracker, float partialTick) {
+        lastExtractStartNanos = System.nanoTime();
         final Minecraft minecraft = Minecraft.getInstance();
         final ClientLevel level = minecraft.level;
         final GameRenderer gameRenderer = minecraft.gameRenderer;
         final LevelRenderer levelRenderer = minecraft.levelRenderer;
-        final LevelRenderState levelState = gameRenderer.gameRenderState().levelRenderState;
-        if (level == null || camera == null || camera != gameRenderer.mainCamera()) {
+        final LevelRenderState mainState = gameRenderer.gameRenderState().levelRenderState;
+        if (level == null || camera == null || camera != gameRenderer.mainCamera()
+                || mainState == null || mainState.cameraRenderState == null
+                || mainState.cameraRenderState.pos == null) {
+            layers = List.of();
             return;
         }
-
-        final CameraRenderState mainCamera = levelState.cameraRenderState;
-        if (mainCamera == null || mainCamera.pos == null) {
-            return;
-        }
-
-        final PortalLevelExtractorAccessor extractorAccess =
-                (PortalLevelExtractorAccessor) minecraft.levelExtractor;
-        if (extractorAccess.crythst$shouldResetLevelRenderData()
-                || extractorAccess.crythst$shouldInvalidateCompiledGeometry()
-                || extractorAccess.crythst$shouldResetSkyRenderer()
-                || extractorAccess.crythst$shouldResetChunkLayerSampler()) {
-            return;
-        }
-
+        final CameraRenderState mainCamera = mainState.cameraRenderState;
         final List<PortalSnapshot> snapshots = PortalClientCache.get();
-        final Set<UUID> live = new HashSet<>(Math.max(8, snapshots.size() * 2));
-        for (PortalSnapshot portal : snapshots) {
-            live.add(portal.id());
-        }
-        registry.prune(live);
         if (snapshots.isEmpty()) {
-            return;
-        }
-
-        final List<PortalSnapshot> candidates = new ArrayList<>();
-        for (PortalSnapshot portal : snapshots) {
-            if (!portal.dimension().equals(level.dimension())
-                    || !portal.viewableIn(level.dimension())) {
-                continue;
-            }
-            if (!isVisible(mainCamera, portal)) {
-                continue;
-            }
-            candidates.add(portal);
-        }
-        if (candidates.isEmpty()) {
-            return;
-        }
-        final Vector3d cameraPosition = new Vector3d(
-                mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z);
-        candidates.sort(Comparator.comparingDouble(
-                portal -> portal.plane().distanceSquared(cameraPosition)));
-
-        final long now = System.nanoTime();
-        boolean poseDirty = false;
-        long oldestAge = Long.MAX_VALUE;
-        for (PortalSnapshot portal : candidates) {
-            final PortalViewTarget target = registry.get(portal.id());
-            if (target == null || !target.isReusable(portal, mainCamera, now)) {
-                poseDirty = true;
-            }
-            if (target != null) {
-                oldestAge = Math.min(oldestAge, target.ageNanos(now));
-            } else {
-                oldestAge = Long.MAX_VALUE;
-            }
-        }
-        if (oldestAge == Long.MAX_VALUE) {
-            // A portal without any image is always due (handled by poseDirty).
-            oldestAge = PortalCaptureSettings.IDLE_REFRESH_NANOS;
-        }
-        if (!scheduler.due(now, poseDirty, oldestAge)) {
+            layers = List.of();
+            lastVisiblePortals = 0;
+            lastSectionCount = 0;
             return;
         }
 
         final RenderTarget mainTarget = gameRenderer.mainRenderTarget();
-        if (mainTarget == null || mainTarget.getColorTexture() == null
-                || mainTarget.getDepthTexture() == null
-                || mainTarget.width <= 0 || mainTarget.height <= 0) {
+        if (mainTarget == null || mainTarget.width <= 0 || mainTarget.height <= 0) {
+            layers = List.of();
             return;
         }
-        final int[] size = PortalCaptureSettings.targetSize(mainTarget);
-        scheduler.markAttempt(now);
+        final int width = mainTarget.width;
+        final int height = mainTarget.height;
+        final Vector3d cameraPosition = new Vector3d(
+                mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z);
 
-        final int start = Math.floorMod(captureCursor++, candidates.size());
-        pass.beginRound();
-        final long roundStart = System.nanoTime();
-        double costMs = 0.0;
-        int sections = 0;
-        try {
-            for (int i = 0; i < candidates.size(); i++) {
-                final PortalSnapshot portal = candidates.get(start + i < candidates.size()
-                        ? start + i : start + i - candidates.size());
-                final PortalViewTarget existing = registry.get(portal.id());
-                if (existing != null && existing.isReusable(portal, mainCamera, now)) {
-                    continue;
-                }
-                if (existing == null
-                        && registry.size() >= PortalCaptureSettings.MAX_ACTIVE_TARGETS) {
-                    continue;
-                }
-                try {
-                    final PortalViewTarget target = registry.getOrCreate(
-                            portal, mainTarget, size[0], size[1]);
-                    final Captured captured = captureOne(minecraft, camera, deltaTracker,
-                            partialTick, level, levelRenderer, levelState, mainCamera,
-                            gameRenderer, portal, target, now);
-                    if (captured != null) {
-                        costMs = captured.costMs();
-                        sections = captured.sections();
-                        break;
-                    }
-                } catch (Throwable error) {
-                    PortalRenderDiagnostics.failure(
-                            "Crythst portal view round failed for '" + portal.name() + "'", error);
-                }
+        final List<PortalSnapshot> roots = new ArrayList<>();
+        for (PortalSnapshot portal : snapshots) {
+            if (!portal.dimension().equals(level.dimension())
+                    || !portal.viewableIn(level.dimension())
+                    || !isVisible(mainCamera, portal)) {
+                continue;
             }
-        } finally {
-            pass.endRound();
+            roots.add(portal);
         }
-        scheduler.recordCost(costMs);
+        roots.sort(Comparator.comparingDouble(
+                portal -> portal.plane().distanceSquared(cameraPosition)));
+
+        final List<PortalRenderData> extracted = new ArrayList<>();
+        final Set<UUID> rendered = new HashSet<>();
+        int sectionCount = 0;
+        int rootsRendered = 0;
+        for (PortalSnapshot portal : roots) {
+            if (rootsRendered >= PortalCaptureSettings.MAX_PORTALS_PER_ROUND) {
+                break;
+            }
+            final PortalViewCamera.Result cameraResult = PortalViewCamera.build(
+                    portal, mainCamera, mainState,
+                    gameRenderer.gameRenderState().optionsRenderState);
+            if (cameraResult.camera() == null) {
+                PortalRenderDiagnostics.skipped(portal, cameraResult.failureReason());
+                continue;
+            }
+            final PortalViewCamera view = cameraResult.camera();
+            final PortalVisibility.Result extractedState = visibility.extract(
+                    minecraft, camera, deltaTracker, partialTick, levelRenderer, view, level);
+            if (!extractedState.ready()) {
+                PortalRenderDiagnostics.skipped(portal, extractedState.failureReason());
+                continue;
+            }
+
+            final PortalMaskGeometry.Mask mask = PortalMaskGeometry.build(
+                    portal.shape(), view.mainViewProjection(),
+                    new Vector3d(mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z),
+                    width, height);
+            if (mask.isEmpty()) {
+                continue;
+            }
+            extracted.add(new PortalRenderData(portal, view, extractedState.state(),
+                    extractedState.sections(), new Matrix4f(view.mainViewProjection()),
+                    mainCamera.pos, mask, 1, 0, extractedState.sectionCount()));
+            rendered.add(portal.id());
+            sectionCount += extractedState.sectionCount();
+            rootsRendered++;
+
+            if (PortalCaptureSettings.MAX_RECURSION <= 1) {
+                continue;
+            }
+            final PortalRenderData child = extractChild(
+                    minecraft, camera, deltaTracker, partialTick, level, levelRenderer,
+                    gameRenderer, portal, view, extractedState, rendered, width, height);
+            if (child != null) {
+                extracted.add(child);
+                sectionCount += child.sectionCount();
+                rendered.add(child.portal().id());
+            }
+        }
+
+        layers = List.copyOf(extracted);
+        lastVisiblePortals = rootsRendered;
+        lastSectionCount = sectionCount;
         if (PortalCaptureSettings.TRACE) {
-            PortalRenderDiagnostics.round(candidates.size(), sections, costMs,
-                    (System.nanoTime() - roundStart) / 1.0e6, scheduler.intervalNanos());
+            PortalRenderDiagnostics.round(lastVisiblePortals, lastSectionCount, 0.0,
+                    (System.nanoTime() - lastExtractStartNanos) / 1.0e6, 0L);
         }
     }
 
-    private Captured captureOne(Minecraft minecraft, Camera camera, DeltaTracker deltaTracker,
-                                float partialTick, ClientLevel level, LevelRenderer levelRenderer,
-                                LevelRenderState levelState, CameraRenderState mainCamera,
-                                GameRenderer gameRenderer, PortalSnapshot portal,
-                                PortalViewTarget target, long now) {
-        final PortalViewCamera.Result cameraResult = PortalViewCamera.build(
-                portal, mainCamera, levelState,
-                gameRenderer.gameRenderState().optionsRenderState);
-        if (cameraResult.camera() == null) {
-            PortalRenderDiagnostics.skipped(portal, cameraResult.failureReason());
-            return null;
-        }
-        final PortalViewCamera view = cameraResult.camera();
-
-        try {
-            final long extractStart = System.nanoTime();
-            try (PortalDestinationExtractor.Scope scope = extractor.begin(
-                    minecraft, camera, mainCamera, levelState, levelRenderer, view)) {
-                final PortalDestinationExtractor.Result extraction = extractor.extract(
-                        camera, deltaTracker, partialTick, view, mainCamera,
-                        levelState, levelRenderer, level);
-                if (!extraction.ready()) {
-                    PortalRenderDiagnostics.skipped(portal, extraction.failureReason());
-                    return null;
-                }
-                final long extractEnd = System.nanoTime();
-                final double extractMs = (extractEnd - extractStart) / 1.0e6;
-                final double renderMs = pass.render(
-                        minecraft, levelRenderer, levelState, mainCamera, view,
-                        extraction.camera(), target, camera, level, deltaTracker);
-                target.markReady(portal, mainCamera, System.nanoTime(),
-                        view.mainViewProjection(), view.mainCapturePosition());
-                PortalRenderDiagnostics.firstCapture(portal, target, extraction.sectionCount());
-                PortalRenderDiagnostics.dumpIfEnabled(target);
-                final double cost = extractMs + renderMs;
-                PortalRenderDiagnostics.timings(portal, target, extraction.sectionCount(),
-                        extractMs, renderMs, scheduler.intervalNanos());
-                return new Captured(cost, extraction.sectionCount());
+    private PortalRenderData extractChild(Minecraft minecraft, Camera camera,
+                                          DeltaTracker deltaTracker, float partialTick,
+                                          ClientLevel level, LevelRenderer levelRenderer,
+                                          GameRenderer gameRenderer, PortalSnapshot parent,
+                                          PortalViewCamera parentView,
+                                          PortalVisibility.Result parentState,
+                                          Set<UUID> rendered, int width, int height) {
+        final CameraRenderState parentCamera = parentState.state().cameraRenderState;
+        final List<PortalSnapshot> candidates = new ArrayList<>();
+        final Vector3d parentPosition = new Vector3d(
+                parentCamera.pos.x, parentCamera.pos.y, parentCamera.pos.z);
+        for (PortalSnapshot portal : PortalClientCache.get()) {
+            if (portal.id().equals(parent.id()) || rendered.contains(portal.id())
+                    || !portal.dimension().equals(level.dimension())
+                    || !portal.viewableIn(level.dimension())) {
+                continue;
             }
-        } catch (Throwable error) {
-            target.markFailed();
-            PortalRenderDiagnostics.failure(
-                    "Crythst portal destination capture failed; keeping previous view", error);
-            return null;
+            if (PortalRecursion.nextLayer(1, PortalCaptureSettings.MAX_RECURSION,
+                    portal.id(), Set.of(parent.id())) == 0) {
+                continue;
+            }
+            if (!isVisible(parentCamera, portal)) {
+                continue;
+            }
+            candidates.add(portal);
         }
+        candidates.sort(Comparator.comparingDouble(
+                portal -> portal.plane().distanceSquared(parentPosition)));
+        for (PortalSnapshot child : candidates) {
+            final PortalViewCamera.Result cameraResult = PortalViewCamera.build(
+                    child, parentCamera, parentState.state(),
+                    gameRenderer.gameRenderState().optionsRenderState,
+                    parentView.projection());
+            if (cameraResult.camera() == null) {
+                continue;
+            }
+            final PortalViewCamera childView = cameraResult.camera();
+            final PortalVisibility.Result childState = visibility.extract(
+                    minecraft, camera, deltaTracker, partialTick, levelRenderer,
+                    childView, level);
+            if (!childState.ready()) {
+                continue;
+            }
+            final Matrix4f screenViewProjection = new Matrix4f(parentView.projection())
+                    .mul(parentView.viewRotation());
+            final PortalMaskGeometry.Mask mask = PortalMaskGeometry.build(
+                    child.shape(), screenViewProjection,
+                    new Vector3d(parentCamera.pos.x, parentCamera.pos.y, parentCamera.pos.z),
+                    width, height);
+            if (mask.isEmpty()) {
+                continue;
+            }
+            return new PortalRenderData(child, childView, childState.state(),
+                    childState.sections(), screenViewProjection, parentCamera.pos,
+                    mask, 2, 1, childState.sectionCount());
+        }
+        return null;
     }
 
     private static boolean isVisible(CameraRenderState camera, PortalSnapshot portal) {
+        if (camera == null || camera.pos == null || portal.plane() == null) {
+            return false;
+        }
         if (camera.pos.distanceToSqr(
-                portal.plane().origin().x, portal.plane().origin().y, portal.plane().origin().z)
+                portal.plane().origin().x, portal.plane().origin().y,
+                portal.plane().origin().z)
                 > PortalCaptureSettings.MAX_CAPTURE_DISTANCE_SQUARED) {
             return false;
         }
@@ -317,11 +303,8 @@ public final class PortalRenderManager {
                 bounds.max().x, bounds.max().y, bounds.max().z));
     }
 
-    private record Captured(double costMs, int sections) {
-    }
-
     private void close() {
-        registry.close();
+        layers = List.of();
         pass.close();
     }
 }

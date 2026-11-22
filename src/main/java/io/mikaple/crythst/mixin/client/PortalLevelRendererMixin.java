@@ -1,33 +1,43 @@
 package io.mikaple.crythst.mixin.client;
 
+import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
+import com.mojang.blaze3d.resource.ResourceHandle;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import io.mikaple.crythst.client.render.portal.PortalRenderManager;
 import net.minecraft.client.renderer.LevelRenderer;
-import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.LevelTargetBundle;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Keeps the shared terrain {@code ViewArea} centred on the main camera during
- * a portal capture.
+ * Adds the portal destination pass to the vanilla level framegraph.
  *
- * <p>{@code LevelRenderer.render} normally re-centres the rotating section
- * storage on the camera it is about to render. Doing that for the portal camera
- * calls {@code RotatingSectionStorage.setSectionNode()}, which resets the
- * affected section meshes to {@code UNCOMPILED}. Bouncing the centre to the
- * destination and back every capture therefore made the destination texture
- * blank (meshes reset immediately before the draw) and caused visible main-view
- * stutter. The portal capture selects sections from the existing main-camera
- * storage instead and only updates the section dispatcher's camera position for
- * translucent sorting, so this re-centre is skipped while capturing.</p>
+ * <p>{@code addMainPass} has just created the main colour+depth pass and stored
+ * its current {@link ResourceHandle} in {@link LevelTargetBundle#main}. The
+ * portal pass declares a read/write dependency on that same handle, so the
+ * framegraph runs it after the vanilla main pass and before the frame is
+ * presented. No separate colour target, texture copy or later quad submission
+ * is involved.</p>
  */
 @Mixin(LevelRenderer.class)
 public abstract class PortalLevelRendererMixin {
-    @Inject(method = "repositionCamera", at = @At("HEAD"), cancellable = true)
-    private void crythst$keepMainViewAreaForPortalCapture(CameraRenderState camera, CallbackInfo ci) {
-        if (PortalRenderManager.isCapturing()) {
-            ci.cancel();
-        }
+    @Shadow
+    @Final
+    private LevelTargetBundle targets;
+
+    @Inject(method = "addMainPass", at = @At("RETURN"))
+    private void crythst$addPortalFramePass(FrameGraphBuilder frame,
+                                            FeatureRenderDispatcher.PreparedFrame featureFrame,
+                                            GpuBufferSlice terrainFog,
+                                            ChunkSectionsToRender chunkSectionsToRender,
+                                            boolean consistentDepthRequired,
+                                            CallbackInfo ci) {
+        this.targets.main = PortalRenderManager.addFramePass(frame, this.targets.main);
     }
 }

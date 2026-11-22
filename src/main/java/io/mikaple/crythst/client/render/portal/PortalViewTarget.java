@@ -20,6 +20,7 @@ import java.util.UUID;
  * <p>Owns the colour+depth target, the texture-manager wrapper, readiness and
  * the camera sample used to decide whether the current image can be reused.</p>
  */
+@Deprecated(forRemoval = true)
 final class PortalViewTarget {
     private final UUID portalId;
     private final Identifier textureId;

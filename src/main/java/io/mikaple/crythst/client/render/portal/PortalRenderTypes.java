@@ -36,6 +36,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>Pipelines are compiled on demand from the current resource pack. No
  * resource reload or dynamic texture reload is triggered.</p>
  */
+@Deprecated(forRemoval = true)
 public final class PortalRenderTypes {
     /** Procedural surface shader: {@code crythst:core/portal}. */
     public static final Identifier PORTAL_SHADER =

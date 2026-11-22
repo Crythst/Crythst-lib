@@ -20,6 +20,7 @@ import java.util.UUID;
 /**
  * Owns one {@link PortalViewTarget} per portal and its texture-manager entry.
  */
+@Deprecated(forRemoval = true)
 final class PortalViewRegistry {
     private final Map<UUID, PortalViewTarget> targets = new HashMap<>();
 

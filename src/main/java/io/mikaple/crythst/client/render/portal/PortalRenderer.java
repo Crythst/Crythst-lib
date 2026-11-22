@@ -25,19 +25,22 @@ public final class PortalRenderer {
         registered = true;
         io.mikaple.crythst.integration.fabric.portal.PortalSyncClient.register();
         PortalClientView.register();
+        PortalCrossingController.register();
         PortalRenderManager.register();
         if (Boolean.getBoolean("crythst.portal.fade")) {
-            // The geometrically correct path needs no curtain. Kept as an
-            // opt-in debug aid for command/respawn jumps.
+            // The continuous crossing path needs no curtain. Kept as an
+            // opt-in debug aid for cross-dimension respawn/command jumps.
             PortalTeleportFade.register();
         }
         LevelRenderEvents.BEFORE_GIZMOS.register(PortalSurfaceRenderer::render);
         Crythst.LOGGER.info(
-                "Crythst portal renderer registered (virtual destination camera + view texture, "
-                        + "oblique exit-plane clip)");
-        if (PortalCaptureSettings.FORCE_PROCEDURAL) {
-            Crythst.LOGGER.info(
-                    "Crythst portal debug: procedural surface forced (capture disabled)");
+                "Crythst portal renderer registered (same-FBO destination pass, "
+                        + "per-pixel mask, exit-plane clip, recursion {})",
+                PortalCaptureSettings.MAX_RECURSION);
+        if (PortalCaptureSettings.OFFSCREEN_FALLBACK) {
+            Crythst.LOGGER.warn(
+                    "Crythst portal debug: legacy offscreen fallback was requested, "
+                            + "but the seamless same-FBO pass is inactive");
         }
     }
 }

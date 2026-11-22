@@ -67,6 +67,13 @@ public abstract class CameraGravityMixin {
     private void crythst$rotateIntoGravityFrame(CameraRenderState state,
                                                 DeltaTracker deltaTracker,
                                                 CallbackInfo ci) {
+        // A portal destination extraction temporarily points the real camera
+        // at the transformed portal camera. Rotating that pose around the
+        // player's feet would corrupt the extracted destination view.
+        if (io.mikaple.crythst.client.render.portal.PortalRenderManager
+                .isDestinationExtracting()) {
+            return;
+        }
         final Quaternionf gravity = crythst$gravityRotation();
         if (gravity == null) {
             return;

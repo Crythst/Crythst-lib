@@ -20,7 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class LevelExtractorFrustumMixin {
     @Inject(method = "applyFrustum", at = @At("HEAD"), cancellable = true)
     private void crythst$skipPortalFrustum(Frustum frustum, CallbackInfo ci) {
-        if (PortalRenderManager.isCapturing()) {
+        if (PortalRenderManager.isDestinationExtracting()) {
             ci.cancel();
         }
     }

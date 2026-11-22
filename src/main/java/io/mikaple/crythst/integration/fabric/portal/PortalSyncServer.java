@@ -2,9 +2,11 @@ package io.mikaple.crythst.integration.fabric.portal;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.portal.PortalManager;
+import io.mikaple.crythst.integration.portal.PortalTeleporter;
 import io.mikaple.crythst.network.portal.PortalRequestPayload;
 import io.mikaple.crythst.network.portal.PortalSyncPayload;
 import io.mikaple.crythst.network.portal.PortalSyncProtocol;
+import io.mikaple.crythst.network.portal.PortalTraversalPayload;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
@@ -38,6 +40,9 @@ public final class PortalSyncServer {
 
         ServerPlayNetworking.registerGlobalReceiver(PortalRequestPayload.TYPE,
                 (payload, context) -> sendFull(context.player()));
+        ServerPlayNetworking.registerGlobalReceiver(PortalTraversalPayload.TYPE,
+                (payload, context) -> context.server().execute(
+                        () -> PortalTeleporter.acceptClientTraversal(context.player(), payload)));
         ServerPlayConnectionEvents.JOIN.register(
                 (handler, sender, server) -> sendFull(handler.getPlayer()));
         ServerTickEvents.END_SERVER_TICK.register(PortalSyncServer::tick);

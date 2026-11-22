@@ -1,7 +1,9 @@
 package io.mikaple.crythst.mixin.client;
 
 import net.minecraft.client.renderer.extract.LevelExtractor;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
 /**
@@ -26,4 +28,16 @@ public interface PortalLevelExtractorAccessor {
 
     @Accessor("shouldResetChunkLayerSampler")
     boolean crythst$shouldResetChunkLayerSampler();
+
+    /**
+     * Swaps the shared extraction target for the duration of a nested portal
+     * extraction. The destination state is a separate {@link LevelRenderState},
+     * so the main camera's already-extracted state is never overwritten.
+     */
+    @Accessor("levelRenderState")
+    LevelRenderState crythst$getLevelRenderState();
+
+    @Mutable
+    @Accessor("levelRenderState")
+    void crythst$setLevelRenderState(LevelRenderState state);
 }

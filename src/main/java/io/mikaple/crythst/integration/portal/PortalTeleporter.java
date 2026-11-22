@@ -82,6 +82,78 @@ public final class PortalTeleporter {
         PLAYER_ATTEMPT_LOG.clear();
     }
 
+    /**
+     * Server-side validation of a client's continuous-crossing prediction.
+     *
+     * <p>The client sends only pre-transform samples. The server verifies that
+     * the swept body-centre segment really crosses the authoritative polygon
+     * near the portal, then applies the same rigid transform itself. This keeps
+     * the server authoritative while preventing the movement-packet checker
+     * from rubber-banding a valid client portal step.</p>
+     */
+    public static void acceptClientTraversal(ServerPlayer player,
+                                             io.mikaple.crythst.network.portal.PortalTraversalPayload payload) {
+        if (player == null || payload == null || player.isRemoved()
+                || player.isSpectator() || player.isPassenger()) {
+            return;
+        }
+        final MinecraftServer server = player.level().getServer();
+        if (server == null) {
+            return;
+        }
+        final Portal portal = PortalManager.findById(payload.portalId());
+        final Portal destination = PortalManager.linkedPortal(portal);
+        if (portal == null || destination == null
+                || !portal.dimension().equals(player.level().dimension())
+                || !destination.dimension().equals(player.level().dimension())) {
+            return;
+        }
+        // The samples must be close to the entry opening, and the eye must be
+        // consistent with the body centre. This bounds both replay and spoofing.
+        if (portal.plane().distanceSquared(payload.currentCentre()) > 64.0
+                || portal.plane().distanceSquared(payload.previousCentre()) > 64.0
+                || payload.eye().distanceSquared(payload.currentCentre()) > 16.0) {
+            return;
+        }
+        // The authoritative server position must be near the claimed crossing;
+        // this rejects replayed samples after the player has moved away.
+        if (player.position().distanceToSqr(new Vec3(
+                payload.currentCentre().x, payload.currentCentre().y,
+                payload.currentCentre().z)) > 64.0) {
+            return;
+        }
+        final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(
+                portal.shape(), payload.previousCentre(), payload.currentCentre());
+        if (crossing == null || !crossing.inside()) {
+            return;
+        }
+        final int tick = server.getTickCount();
+        final Integer ready = ENTITY_READY.get(player.getUUID());
+        if (ready != null && tick < ready) {
+            return;
+        }
+
+        final PortalTransform transform =
+                PortalTransform.between(portal.plane(), destination.plane());
+        final Vector3d feet = PortalTeleportMath.playerFeetForTransformedEye(
+                transform, payload.eye(), player.getEyeHeight());
+        final Vector3d velocity = transform.transformDirection(payload.velocity());
+        final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
+                PortalTransform.viewDirection(payload.yaw(), payload.pitch())));
+        if (player.connection != null) {
+            player.connection.teleport(new PositionMoveRotation(
+                    new Vec3(feet.x, feet.y, feet.z),
+                    new Vec3(velocity.x, velocity.y, velocity.z),
+                    rotation[0], rotation[1]), Set.<Relative>of());
+        }
+        player.setPos(feet.x, feet.y, feet.z);
+        player.setYRot(rotation[0]);
+        player.setXRot(rotation[1]);
+        player.setDeltaMovement(velocity.x, velocity.y, velocity.z);
+        player.setOldPosAndRot();
+        ENTITY_READY.put(player.getUUID(), tick + COOLDOWN_TICKS);
+    }
+
     /** Fabric {@code END_SERVER_TICK} callback. */
     public static void tick(MinecraftServer server) {
         if (PortalManager.size() == 0) {
@@ -323,6 +395,14 @@ public final class PortalTeleporter {
 
         entity.fallDistance = fallDistance;
         entity.setOnGround(onGround);
+        if (!destination.dimension().equals(level.dimension())
+                && entity instanceof net.minecraft.world.entity.Leashable leashable
+                && leashable.isLeashed()) {
+            // A leash cannot follow a dimension change. Same-dimension crossings
+            // keep the leash intact; the vanilla leash tick then updates the
+            // rope between the transformed endpoints.
+            leashable.removeLeash();
+        }
         return true;
     }
 
@@ -426,6 +506,9 @@ public final class PortalTeleporter {
 
             final Vector3d linear = transform.transformDirection(new Vector3d(body.linearVelocity()));
             final Vector3d angular = transform.transformDirection(new Vector3d(body.angularVelocity()));
+            final Vector3d gravityOverride = body.gravityOverride();
+            final Vector3d transformedGravity = gravityOverride == null ? null
+                    : transform.transformDirection(gravityOverride);
             final Vector3d push = PortalTeleportMath.exitBias(
                     destination.shape().plane(), linear, portal.plane().local(centre));
 
@@ -439,6 +522,9 @@ public final class PortalTeleporter {
                 structure.teleport(new Transform3d(position, rotation));
                 structure.body().setLinearVelocity(linear);
                 structure.body().setAngularVelocity(angular);
+                if (transformedGravity != null) {
+                    structure.body().setGravityOverride(transformedGravity);
+                }
                 structure.body().activate();
                 BODY_PREVIOUS.put(key, new BodySample(
                         new Vector3d(structure.body().transform().position()), tick));
@@ -450,6 +536,9 @@ public final class PortalTeleporter {
                 body.teleport(new Transform3d(position, rotation));
                 body.setLinearVelocity(linear);
                 body.setAngularVelocity(angular);
+                if (transformedGravity != null) {
+                    body.setGravityOverride(transformedGravity);
+                }
                 body.activate();
                 BODY_PREVIOUS.put(key, new BodySample(
                         new Vector3d(body.transform().position()), tick));

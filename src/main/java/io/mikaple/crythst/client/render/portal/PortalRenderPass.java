@@ -1,61 +1,103 @@
 package io.mikaple.crythst.client.render.portal;
 
 import com.mojang.blaze3d.ProjectionType;
+import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
+import com.mojang.blaze3d.framegraph.FramePass;
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.resource.CrossFrameResourcePool;
+import com.mojang.blaze3d.pipeline.TextureTarget;
+import com.mojang.blaze3d.resource.ResourceHandle;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.systems.ScissorState;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.renderpearl.api.GpuFormat;
 import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
-import io.mikaple.crythst.mixin.client.PortalLevelRendererAccessor;
+import com.mojang.renderpearl.api.commands.CommandEncoder;
+import com.mojang.renderpearl.api.commands.RenderPass;
+import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
+import com.mojang.renderpearl.api.textures.FilterMode;
+import com.mojang.renderpearl.api.textures.GpuSampler;
+import io.mikaple.crythst.mixin.client.PortalCameraAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.CloudStatus;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.ProjectionMatrixBuffer;
 import net.minecraft.client.renderer.SkyRenderer;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.SubmitNodeStorage;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayerGroup;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.minecraft.client.renderer.fog.FogData;
 import net.minecraft.client.renderer.fog.FogRenderer;
-import net.minecraft.client.renderer.state.GameRenderState;
 import net.minecraft.client.renderer.state.OptionsRenderState;
-import net.minecraft.client.renderer.state.WindowRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.util.ARGB;
+import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
+import org.joml.Matrix4fStack;
 import org.joml.Vector4f;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.OptionalDouble;
+
 /**
- * One isolated RenderPearl destination render into a portal view target.
+ * The same-FBO destination render pass.
  *
- * <p>No raw OpenGL and no stencil: the normal {@link LevelRenderer} framegraph
- * is imported into the portal target, with a temporary
- * {@code GameRenderer.mainRenderTarget()} redirect. The destination camera uses
- * an oblique projection whose near plane is the exit portal plane, so geometry
- * behind the portal is clipped and cannot leak through the opening. Fog is
- * computed at the destination camera rather than copied from the main camera.</p>
+ * <p>For each extracted layer the pass:</p>
+ * <ol>
+ *     <li>saves the current main colour+depth into a per-layer snapshot,</li>
+ *     <li>rasterizes the clipped opening polygon into a per-layer mask,</li>
+ *     <li>clears only the portal's screen rectangle (colour+depth) and renders
+ *     the destination sky, terrain, entities, block entities, particles,
+ *     weather, clouds and world border directly into the main framebuffer,</li>
+ *     <li>composites the snapshot back outside the mask, and</li>
+ *     <li>restores the snapshot depth.</li>
+ * </ol>
  *
- * <p>All frame-global state (model-view, scissor, projection, fog, global
- * camera uniform) is saved and restored. The pass is synchronous on the render
- * thread and never re-enters itself; the surface renderer skips portal quads
- * while {@link #capturing()} is true, which also prevents recursive capture
- * explosions.</p>
+ * <p>The destination world draw is scissored to the portal's screen bounding
+ * rectangle. The sky renderer creates its own full-screen pass, which is why a
+ * full-frame colour snapshot is kept; the composite restores everything outside
+ * the opening.</p>
  */
 final class PortalRenderPass {
-    private CrossFrameResourcePool resourcePool;
+    private static final Vector4f ZERO = new Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
+    private static final int MASK_BUFFER_BYTES = 16 * 1024;
+
     private FogRenderer fogRenderer;
     private GlobalSettingsUniform globalSettings;
     private ProjectionMatrixBuffer projectionBuffer;
+    private GpuBuffer maskBuffer;
+    private int maskBufferBytes;
+    private final List<LayerTargets> layerTargets = new ArrayList<>();
+    private boolean failureLogged;
 
-    private volatile RenderTarget targetOverride;
-    private boolean capturing;
+    /**
+     * Adds the portal pass and returns the newest main-target handle. The
+     * caller must store it back into {@code LevelTargetBundle.main}; otherwise
+     * later framegraph passes would use an invalidated handle version.
+     */
+    ResourceHandle<RenderTarget> addPass(FrameGraphBuilder frame, ResourceHandle<RenderTarget> main,
+                                         List<PortalRenderData> data) {
+        final FramePass pass = frame.addPass("crythst_portals");
+        pass.disableCulling();
+        final ResourceHandle<RenderTarget> updated = pass.readsAndWrites(main);
+        pass.executes(() -> render(data));
+        return updated;
+    }
 
-    void ensureResources() {
-        if (resourcePool == null) {
-            resourcePool = new CrossFrameResourcePool(3);
-        }
+    private void ensureResources() {
         if (fogRenderer == null) {
             fogRenderer = new FogRenderer();
         }
@@ -65,135 +107,348 @@ final class PortalRenderPass {
         if (projectionBuffer == null) {
             projectionBuffer = new ProjectionMatrixBuffer("crythst portal");
         }
-    }
-
-    boolean capturing() {
-        return capturing;
-    }
-
-    RenderTarget targetOverride() {
-        return targetOverride;
-    }
-
-    void beginRound() {
-        capturing = true;
-    }
-
-    void endRound() {
-        capturing = false;
-        targetOverride = null;
-        if (fogRenderer != null) {
-            fogRenderer.endFrame();
+        if (maskBuffer == null) {
+            maskBuffer = RenderSystem.getDevice().createBuffer(
+                    () -> "Crythst portal mask vertices",
+                    GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST,
+                    MASK_BUFFER_BYTES);
+            maskBufferBytes = MASK_BUFFER_BYTES;
         }
     }
 
-    double render(Minecraft minecraft, LevelRenderer levelRenderer,
-                  LevelRenderState levelState, CameraRenderState mainCamera,
-                  PortalViewCamera view, CameraRenderState portalCamera,
-                  PortalViewTarget target, Camera camera, ClientLevel level,
-                  DeltaTracker deltaTracker) {
+    private void render(List<PortalRenderData> data) {
+        final Minecraft minecraft = Minecraft.getInstance();
+        final RenderTarget main = minecraft.gameRenderer.mainRenderTarget();
+        if (main == null || main.getColorTexture() == null || main.getDepthTexture() == null
+                || main.width <= 0 || main.height <= 0) {
+            return;
+        }
         ensureResources();
-        if (resourcePool == null || fogRenderer == null || globalSettings == null
-                || projectionBuffer == null || target.target() == null) {
-            return 0.0;
+        if (fogRenderer == null || globalSettings == null || projectionBuffer == null
+                || maskBuffer == null) {
+            return;
         }
 
-        final int renderDistance = Math.max(2,
-                minecraft.options.getEffectiveRenderDistance());
-        final FogData fog = fogRenderer.setupFog(
-                camera, renderDistance, deltaTracker, 0.0f, level);
-        fogRenderer.updateBuffer(fog);
-        final GpuBufferSlice fogSlice = fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
-        final Vector4f fogColor = fog.color == null
-                ? new Vector4f(0.0f, 0.0f, 0.0f, 1.0f) : new Vector4f(fog.color);
-        if (portalCamera != null) {
-            portalCamera.fogData = fog;
-        }
-
-        final org.joml.Matrix4fStack modelViewStack = RenderSystem.getModelViewStack();
-        final ScissorState savedScissor =
-                new ScissorState(RenderSystem.getScissorStateForRenderTypeDraws());
+        final Matrix4fStack modelViewStack = RenderSystem.getModelViewStack();
         final GpuBufferSlice savedProjection = RenderSystem.getProjectionMatrixBuffer();
         final ProjectionType savedProjectionType = RenderSystem.getProjectionType();
         final GpuBufferSlice savedFog = RenderSystem.getShaderFog();
         final GpuBuffer savedGlobal = RenderSystem.getGlobalSettingsUniform();
 
         modelViewStack.pushMatrix();
-        modelViewStack.identity();
-        RenderSystem.disableScissorForRenderTypeDraws();
-        RenderSystem.setProjectionMatrix(
-                projectionBuffer.getBuffer(view.projection()), ProjectionType.PERSPECTIVE);
-        RenderSystem.setShaderFog(fogSlice);
-        updateGlobalSettings(minecraft, levelState, view.position(), target);
-
-        RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(
-                target.target().getColorTexture(),
-                new Vector4f(fogColor.x, fogColor.y, fogColor.z, 1.0f),
-                target.target().getDepthTexture(), 0.0);
-
-        final PortalLevelRendererAccessor levelRendererAccess =
-                (PortalLevelRendererAccessor) levelRenderer;
-        final SkyRenderer savedSkyRenderer = levelRendererAccess.crythst$getSkyRenderer();
-        SkyRenderer portalSkyRenderer = null;
         try {
-            portalSkyRenderer = target.skyRenderer(
-                    minecraft.getTextureManager(), minecraft.getAtlasManager());
-        } catch (Throwable ignored) {
-            // Sky is non-critical; the destination fog colour remains.
-        }
-        if (portalSkyRenderer != null) {
-            levelRendererAccess.crythst$setSkyRenderer(portalSkyRenderer);
-        }
-
-        final long start = System.nanoTime();
-        targetOverride = target.target();
-        try {
-            levelRenderer.render(resourcePool, false, portalCamera,
-                    fogSlice, fogColor, portalSkyRenderer != null, false);
+            for (PortalRenderData layer : data) {
+                if (!layer.visible()) {
+                    continue;
+                }
+                try {
+                    renderLayer(minecraft, main, layer);
+                } catch (Throwable error) {
+                    if (!failureLogged) {
+                        failureLogged = true;
+                        PortalRenderDiagnostics.failure(
+                                "Crythst same-FBO portal pass failed; skipping frame", error);
+                    }
+                }
+            }
         } finally {
-            targetOverride = null;
-            levelRendererAccess.crythst$setSkyRenderer(savedSkyRenderer);
             modelViewStack.popMatrix();
-            restoreScissor(savedScissor);
-            RenderSystem.setProjectionMatrix(savedProjection, savedProjectionType);
+            if (savedProjection != null) {
+                RenderSystem.setProjectionMatrix(savedProjection, savedProjectionType);
+            }
             RenderSystem.setShaderFog(savedFog);
             if (savedGlobal != null) {
                 RenderSystem.setGlobalSettingsUniform(savedGlobal);
             }
+            final ClientLevel level = minecraft.level;
+            final Camera mainCamera = minecraft.gameRenderer.mainCamera();
+            if (level != null && mainCamera != null) {
+                final Vec3 mainPos = mainCamera.position();
+                mainCamera.attributeProbe().reset();
+                mainCamera.attributeProbe().tick(level, mainPos);
+            }
+            fogRenderer.endFrame();
         }
-        return (System.nanoTime() - start) / 1.0e6;
     }
 
-    private void updateGlobalSettings(Minecraft minecraft, LevelRenderState levelState,
-                                      Vec3 cameraPos, PortalViewTarget target) {
-        final GameRenderState game = minecraft.gameRenderer.gameRenderState();
+    private void renderLayer(Minecraft minecraft, RenderTarget main, PortalRenderData layer) {
+        final ClientLevel level = minecraft.level;
+        final LevelRenderer levelRenderer = minecraft.levelRenderer;
+        final CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+
+        final LayerTargets targets = targetsFor(layer.layer(), main.width, main.height);
+        final PortalMaskGeometry.Mask mask = layer.mask();
+        if (targets == null || mask.isEmpty()) {
+            return;
+        }
+
+        // 1. Snapshot the current main framebuffer.
+        encoder.copyTextureToTexture(main.getColorTexture(), targets.snapshot.getColorTexture(),
+                0, 0, 0, 0, 0, main.width, main.height);
+        encoder.copyTextureToTexture(main.getDepthTexture(), targets.snapshot.getDepthTexture(),
+                0, 0, 0, 0, 0, main.width, main.height);
+
+        // 2. Build the opening mask.
+        drawMask(encoder, targets, mask);
+
+        // 3. Set up destination camera/fog/projection. The real Camera is
+        // temporarily aimed at the destination only so FogRenderer can use the
+        // same attribute probe as a normal level render.
+        final Camera realCamera = minecraft.gameRenderer.mainCamera();
+        final PortalCameraAccessor cameraAccess = (PortalCameraAccessor) realCamera;
+        final Vec3 savedPos = realCamera.position();
+        final float savedYaw = realCamera.yRot();
+        final float savedPitch = realCamera.xRot();
+        cameraAccess.crythst$setPosition(layer.view().position());
+        cameraAccess.crythst$setRotation(layer.view().yaw(), layer.view().pitch());
+        realCamera.attributeProbe().reset();
+        realCamera.attributeProbe().tick(level, layer.view().position());
+        final DeltaTracker deltaTracker = minecraft.getDeltaTracker();
+        final int renderDistance = Math.max(2, minecraft.options.getEffectiveRenderDistance());
+        final FogData fog;
+        try {
+            fog = fogRenderer.setupFog(realCamera, renderDistance, deltaTracker, 0.0f, level);
+            fogRenderer.updateBuffer(fog);
+        } finally {
+            cameraAccess.crythst$setPosition(savedPos);
+            cameraAccess.crythst$setRotation(savedYaw, savedPitch);
+        }
+        final GpuBufferSlice fogSlice = fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
+        final Vector4f fogColor = fog.color == null
+                ? new Vector4f(0.0f, 0.0f, 0.0f, 1.0f) : new Vector4f(fog.color);
+        layer.state().cameraRenderState.fogData = fog;
+
+        modelViewStack().identity();
+        modelViewStack().mul(layer.view().viewRotation());
+        RenderSystem.setProjectionMatrix(
+                projectionBuffer.getBuffer(layer.view().projection()),
+                ProjectionType.PERSPECTIVE);
+        RenderSystem.setShaderFog(fogSlice);
+        updateGlobalSettings(minecraft, layer.state(), main);
+
+        // 4. Clear only the portal rectangle. This is the "depth cleared inside
+        // the opening" step; the composite later restores outside pixels.
+        encoder.clearColorAndDepthTextures(
+                main.getColorTexture(), fogColor, main.getDepthTexture(), 0.0,
+                mask.minX(), mask.minY(), mask.width(), mask.height(), 0);
+
+        // 5. Destination sky. SkyRenderer creates its own full-screen pass, so
+        // the snapshot/composite restores the screen outside the opening.
+        final SkyRenderer skyRenderer = levelRenderer.skyRenderer();
+        if (skyRenderer != null
+                && layer.state().skyRenderState.skybox != DimensionType.Skybox.NONE) {
+            skyRenderer.render(fogSlice, layer.state().skyRenderState);
+        }
+
+        // 6. Destination world into the main colour+depth attachments.
+        renderDestinationWorld(minecraft, levelRenderer, layer, main, mask, fog);
+
+        // 7. Composite: keep destination pixels inside the opening, restore the
+        // snapshot outside it. Layer 2 also multiplies by the parent mask.
+        composite(minecraft, main, targets, layer);
+        encoder.copyTextureToTexture(targets.snapshot.getDepthTexture(), main.getDepthTexture(),
+                0, 0, 0, 0, 0, main.width, main.height);
+    }
+
+    private void renderDestinationWorld(Minecraft minecraft, LevelRenderer levelRenderer,
+                                        PortalRenderData layer, RenderTarget main,
+                                        PortalMaskGeometry.Mask mask, FogData fog) {
+        final LevelRenderState state = layer.state();
+        final OptionsRenderState options = minecraft.gameRenderer
+                .gameRenderState().optionsRenderState;
+        final var visible = levelRenderer.visibleSections();
+        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection>
+                savedVisible = List.copyOf(visible);
+        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection>
+                savedNearby = List.copyOf(levelRenderer.nearbyVisibleSections());
+        FeatureRenderDispatcher.PreparedFrame featureFrame = null;
+        try {
+            visible.clear();
+            visible.addAll(layer.sections());
+
+            final SubmitNodeStorage submits = new SubmitNodeStorage();
+            submits.setUseImprovedTransparency(false);
+            submitFeatures(minecraft, levelRenderer, state, submits);
+            featureFrame = minecraft.gameRenderer.featureRenderDispatcher()
+                    .prepareFrame(submits);
+
+            final net.minecraft.client.renderer.CloudRenderer cloudRenderer =
+                    levelRenderer.cloudRenderer();
+            final boolean clouds = options.cloudStatus != CloudStatus.OFF
+                    && ARGB.alpha(state.cloudColor) > 0;
+            if (clouds) {
+                cloudRenderer.prepare(state.cloudColor, options.cloudStatus, state.cloudHeight,
+                        options.cloudRange, state.cameraRenderState.pos,
+                        state.gameTime, state.worldPartialTicks);
+            }
+            final int renderDistance = options.renderDistance * 16;
+            levelRenderer.worldBorderRenderer().prepare(
+                    state.worldBorderRenderState, state.cameraRenderState.pos,
+                    renderDistance, state.cameraRenderState.depthFar);
+            levelRenderer.weatherEffectRenderer().prepare(
+                    state.cameraRenderState.pos, state.weatherRenderState);
+
+            final Matrix4f terrainMatrix = new Matrix4f(
+                    state.cameraRenderState.viewRotationMatrix);
+            final ChunkSectionsToRender chunkSections =
+                    levelRenderer.prepareChunkRenders(terrainMatrix, true);
+            final GpuSampler sampler = RenderSystem.getSamplerCache()
+                    .getClampToEdge(FilterMode.LINEAR);
+            final var blockAtlas = minecraft.getTextureManager()
+                    .getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+            final RenderPass.RenderArea area = new RenderPass.RenderArea(
+                    mask.minX(), mask.minY(), mask.width(), mask.height());
+
+            final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
+                            () -> "Crythst portal destination")
+                    .withColorAttachment(main.getColorTextureView())
+                    .withDepthAttachment(main.getDepthTextureView())
+                    .withRenderArea(area)
+                    .build();
+            try (RenderPass renderPass = RenderSystem.getDevice()
+                    .createCommandEncoder().createRenderPass(descriptor)) {
+                RenderSystem.bindDefaultUniforms(renderPass);
+                chunkSections.renderGroup(ChunkSectionLayerGroup.OPAQUE, renderPass,
+                        sampler, blockAtlas, state.renderWireframeTerrain);
+                featureFrame.executeSolid(renderPass);
+                featureFrame.executeTranslucent(renderPass);
+                chunkSections.renderGroup(ChunkSectionLayerGroup.TRANSLUCENT, renderPass,
+                        sampler, blockAtlas, state.renderWireframeTerrain);
+                featureFrame.executeTranslucentAfterTerrain(renderPass);
+                if (clouds) {
+                    cloudRenderer.render(options.cloudStatus, renderPass);
+                }
+                levelRenderer.weatherEffectRenderer().render(state.weatherRenderState, renderPass);
+                levelRenderer.worldBorderRenderer().render(
+                        state.worldBorderRenderState, renderPass,
+                        state.cameraRenderState.pos, renderDistance);
+            }
+        } finally {
+            if (featureFrame != null) {
+                featureFrame.close();
+            }
+            visible.clear();
+            visible.addAll(savedVisible);
+            levelRenderer.nearbyVisibleSections().clear();
+            levelRenderer.nearbyVisibleSections().addAll(savedNearby);
+        }
+    }
+
+    private static void submitFeatures(Minecraft minecraft, LevelRenderer levelRenderer,
+                                       LevelRenderState state, SubmitNodeCollector collector) {
+        final PoseStack poseStack = new PoseStack();
+        final CameraRenderState camera = state.cameraRenderState;
+        final Vec3 cameraPos = camera.pos;
+        final double camX = cameraPos.x;
+        final double camY = cameraPos.y;
+        final double camZ = cameraPos.z;
+        for (var entity : state.entityRenderStates) {
+            levelRenderer.entityRenderDispatcher().submit(entity, camera,
+                    entity.x - camX, entity.y - camY, entity.z - camZ,
+                    poseStack, collector);
+        }
+        for (var blockEntity : state.blockEntityRenderStates) {
+            poseStack.pushPose();
+            poseStack.translate(blockEntity.blockPos.getX() - camX,
+                    blockEntity.blockPos.getY() - camY,
+                    blockEntity.blockPos.getZ() - camZ);
+            levelRenderer.blockEntityRenderDispatcher().submit(
+                    blockEntity, poseStack, collector, camera);
+            poseStack.popPose();
+        }
+        state.particlesRenderState.submit(collector, camera);
+    }
+
+    private void drawMask(CommandEncoder encoder, LayerTargets targets,
+                          PortalMaskGeometry.Mask mask) {
+        encoder.clearColorTexture(targets.mask.getColorTexture(), ZERO);
+        final int bytes = mask.triangles().length * Float.BYTES;
+        if (bytes <= 0 || bytes > maskBufferBytes) {
+            return;
+        }
+        final ByteBuffer buffer = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder());
+        for (float value : mask.triangles()) {
+            buffer.putFloat(value);
+        }
+        buffer.flip();
+        encoder.writeToBuffer(maskBuffer.slice(0, bytes), buffer);
+
+        final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
+                        () -> "Crythst portal mask")
+                .withColorAttachment(targets.mask.getColorTextureView())
+                .withRenderArea(new RenderPass.RenderArea(
+                        mask.minX(), mask.minY(), mask.width(), mask.height()))
+                .build();
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder().createRenderPass(descriptor)) {
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
+                    PortalPassRenderTypes.mask()));
+            renderPass.setVertexBuffer(0, maskBuffer.slice(0, bytes));
+            renderPass.draw(mask.vertexCount(), 1, 0, 0);
+        }
+    }
+
+    private void composite(Minecraft minecraft, RenderTarget main, LayerTargets targets,
+                           PortalRenderData layer) {
+        final LayerTargets parent = layer.parentLayer() > 0
+                ? targetsFor(layer.parentLayer(), main.width, main.height) : targets;
+        final var parentMask = parent != null && parent != targets
+                ? parent.mask.getColorTextureView() : targets.mask.getColorTextureView();
+        final GpuSampler nearest = RenderSystem.getSamplerCache()
+                .getClampToEdge(FilterMode.NEAREST);
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder()
+                .createRenderPass(() -> "Crythst portal composite",
+                        main.getColorTextureView(), Optional.empty(), null,
+                        OptionalDouble.empty())) {
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
+                    PortalPassRenderTypes.composite()));
+            renderPass.setUniform("Sampler0",
+                    targets.snapshot.getColorTextureView(), nearest);
+            renderPass.setUniform("Sampler1", targets.mask.getColorTextureView(), nearest);
+            renderPass.setUniform("Sampler2", parentMask, nearest);
+            renderPass.draw(3, 1, 0, 0);
+        }
+    }
+
+    private LayerTargets targetsFor(int layer, int width, int height) {
+        final int index = Math.max(0, layer - 1);
+        while (layerTargets.size() <= index) {
+            layerTargets.add(new LayerTargets());
+        }
+        final LayerTargets targets = layerTargets.get(index);
+        targets.ensure(width, height);
+        return targets;
+    }
+
+    private Matrix4fStack modelViewStack() {
+        return RenderSystem.getModelViewStack();
+    }
+
+    private void updateGlobalSettings(Minecraft minecraft, LevelRenderState state,
+                                      RenderTarget target) {
+        final var game = minecraft.gameRenderer.gameRenderState();
         final OptionsRenderState options = game.optionsRenderState;
-        final WindowRenderState window = game.windowRenderState;
-        final int width = target.width() > 0 ? target.width() : window.width;
-        final int height = target.height() > 0 ? target.height() : window.height;
         globalSettings.update(
-                width,
-                height,
+                target.width,
+                target.height,
                 options.glintStrength,
-                levelState.gameTime,
-                levelState.worldPartialTicks,
+                state.gameTime,
+                state.worldPartialTicks,
                 options.menuBackgroundBlurriness,
-                cameraPos,
+                state.cameraRenderState.pos,
                 options.textureFiltering == TextureFilteringMethod.RGSS);
     }
 
-    private static void restoreScissor(ScissorState state) {
-        if (state != null && state.enabled()) {
-            RenderSystem.enableScissorForRenderTypeDraws(
-                    state.x(), state.y(), state.width(), state.height());
-        } else {
-            RenderSystem.disableScissorForRenderTypeDraws();
-        }
-    }
-
     void close() {
-        capturing = false;
-        targetOverride = null;
+        for (LayerTargets targets : layerTargets) {
+            targets.close();
+        }
+        layerTargets.clear();
+        if (maskBuffer != null) {
+            maskBuffer.close();
+            maskBuffer = null;
+        }
         if (fogRenderer != null) {
             fogRenderer.close();
             fogRenderer = null;
@@ -206,9 +461,36 @@ final class PortalRenderPass {
             projectionBuffer.close();
             projectionBuffer = null;
         }
-        if (resourcePool != null) {
-            resourcePool.clear();
-            resourcePool = null;
+    }
+
+    private static final class LayerTargets {
+        private TextureTarget snapshot;
+        private TextureTarget mask;
+        private int width;
+        private int height;
+
+        void ensure(int width, int height) {
+            if (snapshot != null && mask != null && this.width == width && this.height == height) {
+                return;
+            }
+            close();
+            this.width = width;
+            this.height = height;
+            snapshot = new TextureTarget("Crythst portal snapshot", width, height,
+                    GpuFormat.RGBA8_UNORM, GpuFormat.D32_FLOAT);
+            mask = new TextureTarget("Crythst portal mask", width, height,
+                    GpuFormat.RGBA8_UNORM, null);
+        }
+
+        void close() {
+            if (snapshot != null) {
+                snapshot.destroyBuffers();
+                snapshot = null;
+            }
+            if (mask != null) {
+                mask.destroyBuffers();
+                mask = null;
+            }
         }
     }
 }

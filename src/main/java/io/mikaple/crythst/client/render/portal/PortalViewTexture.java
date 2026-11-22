@@ -12,6 +12,7 @@ import net.minecraft.client.renderer.texture.AbstractTexture;
  * changes what a portal RenderType samples without a resource reload. The
  * render target owns the GPU resources; this wrapper never closes them.</p>
  */
+@Deprecated(forRemoval = true)
 public final class PortalViewTexture extends AbstractTexture {
     private final String label;
 

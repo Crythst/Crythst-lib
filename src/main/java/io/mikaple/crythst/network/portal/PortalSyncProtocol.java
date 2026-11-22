@@ -19,5 +19,7 @@ public final class PortalSyncProtocol {
                 .register(PortalSyncPayload.TYPE, PortalSyncPayload.STREAM_CODEC);
         PayloadTypeRegistry.serverboundPlay()
                 .register(PortalRequestPayload.TYPE, PortalRequestPayload.STREAM_CODEC);
+        PayloadTypeRegistry.serverboundPlay()
+                .register(PortalTraversalPayload.TYPE, PortalTraversalPayload.STREAM_CODEC);
     }
 }
