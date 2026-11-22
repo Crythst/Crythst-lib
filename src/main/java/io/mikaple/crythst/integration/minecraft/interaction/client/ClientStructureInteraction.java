@@ -15,7 +15,6 @@ import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.BlockHitResult;
@@ -244,9 +243,9 @@ public final class ClientStructureInteraction {
 
     private static boolean send(LocalPlayer player, StructureAction action, boolean swing) {
         ClientPlayNetworking.send(new StructureActionPayload(action));
-        if (swing) {
-            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
-        }
+        // Do not swing locally: the server may reject the action (occlusion,
+        // reach, invalid placement, cooldown). StructureInteraction.handleAction
+        // swings only after authoritative success.
         return true;
     }
 

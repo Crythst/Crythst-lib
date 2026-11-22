@@ -931,7 +931,7 @@ public final class StructureInteraction {
         if (player.isSpectator() && !picking) {
             return false;
         }
-        return switch (action) {
+        final boolean result = switch (action) {
             // Legacy one-shot break request. New clients use START/TICK/STOP;
             // retaining MINE keeps older clients working while still preferring
             // the void-level vanilla path.
@@ -960,6 +960,18 @@ public final class StructureInteraction {
             }
             case SHOVEL_WATER -> shovelWater(player);
         };
+        // The client no longer swings before the server validates a structure
+        // action. Let the authoritative success drive the swing, so a rejected
+        // placement/use does not animate. Shovel water and pick-block handle
+        // their own animation semantics.
+        if (result && action != StructureAction.SHOVEL_WATER
+                && action != StructureAction.PICK
+                && action != StructureAction.PICK_WITH_DATA
+                && action != StructureAction.TICK_MINE
+                && action != StructureAction.STOP_MINE) {
+            player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+        }
+        return result;
     }
 
     /**

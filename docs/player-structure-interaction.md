@@ -23,6 +23,7 @@ hand-off are described in [selection-targeting.md](selection-targeting.md).
 | Right-click a structure block to place a block | `StructureOperationRedirector.useOn(...)` runs vanilla `BlockItem`/`BlockPlaceContext` in the void level; outside-volume targets fall back to `StructureInteraction.placeBlock(...)` for expansion |
 | Right-click a structure block to use it (empty hand, tool, bucket, food) | `StructureOperationRedirector.useOn(...)` runs vanilla `BlockState.useItemOn`/`useWithoutItem`/`ItemStack.useOn` with an explicit auxiliary `UseOnContext`, so menus, buttons, dispensers and item use are vanilla |
 | Shift + right-click with a non-empty hand | block use is skipped and vanilla item placement/use runs first, matching vanilla `ServerPlayerGameMode.useItemOn` |
+| Arm swing | server-authoritative: the client sends no local swing, and `handleAction` swings only after the action succeeds; failed reach/occlusion/placement checks stay still |
 | Placement/use sound | projected to host coordinates **without excluding the acting player**, because the client cancels local prediction for structure clicks |
 | Right-click with a spawn egg / item frame / registered entity item | `StructureEntityPlacement.place(...)`: server re-raycast, surface-point math, vanilla entity spawn, no real support block required |
 | Middle-click a structure block to pick it | `StructureInteraction.pickBlock(...)` via the client `PICK` / `PICK_WITH_DATA` payload and vanilla `tryPickItem` |
