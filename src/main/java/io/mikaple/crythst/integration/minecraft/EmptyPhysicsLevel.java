@@ -1236,10 +1236,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         if (region == null || region.structure != structure) {
             return null;
         }
-        final IntBounds3 bounds = structure.volume().bounds();
-        final int localX = x - bounds.minX();
-        final int localY = y - bounds.minY();
-        final int localZ = z - bounds.minZ();
+        final int localX = x - region.volumeMinX;
+        final int localY = y - region.volumeMinY;
+        final int localZ = z - region.volumeMinZ;
         if (localX < 0 || localY < 0 || localZ < 0
                 || localX >= region.sizeX || localY >= region.sizeY || localZ >= region.sizeZ) {
             return null;
@@ -1288,9 +1287,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         if (structure == null || structure.closed()) {
             return null;
         }
-        final IntBounds3 bounds = structure.volume().bounds();
         final Vector3d center = structure.blockCenter(
-                bounds.minX() + localX, bounds.minY() + localY, bounds.minZ() + localZ);
+                region.volumeMinX + localX, region.volumeMinY + localY,
+                region.volumeMinZ + localZ);
         return BlockPos.containing(center.x, center.y, center.z);
     }
 
@@ -1352,11 +1351,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         if (region == null || region.structure == null || region.structure.closed()) {
             return null;
         }
-        final IntBounds3 bounds = region.structure.volume().bounds();
         final StructureEntityProjection.RegionAnchor anchor =
                 new StructureEntityProjection.RegionAnchor(
-                        region.baseX - bounds.minX(), region.baseY - bounds.minY(),
-                        region.baseZ - bounds.minZ());
+                        region.baseX - region.volumeMinX,
+                        region.baseY - region.volumeMinY,
+                        region.baseZ - region.volumeMinZ);
         return StructureEntityProjection.projectPosition(region.structure.pose(),
                 region.structure.blockScale(), anchor, new Vec3(x, y, z));
     }
@@ -1426,9 +1425,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             final PhysicsStructure structure = region.structure;
             final VoxelVolume volume = structure.volume();
             final IntBounds3 bounds = volume.bounds();
-            final int x = bounds.minX() + (pos.getX() - region.baseX);
-            final int y = bounds.minY() + (pos.getY() - region.baseY);
-            final int z = bounds.minZ() + (pos.getZ() - region.baseZ);
+            final int x = region.volumeMinX + (pos.getX() - region.baseX);
+            final int y = region.volumeMinY + (pos.getY() - region.baseY);
+            final int z = region.volumeMinZ + (pos.getZ() - region.baseZ);
             if (!bounds.contains(x, y, z)) {
                 totalSkippedBlocks++;
                 continue;
@@ -1611,9 +1610,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         }
         final PhysicsStructure structure = region.structure;
         final IntBounds3 bounds = structure.volume().bounds();
-        final int x = bounds.minX() + (auxiliaryPos.getX() - region.baseX);
-        final int y = bounds.minY() + (auxiliaryPos.getY() - region.baseY);
-        final int z = bounds.minZ() + (auxiliaryPos.getZ() - region.baseZ);
+        final int x = region.volumeMinX + (auxiliaryPos.getX() - region.baseX);
+        final int y = region.volumeMinY + (auxiliaryPos.getY() - region.baseY);
+        final int z = region.volumeMinZ + (auxiliaryPos.getZ() - region.baseZ);
         if (!bounds.contains(x, y, z)) {
             return false;
         }

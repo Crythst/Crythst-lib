@@ -419,6 +419,23 @@ public final class LevelPhysics implements AutoCloseable {
                     StructureSplitter.removeIfMassless(this, structure, volume);
                     continue;
                 }
+                // In-place reindexing is only safe while the auxiliary region
+                // still describes the same bounds. A broken edge block or an
+                // expansion can change min/size; the old base mapping would
+                // then point at the wrong voxel (blocks become unbreakable or
+                // unplaceable). Re-copy the region in that case.
+                final var region = subLevel == null ? null : subLevel.regionView(structure);
+                if (region == null || region.volumeMinX() != volume.bounds().minX()
+                        || region.volumeMinY() != volume.bounds().minY()
+                        || region.volumeMinZ() != volume.bounds().minZ()
+                        || region.sizeX() != volume.bounds().sizeX()
+                        || region.sizeY() != volume.bounds().sizeY()
+                        || region.sizeZ() != volume.bounds().sizeZ()) {
+                    structure.reindex(volume);
+                    final List<PhysicsStructure> refreshed = refreshStructure(structure, volume);
+                    attachedEntities.relocate(structure, refreshed);
+                    continue;
+                }
                 structure.reindex(volume);
                 refreshStructureActors(structure);
                 // Reconnect/split editing must still run; this may close the

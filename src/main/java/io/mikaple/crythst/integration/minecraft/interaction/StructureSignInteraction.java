@@ -163,8 +163,9 @@ public final class StructureSignInteraction {
         final int x = payload.voxelX();
         final int y = payload.voxelY();
         final int z = payload.voxelZ();
-        if (!structure.volume().bounds().contains(x, y, z)
-                || !structure.volume().isSolid(x, y, z)) {
+        // Signs have no collision shape, so volume.isSolid is false for a
+        // normal sign cell. The live auxiliary block entity is the authority.
+        if (!structure.volume().bounds().contains(x, y, z)) {
             return;
         }
         final EmptyPhysicsLevel auxiliary = physics.auxiliaryLevel();
