@@ -17,6 +17,7 @@ import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
 import com.mojang.renderpearl.api.textures.FilterMode;
 import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
+import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.client.render.structure.batch.BatchedStructureRenderer;
 import io.mikaple.crythst.client.render.structure.blockentity.StructureBlockEntityRenderer;
 import io.mikaple.crythst.client.render.structure.moving.StructureMovingBlockRenderer;
@@ -102,6 +103,17 @@ final class PortalRenderPass {
     private final List<PortalCloudRenderer> portalClouds = new ArrayList<>();
     private boolean failureLogged;
 
+    private static final long FRAME_TRACE_INTERVAL_NANOS = 250_000_000L;
+    private final boolean frameTrace = Boolean.getBoolean("crythst.portal.traceFrames");
+    private long lastFrameTraceNanos;
+    private int frameVisible;
+    private int frameRendered;
+    private int frameFailed;
+    private int frameMaskRectX = -1;
+    private int frameMaskRectY;
+    private int frameMaskRectW;
+    private int frameMaskRectH;
+
     /**
      * Adds the portal pass and returns the newest main-target handle. The
      * caller must store it back into {@code LevelTargetBundle.main}; otherwise
@@ -165,6 +177,13 @@ final class PortalRenderPass {
         final GpuBuffer savedGlobal = RenderSystem.getGlobalSettingsUniform();
 
         modelViewStack.pushMatrix();
+        frameVisible = 0;
+        frameRendered = 0;
+        frameFailed = 0;
+        frameMaskRectX = -1;
+        frameMaskRectY = 0;
+        frameMaskRectW = 0;
+        frameMaskRectH = 0;
         try {
             final Set<Integer> failedLayers = new HashSet<>();
             for (int index = 0; index < data.size(); index++) {
@@ -172,18 +191,22 @@ final class PortalRenderPass {
                 if (!layer.visible()) {
                     continue;
                 }
+                frameVisible++;
                 // A child composite multiplies its mask by the parent's mask.
                 // If the parent layer failed, its mask may be empty or stale,
                 // so rendering the child could paint outside the outer opening.
                 // Skip the whole subtree for this frame.
                 if (layer.parentLayer() > 0 && failedLayers.contains(layer.parentLayer())) {
                     failedLayers.add(layer.layer());
+                    frameFailed++;
                     continue;
                 }
                 try {
                     renderLayer(minecraft, main, layer, index);
+                    frameRendered++;
                 } catch (Throwable error) {
                     failedLayers.add(layer.layer());
+                    frameFailed++;
                     if (!failureLogged) {
                         failureLogged = true;
                         PortalRenderDiagnostics.failure(
@@ -212,6 +235,29 @@ final class PortalRenderPass {
                 featureBuffers.endFrame();
             }
         }
+        traceFrame(main);
+    }
+
+    /**
+     * One {@code [portal frame]} log line per 250 ms when
+     * {@code -Dcrythst.portal.traceFrames=true}. Reports what the pass actually
+     * did with the layers the extractor handed it, plus any mask whose pixel
+     * bounds had to be rescaled because the main target changed size between
+     * extraction and the pass (window maximise/fullscreen toggles).
+     */
+    private void traceFrame(RenderTarget main) {
+        if (!frameTrace) {
+            return;
+        }
+        final long now = System.nanoTime();
+        if (now - lastFrameTraceNanos < FRAME_TRACE_INTERVAL_NANOS) {
+            return;
+        }
+        lastFrameTraceNanos = now;
+        Crythst.LOGGER.info(
+                "[portal frame] target={}x{} visible={} rendered={} failed={} maskRect={},{} {}x{}",
+                main.width, main.height, frameVisible, frameRendered, frameFailed,
+                frameMaskRectX, frameMaskRectY, frameMaskRectW, frameMaskRectH);
     }
 
     private void discardFeatureDispatcher() {
@@ -235,6 +281,10 @@ final class PortalRenderPass {
         if (targets == null || mask.isEmpty() || layer.chunkSections() == null) {
             return;
         }
+        frameMaskRectX = mask.minX();
+        frameMaskRectY = mask.minY();
+        frameMaskRectW = mask.width();
+        frameMaskRectH = mask.height();
 
         // 1. Snapshot the current main framebuffer.
         encoder.copyTextureToTexture(main.getColorTexture(), targets.snapshot.getColorTexture(),

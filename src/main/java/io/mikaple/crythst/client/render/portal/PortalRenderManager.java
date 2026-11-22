@@ -357,7 +357,29 @@ public final class PortalRenderManager {
             PortalRenderDiagnostics.skipped(portal, reason);
             return null;
         }
+        traceReuse(portal, reason, age);
         return cached.result();
+    }
+
+    private static long lastReuseLogNanos = -1_000_000_000L;
+
+    /**
+     * Rate-limited (max one per second) note that a frame was served from the
+     * reuse cache. Useful when comparing a windowed run against a fullscreen
+     * one: it separates "the destination extraction keeps failing" from
+     * "the destination content itself is unstable".
+     */
+    private static void traceReuse(PortalSnapshot portal, String reason, long ageNanos) {
+        if (!PortalCaptureSettings.TRACE) {
+            return;
+        }
+        final long now = System.nanoTime();
+        if (now - lastReuseLogNanos < 1_000_000_000L) {
+            return;
+        }
+        lastReuseLogNanos = now;
+        Crythst.LOGGER.info("Crythst portal '{}' reuses a destination pass {}ms old ({})",
+                portal.name(), ageNanos / 1_000_000L, reason);
     }
 
     /**
