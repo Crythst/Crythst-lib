@@ -101,6 +101,8 @@ final class PortalRenderPass {
     private final List<LayerTargets> layerTargets = new ArrayList<>();
     private final List<PortalCloudRenderer> portalClouds = new ArrayList<>();
     private boolean failureLogged;
+    /** True when a layer-1 portal drew its opening, so the final occlusion depth is valid. */
+    private boolean renderedLayerOne;
 
     /**
      * Adds the portal pass and returns the newest main-target handle. The
@@ -166,6 +168,7 @@ final class PortalRenderPass {
 
         modelViewStack.pushMatrix();
         try {
+            renderedLayerOne = false;
             final Set<Integer> failedLayers = new HashSet<>();
             for (int index = 0; index < data.size(); index++) {
                 final PortalRenderData layer = data.get(index);
@@ -190,6 +193,9 @@ final class PortalRenderPass {
                                 "Crythst same-FBO portal pass failed; skipping frame", error);
                     }
                 }
+            }
+            if (renderedLayerOne) {
+                restoreOcclusionDepth(main);
             }
         } finally {
             modelViewStack.popMatrix();
@@ -313,6 +319,12 @@ final class PortalRenderPass {
         // depth survives inside the opening, which is what lets layer 2 be
         // occluded by layer 1's destination geometry.
         restoreDepth(encoder, main, targets, layer);
+        // Records that layer 1 produced a valid opening: the final occlusion
+        // depth restore below needs this layer's snapshot depth, which already
+        // holds the portal plane depth through the rasterized mask polygon.
+        if (layer.layer() == 1) {
+            renderedLayerOne = true;
+        }
         completed = true;
         } finally {
             if (!completed) {
@@ -321,6 +333,36 @@ final class PortalRenderPass {
                 // degrades to "no portal this frame", not "screen explosion".
                 restoreSnapshot(encoder, main, targets);
             }
+        }
+    }
+
+    /**
+     * Restores the layer-1 snapshot depth over the whole frame once every layer
+     * has been composited.
+     *
+     * <p>Inside a layer-1 opening the snapshot depth already holds the rasterized
+     * portal plane depth, because the mask pass renders the clipped polygon
+     * against that attachment. Restoring it makes the later framegraph passes —
+     * batched structures, moving blocks, block entities and gizmos run after this
+     * pass — depth-test against the portal surface instead of the destination
+     * world. Without it, entry-world geometry behind the portal plane still
+     * passes the destination depth (a destination sky writes far) and is painted
+     * on top of the portal image, which reads as structures flickering through
+     * the opening. Outside the openings this only rewrites the entry-world depth
+     * the snapshot already held, so it is a no-op there.</p>
+     */
+    private void restoreOcclusionDepth(RenderTarget main) {
+        final LayerTargets targets = targetsFor(1, main.width, main.height);
+        if (targets == null || targets.snapshot == null) {
+            return;
+        }
+        try {
+            RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(
+                    targets.snapshot.getDepthTexture(), main.getDepthTexture(),
+                    0, 0, 0, 0, 0, main.width, main.height);
+        } catch (Throwable error) {
+            PortalRenderDiagnostics.failure(
+                    "Crythst portal pass could not restore the occlusion depth", error);
         }
     }
 
