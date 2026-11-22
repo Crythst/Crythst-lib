@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.structure.split;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.integration.minecraft.EditableStatefulVolume;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.math.Transform3d;
@@ -15,6 +16,7 @@ import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import io.mikaple.crythst.physics.voxel.VoxelColliderBuilder;
+import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import io.mikaple.crythst.physics.voxel.VoxelColliderOptions;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolumes;
@@ -26,6 +28,7 @@ import org.joml.Vector3d;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -252,8 +255,10 @@ public final class StructureSplitter {
     /**
      * Splits a structure into one body per disconnected solid component.
      *
-     * <p>When there is at most one component the original structure is returned
-     * unchanged. A zero-mass volume is removed entirely and an empty list is
+     * <p>A component that cannot become a physics body (no mass or no collision
+     * geometry) is folded into a neighbouring one first, see
+     * {@link #mergeUnbuildableComponents}. When there is at most one usable
+     * component the original structure is returned unchanged. A zero-mass volume is removed entirely and an empty list is
      * returned. Otherwise the new bodies are created first, their metadata is
      * copied, and only then is the original removed. If creating a split body
      * fails, the splits created so far are closed and the original is kept.</p>
@@ -291,52 +296,95 @@ public final class StructureSplitter {
         final IntBounds3 bounds = volume.bounds();
         final VoxelColliderOptions colliderOptions =
                 VoxelColliderOptions.DEFAULT.withBlockScale(original.blockScale());
-        final int componentCount = components.size();
 
-        // Build ownership for every non-air state, not just colliding cells.
-        // Repeaters, observers, torches, wire and fluids have no solid voxel of
-        // their own; dropping their ticks here made a split structure lose all
-        // pending redstone work.
-        final Map<Cell, Integer> owners = new HashMap<>();
-        final List<Map<Cell, BlockState>> componentStates = new ArrayList<>(componentCount);
-        for (int i = 0; i < componentCount; i++) {
-            componentStates.add(new HashMap<>());
-            for (Cell cell : components.get(i).cells()) {
-                owners.put(cell, i);
-            }
-        }
-        for (int i = 0; i < componentCount; i++) {
-            for (Cell cell : components.get(i).cells()) {
-                final BlockState state = stateAt(original, volume, cell);
-                if (state != null && !state.isAir()) {
-                    componentStates.get(i).put(cell, state);
+        // PhysicsStructure rejects a collider with no mass and no geometry, and a
+        // component can hit that through its own blocks (a shape hook that
+        // removes every part, a mass override of zero, a collider limit). The
+        // old code only found out when createStructure() threw, rolled the whole
+        // split back and retried it on the next tick — forever. Building the
+        // collider first makes that component merge into a neighbour that can
+        // carry it instead, so the split finishes once.
+        List<Component> splitComponents = components;
+        Map<Cell, Integer> owners = new HashMap<>();
+        List<Map<Cell, BlockState>> componentStates = new ArrayList<>();
+        List<ComponentVolume> volumes = new ArrayList<>();
+        for (int attempt = 0; ; attempt++) {
+            final int count = splitComponents.size();
+            owners = new HashMap<>();
+            componentStates = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                componentStates.add(new HashMap<>());
+                for (Cell cell : splitComponents.get(i).cells()) {
+                    owners.put(cell, i);
                 }
             }
-        }
-        for (int y = bounds.minY(); y < bounds.maxY(); y++) {
-            for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
-                for (int x = bounds.minX(); x < bounds.maxX(); x++) {
-                    if (volume.isSolid(x, y, z)) {
-                        continue;
-                    }
-                    final Cell cell = new Cell(x, y, z);
+            for (int i = 0; i < count; i++) {
+                for (Cell cell : splitComponents.get(i).cells()) {
                     final BlockState state = stateAt(original, volume, cell);
-                    if (state == null || state.isAir()) {
-                        continue;
+                    if (state != null && !state.isAir()) {
+                        componentStates.get(i).put(cell, state);
                     }
-                    final int owner = ownerOf(cell, components);
-                    owners.put(cell, owner);
-                    componentStates.get(owner).put(cell, state);
                 }
             }
-        }
+            // Build ownership for every non-air state, not just colliding
+            // cells. Repeaters, observers, torches, wire and fluids have no
+            // solid voxel of their own; dropping their ticks here made a split
+            // structure lose all pending redstone work.
+            for (int y = bounds.minY(); y < bounds.maxY(); y++) {
+                for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
+                    for (int x = bounds.minX(); x < bounds.maxX(); x++) {
+                        if (volume.isSolid(x, y, z)) {
+                            continue;
+                        }
+                        final Cell cell = new Cell(x, y, z);
+                        final BlockState state = stateAt(original, volume, cell);
+                        if (state == null || state.isAir()) {
+                            continue;
+                        }
+                        final int owner = ownerOf(cell, splitComponents);
+                        owners.put(cell, owner);
+                        componentStates.get(owner).put(cell, state);
+                    }
+                }
+            }
 
-        final List<ComponentVolume> volumes = new ArrayList<>(componentCount);
-        for (int i = 0; i < componentCount; i++) {
-            volumes.add(copyComponent(volume, bounds, components.get(i),
-                    componentStates.get(i)));
-        }
+            volumes = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                volumes.add(copyComponent(volume, bounds, splitComponents.get(i),
+                        componentStates.get(i)));
+            }
 
+            final boolean[] buildable = new boolean[count];
+            int buildableCount = 0;
+            for (int i = 0; i < count; i++) {
+                buildable[i] = isBuildable(volumes.get(i), colliderOptions);
+                if (buildable[i]) {
+                    buildableCount++;
+                }
+            }
+            if (buildableCount == count) {
+                break;
+            }
+            if (buildableCount == 0 || attempt > 0) {
+                // Nothing can carry these cells. Keeping the original body is
+                // the only option that does not lose blocks.
+                if (buildableCount == 0) {
+                    Crythst.LOGGER.debug(
+                            "No split component of body #{} can form a physics body; keeping it whole",
+                            original.body().id());
+                }
+                return List.of(original);
+            }
+            final List<Component> merged = mergeUnbuildableComponents(splitComponents, buildable);
+            if (merged.size() <= 1) {
+                return List.of(original);
+            }
+            Crythst.LOGGER.debug("Folded {} component(s) of body #{} into neighbours: "
+                            + "they cannot form a physics body on their own",
+                    count - buildableCount, original.body().id());
+            splitComponents = merged;
+        }
+        final int componentCount = splitComponents.size();
         final List<PhysicsStructure> created = new ArrayList<>(componentCount);
         try {
             // Reuse the live pose, not a stale definition pose, so blocks do not
@@ -374,8 +422,10 @@ public final class StructureSplitter {
             splitBlockTicks.add(new ListTag());
             splitFluidTicks.add(new ListTag());
         }
-        distributeTicks(originalTicks.getListOrEmpty("Block"), owners, components, splitBlockTicks);
-        distributeTicks(originalTicks.getListOrEmpty("Fluid"), owners, components, splitFluidTicks);
+        distributeTicks(originalTicks.getListOrEmpty("Block"), owners, splitComponents,
+                splitBlockTicks);
+        distributeTicks(originalTicks.getListOrEmpty("Fluid"), owners, splitComponents,
+                splitFluidTicks);
 
         final List<Map<BlockPos, CompoundTag>> splitBlockEntities = new ArrayList<>(componentCount);
         for (int i = 0; i < componentCount; i++) {
@@ -390,7 +440,7 @@ public final class StructureSplitter {
             final int absoluteZ = bounds.minZ() + pos.getZ();
             final Cell cell = new Cell(absoluteX, absoluteY, absoluteZ);
             final Integer owner = owners.containsKey(cell)
-                    ? owners.get(cell) : ownerOf(cell, components);
+                    ? owners.get(cell) : ownerOf(cell, splitComponents);
             // Split volumes deliberately keep the original bounds (see
             // copyComponent), so side-table keys stay relative to the original
             // volume minimum, not the tight component bounds.
@@ -449,6 +499,100 @@ public final class StructureSplitter {
 
         removeStructure(physics, original);
         return List.copyOf(created);
+    }
+
+    /**
+     * Folds every component that cannot become a physics body into the nearest
+     * component that can.
+     *
+     * <p>Such a component can never be created, so retrying the split would
+     * repeat the same failure every tick. Joining a neighbouring body keeps its
+     * blocks, block states and collision geometry alive instead of losing them,
+     * and adds no shape the neighbour did not already have.</p>
+     *
+     * @param components components to merge
+     * @param buildable  whether each component can form a body on its own
+     * @return the merged components in their original order
+     */
+    static List<Component> mergeUnbuildableComponents(List<Component> components,
+                                                      boolean[] buildable) {
+        final int[] target = new int[components.size()];
+        for (int i = 0; i < components.size(); i++) {
+            target[i] = buildable[i] ? i : nearestBuildableComponent(components, buildable, i);
+        }
+        final Map<Integer, List<Cell>> grouped = new LinkedHashMap<>();
+        for (int i = 0; i < components.size(); i++) {
+            grouped.computeIfAbsent(target[i], key -> new ArrayList<>())
+                    .addAll(components.get(i).cells());
+        }
+        final List<Component> merged = new ArrayList<>(grouped.size());
+        for (List<Cell> cells : grouped.values()) {
+            cells.sort(Comparator.comparingInt(Cell::y)
+                    .thenComparingInt(Cell::z)
+                    .thenComparingInt(Cell::x));
+            // The greedy boxes are diagnostics only; every consumer that needs
+            // geometry rebuilds it from the cells.
+            merged.add(new Component(boundsOf(cells), cells, List.of()));
+        }
+        return merged;
+    }
+
+    /**
+     * Whether {@link PhysicsStructure} would accept a body built from this
+     * volume: it needs mass and at least one collision shape.
+     */
+    static boolean isBuildable(VoxelVolume volume, VoxelColliderOptions options) {
+        try {
+            final VoxelColliderData collider = VoxelColliderBuilder.build(volume, options,
+                    StructureBlockHooks.colliderHooks(volume));
+            return collider.mass() > 0.0 && !collider.isEmpty();
+        } catch (RuntimeException e) {
+            // Too large for the collider limits, or a shape that cannot be
+            // built: not a body either.
+            return false;
+        }
+    }
+
+    private static int nearestBuildableComponent(List<Component> components, boolean[] buildable,
+                                                 int index) {
+        final Vector3d centre = centreOf(components.get(index).bounds());
+        int best = index;
+        double bestDistance = Double.MAX_VALUE;
+        for (int i = 0; i < components.size(); i++) {
+            if (!buildable[i]) {
+                continue;
+            }
+            final double distance = centreOf(components.get(i).bounds()).distanceSquared(centre);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static Vector3d centreOf(IntBounds3 bounds) {
+        return new Vector3d((bounds.minX() + bounds.maxX()) * 0.5,
+                (bounds.minY() + bounds.maxY()) * 0.5,
+                (bounds.minZ() + bounds.maxZ()) * 0.5);
+    }
+
+    private static IntBounds3 boundsOf(List<Cell> cells) {
+        int minX = Integer.MAX_VALUE;
+        int minY = Integer.MAX_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int maxY = Integer.MIN_VALUE;
+        int maxZ = Integer.MIN_VALUE;
+        for (Cell cell : cells) {
+            minX = Math.min(minX, cell.x());
+            minY = Math.min(minY, cell.y());
+            minZ = Math.min(minZ, cell.z());
+            maxX = Math.max(maxX, cell.x());
+            maxY = Math.max(maxY, cell.y());
+            maxZ = Math.max(maxZ, cell.z());
+        }
+        return new IntBounds3(minX, minY, minZ, maxX + 1, maxY + 1, maxZ + 1);
     }
 
     private static int enqueue(VoxelVolume volume, boolean[] visited, int[] queue, int tail,
