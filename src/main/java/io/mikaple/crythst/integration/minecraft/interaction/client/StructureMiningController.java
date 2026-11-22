@@ -59,12 +59,15 @@ public final class StructureMiningController {
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
 
     private static final MiningProgress PROGRESS = new MiningProgress();
+    /** Vanilla creative destroy delay (MultiPlayerGameMode.destroyDelay). */
+    private static final int CREATIVE_DESTROY_DELAY = 5;
 
     private static @Nullable Target currentTarget;
     private static @Nullable ItemStack currentTool;
     private static int lastTick = Integer.MIN_VALUE;
     private static boolean completed;
     private static boolean creativeStarted;
+    private static int creativeDelay;
     private static boolean stopRequested;
     private static volatile @Nullable StructureBreakProgress breakProgress;
 
@@ -112,6 +115,11 @@ public final class StructureMiningController {
             return Update.NONE;
         }
         lastTick = player.tickCount;
+        if (creativeDelay > 0) {
+            // Mirror vanilla MultiPlayerGameMode: the creative destroy delay
+            // ticks down before the next continueDestroyBlock.
+            creativeDelay--;
+        }
 
         final BlockState state = hit.blockState();
         final ItemStack tool = player.getMainHandItem();
@@ -133,16 +141,21 @@ public final class StructureMiningController {
         }
 
         final boolean creative = player.gameMode().isCreative();
-        if (targetChanged) {
-            creativeStarted = creative;
+        if (creative) {
+            if (creativeDelay > 0) {
+                // Holding attack with a fresh crosshair target waits for the
+                // vanilla creative cooldown; the current target is already
+                // stored above and will be broken when the delay reaches zero.
+                return Update.NONE;
+            }
+            creativeDelay = CREATIVE_DESTROY_DELAY;
+            creativeStarted = true;
             return Update.START;
         }
-        if (creative) {
-            if (!creativeStarted) {
-                creativeStarted = true;
-                return Update.START;
-            }
-            return Update.TICK;
+        creativeDelay = 0;
+        if (targetChanged) {
+            creativeStarted = false;
+            return Update.START;
         }
         if (creativeStarted) {
             // Creative -> survival while holding the same target: the server
@@ -228,6 +241,7 @@ public final class StructureMiningController {
         currentTool = null;
         completed = false;
         creativeStarted = false;
+        creativeDelay = 0;
         breakProgress = null;
     }
 

@@ -17,11 +17,13 @@ hand-off are described in [selection-targeting.md](selection-targeting.md).
 
 | Requirement | Implemented path |
 | --- | --- |
-| Left-click a structure block to break it | `START_MINE`/`TICK_MINE`/`STOP_MINE` drive `StructureMiningSessions`: server-owned vanilla progress completes with vanilla `destroyBlock`; creative breaks on START |
+| Left-click a structure block to break it | `START_MINE`/`TICK_MINE`/`STOP_MINE` drive `StructureMiningSessions`: server-owned vanilla progress completes with vanilla `destroyBlock`; creative breaks use the vanilla five-tick destroy cooldown |
 | Breaking applies a reaction impulse to the body | the legacy custom break fallback keeps `structure.applyImpulseAt(-look * 400 * miningImpulseScale, hitPoint)`; the redirected vanilla path does not fabricate an impulse |
 | Break progress overlay | `StructureBreakOverlay` submits the vanilla breaking model with the structure voxel's rotated/scaled pose; the server owns the actual break |
 | Right-click a structure block to place a block | `StructureOperationRedirector.useOn(...)` runs vanilla `BlockItem`/`BlockPlaceContext` in the void level; outside-volume targets fall back to `StructureInteraction.placeBlock(...)` for expansion |
-| Right-click a structure block to use it (empty hand, tool, bucket, food) | `StructureOperationRedirector.useOn(...)` runs vanilla `ServerPlayerGameMode.useItemOn` against the live auxiliary block, so menus, buttons, dispensers and `useWithoutItem` are vanilla |
+| Right-click a structure block to use it (empty hand, tool, bucket, food) | `StructureOperationRedirector.useOn(...)` runs vanilla `BlockState.useItemOn`/`useWithoutItem`/`ItemStack.useOn` with an explicit auxiliary `UseOnContext`, so menus, buttons, dispensers and item use are vanilla |
+| Shift + right-click with a non-empty hand | block use is skipped and vanilla item placement/use runs first, matching vanilla `ServerPlayerGameMode.useItemOn` |
+| Placement/use sound | projected to host coordinates **without excluding the acting player**, because the client cancels local prediction for structure clicks |
 | Right-click with a spawn egg / item frame / registered entity item | `StructureEntityPlacement.place(...)`: server re-raycast, surface-point math, vanilla entity spawn, no real support block required |
 | Middle-click a structure block to pick it | `StructureInteraction.pickBlock(...)` via the client `PICK` / `PICK_WITH_DATA` payload and vanilla `tryPickItem` |
 | Placement validation | in-volume placement uses vanilla `BlockItem.canPlace` (`canSurvive`, obstruction, replaceability); the volume-expanding fallback uses `StructurePlacementValidation` before any mutation |
@@ -53,7 +55,7 @@ The server owns mining progress; the client only sends a small protocol:
 
 | Packet | Server behaviour |
 | --- | --- |
-| `START_MINE` | Re-raycast, reach/occlusion check, map the voxel into the void level. Creative calls vanilla `destroyBlock` immediately. Survival starts a server-side session with zero progress. |
+| `START_MINE` | Re-raycast, reach/occlusion check, map the voxel into the void level. Creative queues a `destroyBlock` on the vanilla five-tick cooldown. Survival starts a server-side session with zero progress. |
 | `TICK_MINE` | Heartbeat only. It carries no progress value. The server tick advances vanilla `BlockState#getDestroyProgress` for the session. |
 | `STOP_MINE` | Abort/remove the session. A missing heartbeat for four ticks has the same effect. |
 

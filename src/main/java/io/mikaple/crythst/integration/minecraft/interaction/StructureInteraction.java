@@ -524,6 +524,10 @@ public final class StructureInteraction {
         final StructurePlacementLevel virtualLevel = new StructurePlacementLevel(
                 level, structure.pose(), blockScale, bounds,
                 (sx, sy, sz) -> stateAt(volume, structure, sx, sy, sz));
+        if (StructurePlacementValidation.worldObstructed(
+                level, structure.pose(), blockScale, x, y, z)) {
+            return PlaceResult.FAILED;
+        }
         final StructurePlacementValidation.Result validation =
                 StructurePlacementValidation.validate(
                         state, volume, virtualLevel,

@@ -72,8 +72,10 @@ read through `stateAt(x, y, z)`, so the client can read it without a lock.
 
 Lifecycle and limits:
 
-* Snapshots are rebuilt every `REBUILD_INTERVAL_TICKS = 4` server ticks
-  (200 ms at 20 TPS). New structures are snapshotted immediately.
+* Snapshots are rebuilt as soon as `PhysicsStructure#contentRevision()` changes
+  (void-tick edits and player edits reindex the structure), so block textures
+  update on the same server tick as the content. Pose-only updates do not copy
+  blocks. New structures are snapshotted immediately.
 * Body ids not seen in a tick are removed, which also handles structure removal
   and level close.
 * `SERVER_STOPPED` clears the map.
@@ -174,5 +176,6 @@ there are no `ClientPhysicsView` structures, so this path is not reached.
 * **Tint sources are not evaluated.** Untinted blocks render correctly; blocks
   that rely on biome/block tint (grass, leaves) render with the neutral tint.
 * **Large structures fall back to debug cuboids** above the snapshot caps.
-* **Snapshot latency.** Visual block edits appear within the rebuild interval
-  (up to four server ticks).
+* **Snapshot latency.** Visual block edits appear when the structure content
+  revision changes (the following server tick), not on the former four-tick
+  throttle.

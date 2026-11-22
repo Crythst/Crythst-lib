@@ -5,6 +5,7 @@ import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import net.minecraft.core.BlockPos;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.LevelReader;
 import net.minecraft.world.level.block.state.BlockState;
@@ -189,6 +190,41 @@ public final class StructurePlacementValidation {
         return context != null && context.getPlayer() != null
                 ? CollisionContext.placementContext(context.getPlayer())
                 : CollisionContext.empty();
+    }
+
+    /**
+     * Whether a real host-world block collision overlaps the world-space cell
+     * of a structure voxel. The auxiliary level only sees copied structure
+     * blocks, so without this check a structure embedded in terrain could
+     * place a block through a real wall/floor.
+     */
+    public static boolean worldObstructed(ServerLevel level, Transform3d pose,
+                                          double blockScale, int x, int y, int z) {
+        if (level == null) {
+            return false;
+        }
+        final AABB bounds = worldVoxelBounds(pose, x, y, z, blockScale).inflate(1.0e-4);
+        final BlockPos min = new BlockPos(
+                (int) Math.floor(bounds.minX + 1.0e-6),
+                (int) Math.floor(bounds.minY + 1.0e-6),
+                (int) Math.floor(bounds.minZ + 1.0e-6));
+        final BlockPos max = new BlockPos(
+                (int) Math.floor(bounds.maxX - 1.0e-6),
+                (int) Math.floor(bounds.maxY - 1.0e-6),
+                (int) Math.floor(bounds.maxZ - 1.0e-6));
+        for (BlockPos pos : BlockPos.betweenClosed(min, max)) {
+            final VoxelShape shape = level.getBlockState(pos)
+                    .getCollisionShape(level, pos, CollisionContext.empty());
+            if (shape.isEmpty()) {
+                continue;
+            }
+            for (AABB local : shape.toAabbs()) {
+                if (bounds.intersects(local.move(pos))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

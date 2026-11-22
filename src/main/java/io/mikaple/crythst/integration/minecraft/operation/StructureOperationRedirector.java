@@ -7,6 +7,8 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureInteraction;
+import io.mikaple.crythst.integration.minecraft.interaction.StructurePlacementValidation;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -175,10 +177,31 @@ public final class StructureOperationRedirector {
         if (mapped == null) {
             return Result.of(enabled() ? Status.NOT_HANDLED : Status.DISABLED);
         }
+        if (!StructureInteraction.isStructureInFrontOfRealBlocks(player, hit)) {
+            return Result.of(Status.FAILED);
+        }
         final ItemStack stack = player.getItemInHand(hand);
         if (stack.getItem() instanceof BlockItem
                 && !placementTargetInsideVolume(mapped, hit, stack)) {
             return Result.of(Status.OUT_OF_BOUNDS);
+        }
+        if (stack.getItem() instanceof BlockItem) {
+            final var bounds = mapped.structure().volume().bounds();
+            int tx = hit.adjacentX();
+            int ty = hit.adjacentY();
+            int tz = hit.adjacentZ();
+            if (!bounds.contains(tx, ty, tz)) {
+                // Replaceable clicked cell (grass/water) is the placement target.
+                tx = hit.voxelX();
+                ty = hit.voxelY();
+                tz = hit.voxelZ();
+            }
+            final ServerLevel hostLevel = (ServerLevel) player.level();
+            if (StructurePlacementValidation.worldObstructed(hostLevel,
+                    mapped.structure().pose(), mapped.structure().blockScale(),
+                    tx, ty, tz)) {
+                return Result.of(Status.FAILED);
+            }
         }
         final ServerLevel hostLevel = (ServerLevel) player.level();
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);

@@ -31,6 +31,15 @@ This document records the end-to-end tick path of the auxiliary
 4. **Persistence dropped non-solid states.** `SavedStructureVolume` previously
    stored states only for solid cells, so a restored redstone/fluid structure
    came back as stone/air. Non-solid states are now captured and restored.
+5. **`LevelTicks#tick` left due ticks queued.** Even with
+   `inBlockTickingRange=true`, `BLOCK_TICKING` status and registered
+   containers, the auxiliary level's `LevelTicks` pass did not drain scheduled
+   work. `EmptyPhysicsLevel` now drains each active chunk's
+   `LevelChunkTicks` container directly (sorted by trigger tick, capped by the
+   per-tick budget). Tick containers are registered **before**
+   `wakeCopiedRegion`, because `LevelTicks#schedule` drops requests for a chunk
+   whose container is not registered yet. Containers are unregistered when a
+   region is removed so stale ticks cannot accumulate.
 
 ## Tick phases
 
@@ -38,8 +47,9 @@ This document records the end-to-end tick path of the auxiliary
 
 1. chunk lifecycle/promotion for active regions;
 2. entity ejection (before any entity logic);
-3. scheduled block ticks (`LevelTicks<Block>`, budget 4096);
-4. scheduled fluid ticks (`LevelTicks<Fluid>`, budget 4096);
+3. scheduled block ticks (direct `LevelChunkTicks<Block>` drain per active
+   chunk, budget 4096);
+4. scheduled fluid ticks (direct `LevelChunkTicks<Fluid>` drain, budget 4096);
 5. random block/fluid ticks per active section (configured speed);
 6. queued block events (budget 4096, queue cap 8192);
 7. vanilla `tickBlockEntities()`;

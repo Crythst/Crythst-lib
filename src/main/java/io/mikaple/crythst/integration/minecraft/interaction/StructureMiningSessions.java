@@ -49,11 +49,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * redirector's immediate vanilla {@code destroyBlock} on START.</p>
  */
 public final class StructureMiningSessions {
-    /** Vanilla creative destroy cooldown between blocks. */
-    public static final int CREATIVE_BREAK_COOLDOWN_TICKS = 5;
     private static final Map<ServerPlayer, Active> ACTIVE = new WeakHashMap<>();
-    private static final Map<ServerPlayer, Long> LAST_CREATIVE_BREAK = new WeakHashMap<>();
-    private static final Map<ServerPlayer, PendingCreative> PENDING_CREATIVE = new WeakHashMap<>();
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
 
     private StructureMiningSessions() {
@@ -111,7 +107,8 @@ public final class StructureMiningSessions {
             }
             ACTIVE.remove(player);
             if (step == VoidMiningSession.Step.BREAK) {
-                return creativeBreak(player, mapped, hit, now);
+                breakImmediately(player, mapped, hit);
+                return true;
             }
             // STARTED means the target/tool changed; fall through to a fresh
             // session. ABORTED/other states also simply restart.
@@ -120,7 +117,8 @@ public final class StructureMiningSessions {
         final VoidMiningSession session = new VoidMiningSession();
         final VoidMiningSession.Step step = session.start(now, target, tool, creative);
         if (step == VoidMiningSession.Step.BREAK) {
-            return creativeBreak(player, mapped, hit, now);
+            breakImmediately(player, mapped, hit);
+            return true;
         }
         if (step != VoidMiningSession.Step.STARTED) {
             return false;
@@ -190,70 +188,13 @@ public final class StructureMiningSessions {
         if (player == null) {
             return;
         }
-        PENDING_CREATIVE.remove(player);
         final Active active = ACTIVE.remove(player);
         if (active != null) {
             active.session.stop();
         }
     }
 
-    /**
-     * Queues or performs a creative break. Vanilla creative has a five-tick
-     * destroy cooldown; without it a held attack would remove one structure
-     * voxel per tick as the crosshair advances.
-     */
-    private static boolean creativeBreak(ServerPlayer player,
-                                         @Nullable StructureOperationRedirector.Mapped mapped,
-                                         StructureBlockHitResult hit, long now) {
-        final Long last = LAST_CREATIVE_BREAK.get(player);
-        if (last != null && now - last < CREATIVE_BREAK_COOLDOWN_TICKS) {
-            PENDING_CREATIVE.put(player, new PendingCreative(
-                    hit, last + CREATIVE_BREAK_COOLDOWN_TICKS));
-            return true;
-        }
-        LAST_CREATIVE_BREAK.put(player, now);
-        PENDING_CREATIVE.remove(player);
-        breakImmediately(player, mapped, hit);
-        return true;
-    }
-
-    private static void tickPendingCreative() {
-        if (PENDING_CREATIVE.isEmpty()) {
-            return;
-        }
-        for (Map.Entry<ServerPlayer, PendingCreative> entry
-                : List.copyOf(PENDING_CREATIVE.entrySet())) {
-            final ServerPlayer player = entry.getKey();
-            final PendingCreative pending = entry.getValue();
-            if (player == null || player.hasDisconnected() || player.isRemoved()
-                    || player.isSpectator()
-                    || !(player.level() instanceof ServerLevel host)) {
-                PENDING_CREATIVE.remove(player);
-                continue;
-            }
-            final long now = host.getGameTime();
-            if (now < pending.dueTick()) {
-                continue;
-            }
-            PENDING_CREATIVE.remove(player);
-            final StructureBlockHitResult hit = pending.hit();
-            if (hit.structure() == null || hit.structure().closed()
-                    || player.getEyePosition().distanceToSqr(hit.getLocation())
-                            > player.blockInteractionRange() * player.blockInteractionRange()
-                                    + 1.0e-6
-                    || !StructureInteraction.isStructureInFrontOfRealBlocks(player, hit)) {
-                continue;
-            }
-            LAST_CREATIVE_BREAK.put(player, now);
-            breakImmediately(player, StructureOperationRedirector.map(player, hit), hit);
-        }
-    }
-
-    private record PendingCreative(StructureBlockHitResult hit, long dueTick) {
-    }
-
     private static void tickAll(MinecraftServer server) {
-        tickPendingCreative();
         if (ACTIVE.isEmpty()) {
             return;
         }
