@@ -9,6 +9,7 @@ import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
+import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.integration.minecraft.structure.StructureBlockSnapshots;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
@@ -21,6 +22,8 @@ import io.mikaple.crythst.physics.world.PhysicsWorld;
 import io.mikaple.crythst.physics.world.StepListener;
 import io.mikaple.crythst.physics.world.TerrainCollisionSnapshot;
 import io.mikaple.crythst.physics.world.WorldSettings;
+import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.TickRateManager;
 import org.joml.Vector3d;
@@ -247,18 +250,21 @@ public final class LevelPhysics implements AutoCloseable {
             // Replacing the region destroys its block entities. Preserve their
             // live NBT so a door/button state change does not empty a chest or
             // reset a furnace in the same structure.
-            final Map<net.minecraft.core.BlockPos, net.minecraft.nbt.CompoundTag> preserved =
-                    subLevel.captureBlockEntities(structure);
-            // Capture pending repeater/observer/fluid delays before the region
-            // is removed. EmptyPhysicsLevel#addStructure cannot do this itself
-            // on this path because the old region is already gone.
-            final net.minecraft.nbt.CompoundTag preservedTicks =
-                    subLevel.captureScheduledTicks(structure);
+            final EmptyPhysicsLevel.RegionView oldRegion = subLevel.regionView(structure);
+            final Map<BlockPos, CompoundTag> liveData = subLevel.captureBlockEntities(structure);
+            final CompoundTag preservedTicks = subLevel.captureScheduledTicks(structure);
             try {
                 subLevel.removeStructure(structure);
                 subLevel.addStructure(structure, volume, preservedTicks);
-                if (!preserved.isEmpty()) {
+                if (oldRegion != null) {
+                    final Map<BlockPos, CompoundTag> preserved = EmptyPhysicsLevel.rebaseBlockEntityData(
+                            liveData, oldRegion, volume.bounds());
                     subLevel.applyBlockEntities(structure, preserved);
+                    // An immediate split or save reads the side table before the next void tick.
+                    final Map<BlockPos, CompoundTag> saved = EmptyPhysicsLevel.rebaseBlockEntityData(
+                            StructureBlockEntityData.get(structure), oldRegion, volume.bounds());
+                    saved.putAll(preserved);
+                    StructureBlockEntityData.put(structure, saved);
                 }
                 refreshStructureActors(structure);
             } catch (Throwable t) {

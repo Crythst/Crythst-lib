@@ -300,7 +300,7 @@ final class SectionMesh {
      * just outside the face, not at the (usually solid) block centre. A face is
      * only re-sampled when the structure moved it into another world cell, when
      * it has no cached value yet, or on a slow 16-frame refresh. The shared
-     * {@code budget[0]} caps successful level lookups per frame.
+     * {@code budget[0]} caps light lookups per frame.
      */
     void updateFaceLights(Level level, Transform3d pose, double blockScale,
                           long frame, int[] budget) {
@@ -308,13 +308,13 @@ final class SectionMesh {
             return;
         }
         final double scale = blockScale;
-        final boolean checkPositions = (frame & LIGHT_POSITION_CHECK_MASK) == 0L;
         for (int quad = 0; quad < quadCount; quad++) {
             final long sample = faceSample[quad];
             if (sample == Long.MIN_VALUE) {
                 continue;
             }
-            if (!checkPositions && faceLight[quad] >= 0) {
+            final boolean sampled = lightKey[quad] != Long.MIN_VALUE;
+            if (sampled && !isLightPositionCheckFrame(frame, quad)) {
                 continue;
             }
             scratchLight.set(
@@ -326,8 +326,7 @@ final class SectionMesh {
                     Mth.floor(scratchLight.x),
                     Mth.floor(scratchLight.y),
                     Mth.floor(scratchLight.z));
-            if (faceLight[quad] >= 0 && lightKey[quad] == key
-                    && ((frame + quad) & LIGHT_REFRESH_MASK) != 0) {
+            if (lightKey[quad] == key && !isLightRefreshFrame(frame, quad)) {
                 continue;
             }
             if (budget[0] <= 0) {
@@ -338,16 +337,19 @@ final class SectionMesh {
             }
             budget[0]--;
             scratchLightPos.set(key);
-            if (!level.isLoaded(scratchLightPos)) {
-                continue;
-            }
-            try {
-                faceLight[quad] = LightCoordsUtil.getLightCoords(level, scratchLightPos);
-                lightKey[quad] = key;
-            } catch (RuntimeException ignored) {
-                // A broken light lookup keeps the section fallback.
-            }
+            faceLight[quad] = BatchedStructureRenderer.sampleWorldLight(level, scratchLightPos);
+            lightKey[quad] = key;
         }
+    }
+
+    static boolean isLightPositionCheckFrame(long frame, int quad) {
+        // Use the same per-quad phase for both intervals so every scheduled
+        // light refresh also gets a position check.
+        return ((frame + quad) & LIGHT_POSITION_CHECK_MASK) == 0L;
+    }
+
+    static boolean isLightRefreshFrame(long frame, int quad) {
+        return ((frame + quad) & LIGHT_REFRESH_MASK) == 0L;
     }
 
     SubmitNodeCollector.CustomGeometryRenderer renderer() {

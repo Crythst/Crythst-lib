@@ -33,9 +33,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * hand, tools, buckets, food and other items use {@code USE}, which runs the
  * live vanilla block-use path on the server. Vanilla never sends a use-on-block
  * packet and never runs {@code BlockItem.place}, {@code SpawnEggItem.useOn} or
- * a hanging-entity placement for this click. Returning {@code CONSUME} rather
- * than {@code SUCCESS} avoids a second arm swing because
- * {@link ClientStructureInteraction} already swings.</p>
+ * a hanging-entity placement for this click. {@code CONSUME} suppresses the
+ * predicted swing so the server can animate a successful interaction.</p>
  */
 @Mixin(MultiPlayerGameMode.class)
 public abstract class StructurePlacementMixin {

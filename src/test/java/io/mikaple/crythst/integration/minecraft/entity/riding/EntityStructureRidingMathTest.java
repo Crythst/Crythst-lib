@@ -122,6 +122,21 @@ class EntityStructureRidingMathTest {
     }
 
     @Test
+    void attachmentAcceptsAnInclineButRejectsANearlyVerticalLocalTop() {
+        final var boxes = List.of(box(0, 0, 0, 2, 1, 2));
+        final Vector3d localTop = new Vector3d(1.0, 1.0, 1.0);
+        final Transform3d incline = Transform3d.of(new Vector3d(),
+                new Quaterniond().rotateZ(Math.toRadians(30.0)));
+        final Transform3d wall = Transform3d.of(new Vector3d(),
+                new Quaterniond().rotateZ(Math.toRadians(85.0)));
+
+        assertNotNull(EntityStructureRidingMath.findSupport(incline, boxes, 1.0,
+                incline.transformPoint(localTop), TOLERANCE, 64));
+        assertNull(EntityStructureRidingMath.findSupport(wall, boxes, 1.0,
+                wall.transformPoint(localTop), TOLERANCE, 64));
+    }
+
+    @Test
     void supportRejectsTallSideAndDistantBox() {
         assertNull(EntityStructureRidingMath.findSupport(
                 Transform3d.identity(),

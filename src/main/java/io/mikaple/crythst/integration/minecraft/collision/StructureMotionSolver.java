@@ -46,8 +46,6 @@ public final class StructureMotionSolver {
     public static final int MAX_SUBSTEPS = 10;
     /** Players use a fixed substep count for client/server parity. */
     public static final int PLAYER_SUBSTEPS = 8;
-    /** A contact normal above this is a floor/support normal. */
-    private static final double VERTICAL_DOT = 0.55;
     /** At most this many contact normals are kept for velocity projection. */
     private static final int MAX_CONTACTS = 16;
 
@@ -99,7 +97,9 @@ public final class StructureMotionSolver {
         }
 
         public boolean touched() {
-            return !contacts.isEmpty();
+            // A successful step already changed the movement and may finish
+            // without any penetration contacts at the lifted position.
+            return stepped || !contacts.isEmpty();
         }
 
         public String bodyIds() {
@@ -172,15 +172,15 @@ public final class StructureMotionSolver {
         // explicitly below with the entity's vanilla step height.
         final double supportLimit = Math.min(0.2,
                 0.02 + Math.abs(input.verticalSpeed()) / substeps);
+        final boolean rising = motion.y > CONTACT_SLOP;
         final EntityStructureSolver.Policy policy = new EntityStructureSolver.Policy(
                 0.0,
                 MAX_BOXES_PER_STRUCTURE,
                 CONTACT_SLOP,
-                input.onGround() || input.verticalSpeed() <= 0.0,
+                !rising && (input.onGround() || input.verticalSpeed() <= 0.0),
                 supportLimit
         );
 
-        final Vector3d allowed = new Vector3d();
         final Vector3d correction = new Vector3d();
         final List<Contact> contacts = new ArrayList<>(4);
         Aabb candidate = input.box();
@@ -194,45 +194,62 @@ public final class StructureMotionSolver {
         for (int substep = 0; substep < substeps; substep++) {
             final Vector3d previousCenter = candidate.center();
             candidate = candidate.offset(step);
-            allowed.add(step);
 
             for (StructureCollisionBox structure : candidates) {
                 for (int pass = 0; pass < MAX_PASSES; pass++) {
-                    final EntityStructureSolver.Hit hit = EntityStructureSolver.resolve(
+                    final EntityStructureSolver.Hit hit = EntityStructureSolver.resolveMovement(
                             candidate, previousCenter, structure.pose(), structure.boxes(),
                             structure.parts(), structure.blockScale(), policy);
                     if (hit == null || hit.penetration() <= CONTACT_SLOP) {
                         break;
                     }
 
-                    final boolean floor = hit.normal().y > VERTICAL_DOT;
-                    final boolean ceiling = hit.normal().y < -VERTICAL_DOT;
-                    if (!floor && !ceiling && !stepped
+                    final Vector3d normal = hit.normal();
+                    final boolean floor = normal.y > EntityStructureSolver.MIN_SUPPORT_NORMAL_Y;
+                    final boolean ceiling = normal.y < -EntityStructureSolver.MIN_SUPPORT_NORMAL_Y;
+                    if (!floor && !ceiling && !stepped && !rising
                             && input.onGround() && input.stepHeight() > 0.01) {
                         final Aabb lifted = candidate.offset(
                                 new Vector3d(0.0, input.stepHeight(), 0.0));
-                        final EntityStructureSolver.Hit liftHit = EntityStructureSolver.resolve(
+                        final EntityStructureSolver.Hit liftHit = EntityStructureSolver.resolveMovement(
                                 lifted, candidate.center(), structure.pose(), structure.boxes(),
                                 structure.parts(), structure.blockScale(), policy);
                         if (liftHit == null || liftHit.penetration() <= CONTACT_SLOP) {
-                            // Step onto the obstacle instead of stopping at its side.
-                            candidate = lifted;
-                            allowed.y += input.stepHeight();
-                            stepped = true;
-                            support = true;
-                            below = true;
-                            vertical = true;
-                            break;
+                            // A lift can also clear the side of a leaning wall.
+                            // Check for a landing under the lifted footprint.
+                            final EntityStructureSolver.Policy stepPolicy = new EntityStructureSolver.Policy(
+                                    0.0, MAX_BOXES_PER_STRUCTURE, CONTACT_SLOP, true, input.stepHeight());
+                            final EntityStructureSolver.Hit landing = EntityStructureSolver.resolveMovement(
+                                    candidate, lifted.center(), structure.pose(), structure.boxes(),
+                                    structure.parts(), structure.blockScale(), stepPolicy);
+                            if (landing != null && landing.normal().y > EntityStructureSolver.MIN_SUPPORT_NORMAL_Y) {
+                                candidate = lifted;
+                                stepped = true;
+                                support = true;
+                                below = true;
+                                vertical = true;
+                                break;
+                            }
                         }
                     }
 
-                    candidate = candidate.offset(hit.offset());
-                    allowed.add(hit.offset());
-                    correction.add(hit.offset());
+                    final Vector3d offset;
+                    if (floor || ceiling) {
+                        offset = hit.offset();
+                    } else {
+                        // Separate along the horizontal projection of the normal.
+                        // Scale the push so it still clears the original plane.
+                        normal.y = 0.0;
+                        final double horizontalLength = normal.length();
+                        normal.div(horizontalLength);
+                        offset = new Vector3d(normal).mul(hit.penetration() / horizontalLength);
+                    }
+                    candidate = candidate.offset(offset);
+                    correction.add(offset);
                     deepest = Math.max(deepest, hit.penetration());
-                    addContact(contacts, structure.bodyId(), hit.normal(), hit.penetration());
+                    addContact(contacts, structure.bodyId(), normal, hit.penetration());
 
-                    vertical = true;
+                    vertical |= floor || ceiling;
                     if (floor) {
                         support = true;
                         below = true;
@@ -249,11 +266,16 @@ public final class StructureMotionSolver {
             // A stale client pose (or a structure that teleported) must not
             // fling the entity. Keep the step-up part intact, which is a
             // deliberate movement rather than a de-penetration offset.
-            final Vector3d clamped = new Vector3d(correction)
-                    .mul(maxCorrection / correctionLength);
-            allowed.sub(correction).add(clamped);
+            correction.mul(maxCorrection / correctionLength);
         }
 
+        // Entity.move compares the requested and returned Y exactly. Start
+        // from the original motion so a wall cannot create a vertical clip
+        // through substep rounding.
+        final Vector3d allowed = motion.add(correction);
+        if (stepped) {
+            allowed.y += input.stepHeight();
+        }
         return new Result(allowed, contacts, horizontal, vertical, below, support,
                 substeps, deepest, stepped);
     }

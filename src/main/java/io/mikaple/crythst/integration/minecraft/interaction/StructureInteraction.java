@@ -972,8 +972,14 @@ public final class StructureInteraction {
                 StructureMiningSessions.stop(player);
                 yield true;
             }
-            case PLACE -> placeFromAction(player);
-            case USE -> useFromAction(player);
+            case PLACE, USE -> {
+                final InteractionResult use = action == StructureAction.PLACE
+                        ? placeFromAction(player) : useFromAction(player);
+                if (shouldSwingForUse(use)) {
+                    player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
+                }
+                yield use.consumesAction();
+            }
             case PICK, PICK_WITH_DATA -> {
                 final StructureBlockHitResult hit = raycast(player);
                 yield hit != null && isStructureInFrontOfRealBlocks(player, hit)
@@ -982,18 +988,14 @@ public final class StructureInteraction {
             }
             case SHOVEL_WATER -> shovelWater(player);
         };
-        // The client no longer swings before the server validates a structure
-        // action. Let the authoritative success drive the swing, so a rejected
-        // placement/use does not animate. Shovel water and pick-block handle
-        // their own animation semantics.
-        if (result && action != StructureAction.SHOVEL_WATER
-                && action != StructureAction.PICK
-                && action != StructureAction.PICK_WITH_DATA
-                && action != StructureAction.TICK_MINE
-                && action != StructureAction.STOP_MINE) {
+        if (result && (action == StructureAction.MINE || action == StructureAction.START_MINE)) {
             player.swing(InteractionHand.MAIN_HAND, SwingAnimation.DEFAULT, true);
         }
         return result;
+    }
+
+    static boolean shouldSwingForUse(InteractionResult result) {
+        return result instanceof InteractionResult.Success success && success.shouldSwing();
     }
 
     /**
@@ -1039,53 +1041,47 @@ public final class StructureInteraction {
     }
 
     /**
-     * Right-click placement action. Block items route through vanilla
-     * {@code ServerPlayerGameMode.useItemOn} in the void level; a target outside
-     * the copied volume falls back to the expanding custom placement. Entity
-     * items keep their structure-surface handler because a vanilla aux spawn
-     * would sit inside the copied block cell.
+     * Right-click with a placement item. The void-level block can consume the
+     * click first. Entity placement and placement outside the copied volume
+     * then use the custom paths.
      */
-    private static boolean placeFromAction(ServerPlayer player) {
+    private static InteractionResult placeFromAction(ServerPlayer player) {
         final ItemStack stack = player.getMainHandItem();
         if (!StructureItemUse.shouldHandleStructureUse(stack)) {
-            return false;
+            return InteractionResult.PASS;
         }
         final StructureBlockHitResult hit = raycast(player);
         if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
-            return false;
+            return InteractionResult.PASS;
         }
-        if (stack.getItem() instanceof BlockItem
-                && StructureOperationRedirector.enabled()) {
+        if (StructureOperationRedirector.enabled()) {
             if (!beginInteraction(player)) {
-                return true;
+                return InteractionResult.CONSUME;
             }
             final StructureOperationRedirector.Result result =
                     StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
-            if (result.handled() || result.status() == StructureOperationRedirector.Status.FAILED) {
-                return true;
-            }
             if (!StructureOperationRedirector.shouldFallback(result.status())) {
-                return true;
+                return result.handled() ? result.interaction() : InteractionResult.FAIL;
             }
             // OUT_OF_BOUNDS and unavailable-region statuses fall through to
             // the custom path below.
         }
         if (!beginPlacement(player)) {
-            return true;
+            return InteractionResult.CONSUME;
         }
         if (stack.getItem() instanceof BlockItem) {
             final PlaceResult result = placeBlock(player, hit, stack);
             if (result.success()) {
                 stack.consume(1, player);
             }
-            return result.success();
+            return result.success() ? InteractionResult.SUCCESS_SERVER : InteractionResult.FAIL;
         }
         final StructureEntityPlacementHandler.Result result =
                 StructureEntityPlacement.place(player, stack, hit, InteractionHand.MAIN_HAND);
         if (result.success()) {
             stack.consume(1, player);
         }
-        return result.success();
+        return result.success() ? InteractionResult.SUCCESS_SERVER : InteractionResult.FAIL;
     }
 
     /**
@@ -1094,25 +1090,22 @@ public final class StructureInteraction {
      * interaction is only a fallback when the redirector is disabled or the
      * auxiliary block/region is unavailable.
      */
-    private static boolean useFromAction(ServerPlayer player) {
+    private static InteractionResult useFromAction(ServerPlayer player) {
         final StructureBlockHitResult hit = raycast(player);
         if (hit == null || !isStructureInFrontOfRealBlocks(player, hit)) {
-            return false;
+            return InteractionResult.PASS;
         }
         if (StructureOperationRedirector.enabled()) {
             if (!beginInteraction(player)) {
-                return true;
+                return InteractionResult.CONSUME;
             }
             final StructureOperationRedirector.Result result =
                     StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
-            if (result.handled() || result.status() == StructureOperationRedirector.Status.FAILED) {
-                return true;
-            }
             if (!StructureOperationRedirector.shouldFallback(result.status())) {
-                return true;
+                return result.handled() ? result.interaction() : InteractionResult.FAIL;
             }
         }
-        return interactBlock(player, hit).consumesAction();
+        return interactBlock(player, hit);
     }
 
     /**

@@ -91,21 +91,24 @@ public final class EntityStructureCollision {
             return vanilla.collide(toVec(wanted));
         }
 
-        Vec3 allowed = vanilla.collide(toVec(structures.motion()));
+        final Vec3 structureMotion = toVec(structures.motion());
+        Vec3 allowed = vanilla.collide(structureMotion);
         final List<StructureMotionSolver.Contact> contacts =
                 new ArrayList<>(structures.contacts());
 
         // Vanilla may have clipped the structure-clear motion (a world wall
         // next to a structure). Resolve only a shallow residual so a corner
         // cannot become a teleport.
-        final Aabb moved = box.offset(new Vector3d(allowed.x, allowed.y, allowed.z));
-        final StructureMotionSolver.Result residual = StructureMotionSolver.resolvePenetration(
-                moved, entity.onGround(), entity.getDeltaMovement().y, source);
-        if (residual.touched()) {
+        boolean appliedResidual = false;
+        if (!allowed.equals(structureMotion)) {
+            final Aabb moved = box.offset(new Vector3d(allowed.x, allowed.y, allowed.z));
+            final StructureMotionSolver.Result residual = StructureMotionSolver.resolvePenetration(
+                    moved, entity.onGround(), entity.getDeltaMovement().y, source);
             final Vector3d correction = residual.motion();
-            if (correction.length() <= MAX_RESIDUAL_CORRECTION) {
+            if (residual.touched() && correction.length() <= MAX_RESIDUAL_CORRECTION) {
                 allowed = allowed.add(correction.x, correction.y, correction.z);
                 contacts.addAll(residual.contacts());
+                appliedResidual = true;
             }
         }
 
@@ -120,7 +123,7 @@ public final class EntityStructureCollision {
         }
 
         StructureCollisionTrace.record(source.side(), entity.getType().toString(),
-                structures, motion, allowed, residual.touched() ? "residual" : "");
+                structures, motion, allowed, appliedResidual ? "residual" : "");
         return allowed;
     }
 

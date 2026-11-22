@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,6 +23,24 @@ class SectionMeshCullingTest {
     static void bootstrapMinecraftRegistries() {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+    }
+
+    @Test
+    void everyCachedQuadCanRefreshEvenWithoutMoving() {
+        for (int quad = 0; quad < 32; quad++) {
+            int positionChecks = 0;
+            int refreshes = 0;
+            for (long frame = 0; frame < 16; frame++) {
+                if (SectionMesh.isLightPositionCheckFrame(frame, quad)) {
+                    positionChecks++;
+                    if (SectionMesh.isLightRefreshFrame(frame, quad)) {
+                        refreshes++;
+                    }
+                }
+            }
+            assertEquals(4, positionChecks, "position checks for quad " + quad);
+            assertEquals(1, refreshes, "light refreshes for quad " + quad);
+        }
     }
 
     @Test

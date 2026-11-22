@@ -1,5 +1,6 @@
 package io.mikaple.crythst.integration.minecraft.entity.riding;
 
+import io.mikaple.crythst.integration.minecraft.entity.EntityStructureSolver;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import io.mikaple.crythst.physics.voxel.VoxelCellPart;
@@ -160,6 +161,10 @@ public final class EntityStructureRidingMath {
         final boolean hasBoxes = boxes != null && !boxes.isEmpty();
         final boolean hasParts = parts != null && !parts.isEmpty();
         if (!hasBoxes && !hasParts) {
+            return null;
+        }
+        final Vector3d topNormal = pose.transformDirection(new Vector3d(0.0, 1.0, 0.0));
+        if (topNormal.y <= EntityStructureSolver.MIN_SUPPORT_NORMAL_Y) {
             return null;
         }
         final double safeHalfX = Math.max(0.0, halfX);

@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.physics.voxel.IntBounds3;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -98,6 +100,23 @@ class VoidWorldLogicTest {
         assertNull(view.toLocalVoxel(new BlockPos(103, 0, 200)), "after region X");
         assertNull(view.toLocalVoxel(new BlockPos(100, 4, 200)), "above region Y");
         assertNull(view.toLocalVoxel(new BlockPos(100, 0, 205)), "after region Z");
+    }
+
+    @Test
+    void blockEntityDataKeepsItsVoxelWhenRegionBoundsChange() {
+        final EmptyPhysicsLevel.RegionView oldRegion = new EmptyPhysicsLevel.RegionView(
+                17L, 100, 0, 200, 0, 2, -3, 3, 4, 5);
+        final IntBounds3 newBounds = new IntBounds3(-1, 0, -4, 2, 6, 2);
+        final CompoundTag chest = new CompoundTag();
+        chest.putString("id", "minecraft:chest");
+        final CompoundTag removedFurnace = new CompoundTag();
+        removedFurnace.putString("id", "minecraft:furnace");
+
+        final Map<BlockPos, CompoundTag> rebased = EmptyPhysicsLevel.rebaseBlockEntityData(
+                Map.of(new BlockPos(0, 1, 2), chest, new BlockPos(2, 1, 2), removedFurnace),
+                oldRegion, newBounds);
+
+        assertEquals(Map.of(new BlockPos(1, 3, 3), chest), rebased);
     }
 
     @Test
