@@ -24,6 +24,7 @@ import net.minecraft.client.CloudStatus;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
+import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.ProjectionMatrixBuffer;
 import net.minecraft.client.renderer.SkyRenderer;
@@ -78,6 +79,8 @@ final class PortalRenderPass {
     private FogRenderer fogRenderer;
     private GlobalSettingsUniform globalSettings;
     private ProjectionMatrixBuffer projectionBuffer;
+    /** Dedicated dispatcher: the main frame's PreparedFrame is already in use. */
+    private FeatureRenderDispatcher featureDispatcher;
     private GpuBuffer maskBuffer;
     private int maskBufferBytes;
     private final List<LayerTargets> layerTargets = new ArrayList<>();
@@ -269,8 +272,7 @@ final class PortalRenderPass {
             final SubmitNodeStorage submits = new SubmitNodeStorage();
             submits.setUseImprovedTransparency(false);
             submitFeatures(minecraft, levelRenderer, state, submits);
-            featureFrame = minecraft.gameRenderer.featureRenderDispatcher()
-                    .prepareFrame(submits);
+            featureFrame = featureDispatcher.prepareFrame(submits);
 
             final net.minecraft.client.renderer.CloudRenderer cloudRenderer =
                     levelRenderer.cloudRenderer();
