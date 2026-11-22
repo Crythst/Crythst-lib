@@ -494,10 +494,13 @@ public final class EntityStructureSolver {
         // still inside this box's slab. Once the centre is clearly outside the
         // box the current side is unambiguous, and a stale/interpolated hint
         // must not push the entity back into the surface.
-        if (previousDelta != null && Math.abs(distance) <= boxProjection) {
+        if (previousDelta != null && Math.abs(distance) < boxProjection - 1.0e-4) {
             final double previousDistance = previousDelta.x * axisX
                     + previousDelta.y * axisY + previousDelta.z * axisZ;
-            if (Math.abs(previousDistance) > EPSILON) {
+            // Near a face plane the previous side is numerically ambiguous.
+            // Falling back to the current centre prevents float noise from
+            // pushing an entity deeper into a wall.
+            if (Math.abs(previousDistance) > 1.0e-4) {
                 sign = previousDistance >= 0.0 ? 1.0 : -1.0;
             }
         }

@@ -418,6 +418,10 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return;
         }
         final long regionKey = structure.body().id();
+        // A refresh replaces the whole region. Preserve pending repeater /
+        // observer / fluid delays instead of silently dropping them.
+        final CompoundTag previousTicks = regions.containsKey(regionKey)
+                ? captureScheduledTicks(structure) : null;
         if (regions.containsKey(regionKey)) {
             removeStructure(structure);
         }
@@ -492,6 +496,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         // repeaters/torches/fluids, neighbour updates seed redstone and shape
         // updates, and fluid ticks make copied water/lava actually flow.
         wakeCopiedRegion(region);
+        if (previousTicks != null && !previousTicks.isEmpty()) {
+            applyScheduledTicks(structure, previousTicks);
+        }
     }
 
     /**
@@ -890,6 +897,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return root;
         }
         final long now = level.getGameTime();
+        final IntBounds3 bounds = structure.volume().bounds();
         final ListTag blocks = new ListTag();
         final ListTag fluids = new ListTag();
         for (long chunkKey : region.chunks) {
@@ -901,14 +909,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
-                ticks.getAll().forEach(tick -> addSavedTick(blocks, region, now,
+                ticks.getAll().forEach(tick -> addSavedTick(blocks, region, bounds, now,
                         tick.pos(), BuiltInRegistries.BLOCK.getKey(tick.type()).toString(),
                         tick.triggerTick(), tick.priority(), tick.subTickOrder()));
             }
             if (chunk.getFluidTicks() instanceof LevelChunkTicks<?> rawFluids) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawFluids;
-                ticks.getAll().forEach(tick -> addSavedTick(fluids, region, now,
+                ticks.getAll().forEach(tick -> addSavedTick(fluids, region, bounds, now,
                         tick.pos(), BuiltInRegistries.FLUID.getKey(tick.type()).toString(),
                         tick.triggerTick(), tick.priority(), tick.subTickOrder()));
             }
@@ -922,8 +930,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         return root;
     }
 
-    private static void addSavedTick(ListTag list, Region region, long now,
-                                     BlockPos pos, String type, long triggerTick,
+    private static void addSavedTick(ListTag list, Region region, IntBounds3 bounds,
+                                     long now, BlockPos pos, String type, long triggerTick,
                                      TickPriority priority, long subTickOrder) {
         final int localX = pos.getX() - region.baseX;
         final int localY = pos.getY() - region.baseY;
@@ -934,9 +942,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return;
         }
         final CompoundTag entry = new CompoundTag();
-        entry.putInt("X", localX);
-        entry.putInt("Y", localY);
-        entry.putInt("Z", localZ);
+        // Store absolute structure-local voxels so the tick survives a refresh
+        // whose region/bounds origin changed.
+        entry.putInt("X", bounds.minX() + localX);
+        entry.putInt("Y", bounds.minY() + localY);
+        entry.putInt("Z", bounds.minZ() + localZ);
         entry.putString("Type", type);
         entry.putLong("Delay", Math.max(0L, triggerTick - now));
         entry.putInt("Priority", priority.getValue());
@@ -959,9 +969,10 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return;
         }
         final long now = level.getGameTime();
+        final IntBounds3 bounds = structure.volume().bounds();
         clearRegionTicks(region);
-        restoreTickList(root.getListOrEmpty("Block"), true, region, now);
-        restoreTickList(root.getListOrEmpty("Fluid"), false, region, now);
+        restoreTickList(root.getListOrEmpty("Block"), true, region, bounds, now);
+        restoreTickList(root.getListOrEmpty("Fluid"), false, region, bounds, now);
     }
 
     private void clearRegionTicks(Region region) {
@@ -992,7 +1003,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 && x < region.sizeX && y < region.sizeY && z < region.sizeZ;
     }
 
-    private void restoreTickList(ListTag list, boolean blockTicks, Region region, long now) {
+    private void restoreTickList(ListTag list, boolean blockTicks, Region region,
+                                 IntBounds3 bounds, long now) {
         for (int i = 0; i < list.size(); i++) {
             final CompoundTag entry = list.getCompoundOrEmpty(i);
             if (entry.isEmpty()) {
@@ -1003,9 +1015,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 continue;
             }
             final BlockPos pos = new BlockPos(
-                    region.baseX + entry.getIntOr("X", 0),
-                    region.baseY + entry.getIntOr("Y", 0),
-                    region.baseZ + entry.getIntOr("Z", 0));
+                    region.baseX + entry.getIntOr("X", 0) - bounds.minX(),
+                    region.baseY + entry.getIntOr("Y", 0) - bounds.minY(),
+                    region.baseZ + entry.getIntOr("Z", 0) - bounds.minZ());
             ensureChunk(pos);
             final long delay = Math.max(0L, entry.getLongOr("Delay", 0L));
             final TickPriority priority = TickPriority.byValue(

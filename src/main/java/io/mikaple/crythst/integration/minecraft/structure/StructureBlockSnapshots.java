@@ -6,12 +6,15 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
+import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtOps;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.resources.ResourceKey;
@@ -256,6 +259,12 @@ public final class StructureBlockSnapshots {
         final BlockState[] blocks = new BlockState[(int) cells];
         Arrays.fill(blocks, AIR);
 
+        // moving_piston is rendered by its block entity, not by a block model.
+        // Use the moved state so pistons remain visible in the batched
+        // renderer (the animation itself is not interpolated here).
+        final Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities =
+                StructureBlockEntityData.get(structure);
+
         int nonAir = 0;
 
         for (int y = bounds.minY(); y < bounds.maxY(); y++) {
@@ -276,10 +285,21 @@ public final class StructureBlockSnapshots {
                     if (state == null || state.isAir()) {
                         state = STONE;
                     }
-
                     final int localX = x - bounds.minX();
                     final int localY = y - bounds.minY();
                     final int localZ = z - bounds.minZ();
+                    if (state.is(Blocks.MOVING_PISTON)) {
+                        final CompoundTag data = blockEntities.get(
+                                new net.minecraft.core.BlockPos(localX, localY, localZ));
+                        if (data != null && data.contains("blockState")) {
+                            final BlockState moved = BlockState.CODEC
+                                    .parse(NbtOps.INSTANCE, data.get("blockState"))
+                                    .result().orElse(null);
+                            if (moved != null && !moved.isAir()) {
+                                state = moved;
+                            }
+                        }
+                    }
                     blocks[(localY * sizeZ + localZ) * sizeX + localX] = state;
                     nonAir++;
                 }
