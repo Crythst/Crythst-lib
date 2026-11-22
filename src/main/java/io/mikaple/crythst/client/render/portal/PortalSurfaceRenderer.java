@@ -72,24 +72,34 @@ final class PortalSurfaceRenderer {
                 }
             }
             final List<Vector3d> outline = snapshot.shape().worldOutline();
+            // Level custom geometry is camera-relative. Passing absolute world
+            // coordinates made the debug outline fly far away from the portal.
+            final double camX = camera.pos.x;
+            final double camY = camera.pos.y;
+            final double camZ = camera.pos.z;
             collector.submitCustomGeometry(new PoseStack(), RenderTypes.lines(),
-                    (pose, consumer) -> emitOutline(outline, pose, consumer));
+                    (pose, consumer) -> emitOutline(outline, pose, consumer,
+                            camX, camY, camZ));
         }
     }
 
     private static void emitOutline(List<Vector3d> outline, PoseStack.Pose pose,
-                                    VertexConsumer consumer) {
+                                    VertexConsumer consumer,
+                                    double camX, double camY, double camZ) {
         for (int i = 0; i < outline.size(); i++) {
             final Vector3d a = outline.get(i);
             final Vector3d b = outline.get((i + 1) % outline.size());
-            addVertex(consumer, pose, a);
-            addVertex(consumer, pose, b);
+            addVertex(consumer, pose, a, camX, camY, camZ);
+            addVertex(consumer, pose, b, camX, camY, camZ);
         }
     }
 
     private static void addVertex(VertexConsumer consumer, PoseStack.Pose pose,
-                                  Vector3d point) {
-        consumer.addVertex(pose, (float) point.x, (float) point.y, (float) point.z)
+                                  Vector3d point, double camX, double camY, double camZ) {
+        consumer.addVertex(pose,
+                        (float) (point.x - camX),
+                        (float) (point.y - camY),
+                        (float) (point.z - camZ))
                 .setColor(0.2f, 1.0f, 0.9f, 1.0f)
                 .setNormal(0.0f, 1.0f, 0.0f)
                 .setLineWidth(2.0f);
