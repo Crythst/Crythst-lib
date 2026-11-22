@@ -30,7 +30,9 @@ import org.joml.Vector3d;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -57,6 +59,16 @@ public final class PortalRenderManager {
     private final PortalRenderPass pass = new PortalRenderPass();
     /** Lazily created on the render thread; dedicated per-frame section storage. */
     private PortalChunkSections chunkSections;
+    /**
+     * Last destination extraction that was ready, per portal.
+     *
+     * <p>A portal whose destination sections have not finished compiling used
+     * to be dropped for that frame, which showed the entry world through the
+     * opening for a frame and read as the image blinking on and off. Reusing the
+     * last ready extraction keeps the destination image on screen while the
+     * section meshes catch up.</p>
+     */
+    private final Map<UUID, CachedDestination> lastReady = new HashMap<>();
 
     private volatile boolean registered;
     private volatile boolean destinationExtracting;
@@ -68,6 +80,10 @@ public final class PortalRenderManager {
     private volatile double lastPassMillis;
     private long lastExtractStartNanos;
     private static volatile PortalRenderStats stats = PortalRenderStats.EMPTY;
+
+    /** A destination extraction held over from an earlier frame. */
+    private record CachedDestination(PortalVisibility.Result result, long nanos) {
+    }
 
     private PortalRenderManager() {
     }
@@ -239,9 +255,16 @@ public final class PortalRenderManager {
             final PortalViewCamera view = cameraResult.camera();
             final PortalVisibility.Result extractedState = visibility.extract(
                     minecraft, camera, deltaTracker, partialTick, levelRenderer, view, level);
-            if (!extractedState.ready()) {
-                PortalRenderDiagnostics.skipped(portal, extractedState.failureReason());
-                continue;
+            final PortalVisibility.Result destination;
+            if (extractedState.ready()) {
+                destination = extractedState;
+                lastReady.put(portal.id(),
+                        new CachedDestination(extractedState, lastExtractStartNanos));
+            } else {
+                destination = reusable(portal, extractedState.failureReason());
+                if (destination == null) {
+                    continue;
+                }
             }
 
             final PortalMaskGeometry.Mask mask = PortalMaskGeometry.build(
@@ -253,13 +276,13 @@ public final class PortalRenderManager {
             }
             final ChunkSectionsToRender chunkRender = chunkSections.prepare(
                     levelRenderer.sectionRenderDispatcher(), view.viewRotation(),
-                    extractedState.sections(), atlasWidth, atlasHeight, options);
-            extracted.add(new PortalRenderData(portal, view, extractedState.state(), extractedState.hitboxes(),
-                    extractedState.sections(), new Matrix4f(view.mainViewProjection()),
+                    destination.sections(), atlasWidth, atlasHeight, options);
+            extracted.add(new PortalRenderData(portal, view, destination.state(), destination.hitboxes(),
+                    destination.sections(), new Matrix4f(view.mainViewProjection()),
                     mainCamera.pos, mask, chunkRender, 1, 0,
-                    extractedState.sectionCount()));
+                    destination.sectionCount()));
             rendered.add(portal.id());
-            sectionCount += extractedState.sectionCount();
+            sectionCount += destination.sectionCount();
             rootsRendered++;
 
             if (PortalCaptureSettings.MAX_RECURSION <= 1) {
@@ -267,7 +290,7 @@ public final class PortalRenderManager {
             }
             final PortalRenderData child = extractChild(
                     minecraft, camera, deltaTracker, partialTick, level, levelRenderer,
-                    gameRenderer, portal, view, extractedState, rendered, width, height,
+                    gameRenderer, portal, view, destination, rendered, width, height,
                     atlasWidth, atlasHeight, options);
             if (child != null) {
                 extracted.add(child);
@@ -282,6 +305,7 @@ public final class PortalRenderManager {
             RenderSystem.resizeAllAutoStorageIndexBuffers();
         }
         layers = List.copyOf(extracted);
+        pruneReady();
         lastVisiblePortals = rootsRendered;
         lastSectionCount = sectionCount;
         int maxLayer = 0;
@@ -307,6 +331,43 @@ public final class PortalRenderManager {
         lastExtractMillis = (now - lastExtractStartNanos) / 1.0e6;
         stats = new PortalRenderStats(portals, maxLayer, sections,
                 lastExtractMillis, lastPassMillis, now);
+    }
+
+    /**
+     * Returns the last ready destination extraction for a portal when this
+     * frame's extraction failed but the previous one is still fresh enough.
+     *
+     * <p>Section meshes compile asynchronously, so a portal that just came into
+     * view fails extraction for the first frame or two. Dropping the opening for
+     * those frames is what made the destination image blink: the same pixels
+     * showed the entry world instead. Reusing the previous extraction keeps the
+     * image on screen while the meshes catch up; after
+     * {@link PortalCaptureSettings#MAX_INTERVAL_NANOS} the entry is dropped so a
+     * portal that really lost its destination stops being drawn.</p>
+     */
+    private PortalVisibility.Result reusable(PortalSnapshot portal, String reason) {
+        final CachedDestination cached = lastReady.get(portal.id());
+        if (cached == null) {
+            PortalRenderDiagnostics.skipped(portal, reason);
+            return null;
+        }
+        final long age = lastExtractStartNanos - cached.nanos();
+        if (age < 0L || age > PortalCaptureSettings.MAX_INTERVAL_NANOS) {
+            lastReady.remove(portal.id());
+            PortalRenderDiagnostics.skipped(portal, reason);
+            return null;
+        }
+        return cached.result();
+    }
+
+    /**
+     * Drops cached extractions that are no longer fresh, so removed portals do
+     * not keep a destination state alive.
+     */
+    private void pruneReady() {
+        lastReady.values().removeIf(
+                cached -> lastExtractStartNanos - cached.nanos()
+                        > PortalCaptureSettings.MAX_INTERVAL_NANOS);
     }
 
     private PortalRenderData extractChild(Minecraft minecraft, Camera camera,
@@ -395,6 +456,7 @@ public final class PortalRenderManager {
 
     private void close() {
         layers = List.of();
+        lastReady.clear();
         pass.close();
         if (chunkSections != null) {
             chunkSections.close();
