@@ -47,7 +47,10 @@ spawners and other host-world systems inside an empty copy.
    interaction), block events execute immediately so chest/note-block feedback
    is not delayed.
 5. **Block entities** via `tickBlockEntities()`, which drives dispensers,
-   droppers, hoppers, furnaces and other block-entity logic.
+   droppers, hoppers, furnaces and other block-entity logic. A bounded
+   fallback then directly invokes the state ticker for BEs that vanilla
+   skipped because the chunk/entity section was not tickable or the ticker was
+   not registered. Entries vanilla ticked are not run twice.
 
 Only chunks in `activeChunks` (chunks that received copied blocks) are read.
 `getChunkNow`/`getAllEntities` paths never force a chunk load.
@@ -233,6 +236,10 @@ loot for blocks that vanilla would move or destroy without drops.
 - `EmptyPhysicsLevel#totalBlockTicks()`, `totalFluidTicks()`,
   `totalBlockEvents()`, `totalRandomTicks()`, `totalMirroredBlocks()`,
   `totalSkippedBlocks()`, `totalNeighborUpdates()`, `totalDroppedWork()`.
+- `EmptyPhysicsLevel#blockEntityDiagnostics()`: live BEs, registered and
+  pending tickers, loaded active chunks, random-ticking sections, chunk
+  activations/reinitializations and queued events.
+  `totalBlockEntityFallbackTicks()` covers the direct fallback pass.
 
 ## Limitations
 

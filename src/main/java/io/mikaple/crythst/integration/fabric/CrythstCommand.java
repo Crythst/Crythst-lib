@@ -156,6 +156,8 @@ public final class CrythstCommand {
             return 0;
         }
         source.sendSuccess(() -> Component.literal("voiddebug: " + subLevel.status()), false);
+        source.sendSuccess(() -> Component.literal("voiddebug block entities: "
+                + subLevel.blockEntityDiagnostics()), false);
         source.sendSuccess(() -> Component.literal("voiddebug last tick: "
                 + physics.lastVoidTick().summary()), false);
         source.sendSuccess(() -> Component.literal("voiddebug entity policy: "

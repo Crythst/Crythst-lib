@@ -40,6 +40,27 @@ This document records the end-to-end tick path of the auxiliary
    `wakeCopiedRegion`, because `LevelTicks#schedule` drops requests for a chunk
    whose container is not registered yet. Containers are unregistered when a
    region is removed so stale ticks cannot accumulate.
+6. **Block-entity registration was keyed by chunk position only.** A chunk that
+   unloaded and was replaced under the same key kept its "initialized" marker,
+   so the new `LevelChunk`'s tick container was never registered. Registration
+   now compares the live chunk object and re-unpacks/re-registers a replacement.
+7. **Vanilla `tickBlockEntities` has two extra gates.** A registered ticker is
+   skipped when the chunk is not `BLOCK_TICKING` or its entity section is not
+   loaded, and an unregistered ticker is skipped even when both are true. In
+   the auxiliary level the entity sections are promoted manually and a restored
+   or freshly created block entity can miss a tick (notably a moving piston
+   created by a block event, or a furnace/hopper restored from NBT). The void
+   tick now runs a bounded fallback over active chunks that invokes the state
+   ticker directly **only** for entries vanilla would skip, so nothing is
+   double-ticked. See `blockEntityFallbackTicks` and the
+   `loadedChunks`/`beTickers` diagnostics below.
+8. **Refresh dropped already-captured ticks.** `LevelPhysics#refreshStructure`
+   removes the old region before `EmptyPhysicsLevel#addStructure`, so the
+   latter's "capture from the existing region" path never ran. The refresh path
+   now captures scheduled ticks *before* removing the region and passes them to
+   the copy. Region removal also clears that region's pending ticks, so an
+   inactive chunk no longer saves overdue repeater/observer work that fires
+   unexpectedly when the chunk is reused.
 
 ## Tick phases
 
@@ -52,7 +73,9 @@ This document records the end-to-end tick path of the auxiliary
 4. scheduled fluid ticks (direct `LevelChunkTicks<Fluid>` drain, budget 4096);
 5. random block/fluid ticks per active section (configured speed);
 6. queued block events (budget 4096, queue cap 8192);
-7. vanilla `tickBlockEntities()`;
+7. vanilla `tickBlockEntities()`, then a direct-ticker fallback for entries
+   vanilla skipped because the chunk/entity section was not tickable or the
+   ticker was not registered;
 8. a second entity ejection for entities spawned by dispensers/events;
 9. attached host mirror updates;
 10. block-entity NBT mirroring and changed-state mirroring.
@@ -108,6 +131,26 @@ automatically.
   cumulative scheduled block/fluid ticks, random ticks, events, neighbours,
   mirrored/skipped blocks, dropped work, entity ejection and attachment
   failures.
+- The same line now includes block-entity counters: live BEs, registered
+  tickers in active chunks and in the level-wide list, pending tickers,
+  loaded/total active chunks, random-ticking sections, chunk
+  activations/reinitializations, queued events and fallback BE ticks. A
+  structure with random-ticking crops should show `randomSections > 0`;
+  redstone-only structures correctly show zero.
 - `/crythst timing` appends the same void status.
 - `/crythst status` includes ejected and attached counts.
 - `EmptyPhysicsLevel#status()` is the one-line cumulative summary.
+- Set `-Dcrythst.void.logTicks=true` to log the same status every 100 server
+  ticks. It is off by default.
+
+## Test coverage and limitations
+
+Unit tests cover the pure parts: tick budgets/results, region coordinate
+mapping, copy-state selection, mirror decisions and the chunk-object
+re-registration decision. The live paths (chunk tickets, entity-section load,
+vanilla ticker registration and actual redstone/hopper/moving-piston
+behaviour) need an in-game or dedicated-server harness; they are not covered by
+the JUnit suite. Use `/crythst voiddebug` with the counters above to distinguish
+"no ticker registered", "ticker registered but chunk/entity section not tickable"
+and "ticker ran but no scheduled work was due". Redstone-only structures
+legitimately report `randomTicks=0` and `randomSections=0`.

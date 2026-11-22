@@ -65,6 +65,23 @@ class VoidWorldLogicTest {
     }
 
     @Test
+    void replacedChunkObjectIsRegisteredAgainButSameChunkIsNot() {
+        final Object firstChunk = new Object();
+        final Object replacement = new Object();
+
+        assertTrue(EmptyPhysicsLevel.needsTickContainerRegistration(null, firstChunk),
+                "a newly activated chunk registers its tick container");
+        assertFalse(EmptyPhysicsLevel.needsTickContainerRegistration(firstChunk, firstChunk),
+                "the same live chunk must not be unpacked/registered every tick");
+        assertTrue(EmptyPhysicsLevel.needsTickContainerRegistration(firstChunk, replacement),
+                "an unloaded/replaced chunk object needs its new containers registered");
+        assertFalse(EmptyPhysicsLevel.needsTickContainerRegistration(firstChunk, null),
+                "an unavailable chunk is skipped, not treated as a new chunk");
+        assertFalse(EmptyPhysicsLevel.needsTickContainerRegistration(null, null),
+                "no chunk means no registration work");
+    }
+
+    @Test
     void regionViewConvertsAuxiliaryPositionsToVolumeVoxels() {
         final EmptyPhysicsLevel.RegionView view = new EmptyPhysicsLevel.RegionView(
                 17L, 100, 0, 200, -4, 2, 6, 3, 4, 5);

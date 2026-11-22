@@ -247,9 +247,14 @@ public final class LevelPhysics implements AutoCloseable {
             // reset a furnace in the same structure.
             final Map<net.minecraft.core.BlockPos, net.minecraft.nbt.CompoundTag> preserved =
                     subLevel.captureBlockEntities(structure);
+            // Capture pending repeater/observer/fluid delays before the region
+            // is removed. EmptyPhysicsLevel#addStructure cannot do this itself
+            // on this path because the old region is already gone.
+            final net.minecraft.nbt.CompoundTag preservedTicks =
+                    subLevel.captureScheduledTicks(structure);
             try {
                 subLevel.removeStructure(structure);
-                subLevel.addStructure(structure, volume);
+                subLevel.addStructure(structure, volume, preservedTicks);
                 if (!preserved.isEmpty()) {
                     subLevel.applyBlockEntities(structure, preserved);
                 }

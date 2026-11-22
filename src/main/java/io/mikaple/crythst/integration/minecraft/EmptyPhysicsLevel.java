@@ -7,6 +7,9 @@ import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntit
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
 import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
+import io.mikaple.crythst.mixin.ChunkAccessBlockEntityAccessor;
+import io.mikaple.crythst.mixin.LevelBlockEntityTickerAccessor;
+import io.mikaple.crythst.mixin.LevelChunkTickAccessor;
 import io.mikaple.crythst.mixin.MinecraftServerAccessor;
 import io.mikaple.crythst.mixin.ServerLevelEntityManagerAccessor;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -45,6 +48,8 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LevelEvent;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityTicker;
+import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -314,8 +319,13 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private final AuxiliaryServerLevel level;
     private final ServerLevel hostLevel;
     private final Map<Long, Integer> activeChunks = new HashMap<>();
-    /** Chunks whose vanilla tick containers have been registered. */
-    private final Set<Long> initializedChunks = new HashSet<>();
+    /**
+     * Chunk object whose vanilla tick containers were last registered. Keeping
+     * the object identity (not just the chunk key) matters because a chunk can
+     * be unloaded and replaced under the same key; the replacement needs its
+     * own containers registered and its pending ticks unpacked.
+     */
+    private final Map<Long, LevelChunk> initializedChunks = new HashMap<>();
     private final Map<Long, Region> regions = new HashMap<>();
     /** Positions whose auxiliary block state changed since the last flush. */
     private final Set<Long> changedBlocks = new HashSet<>();
@@ -333,6 +343,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private long totalScheduledPasses;
     private long totalFluidTicks;
     private long totalBlockEvents;
+    private long totalBlockEventsQueued;
+    private long totalBlockEntityFallbackTicks;
     private long totalRandomTicks;
     private long totalMirroredBlocks;
     private long totalSkippedBlocks;
@@ -341,6 +353,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private long totalEjectedEntities;
     private long totalAdoptedAttachedEntities;
     private long totalEjectionFailures;
+    private long totalChunkActivations;
+    private long totalChunkReinitializations;
     private long suppressedFailureLogs;
     private long lastFailureLogTick = Long.MIN_VALUE;
     private String lastFailureDescription = "";
@@ -414,14 +428,30 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      * the whole lifetime of a structure.
      */
     public void addStructure(PhysicsStructure structure, VoxelVolume volume) {
+        addStructure(structure, volume, null);
+    }
+
+    /**
+     * Copies a structure into the void level while restoring caller-captured
+     * pending block/fluid ticks. Used by {@code LevelPhysics#refreshStructure},
+     * which must capture the ticks <em>before</em> it removes the old region.
+     *
+     * @param preservedTicks ticks captured from the old region, or {@code null}
+     *                       to capture from the current region when it exists
+     */
+    public void addStructure(PhysicsStructure structure, VoxelVolume volume,
+                             @Nullable CompoundTag preservedTicks) {
         if (closed) {
             return;
         }
         final long regionKey = structure.body().id();
         // A refresh replaces the whole region. Preserve pending repeater /
-        // observer / fluid delays instead of silently dropping them.
-        final CompoundTag previousTicks = regions.containsKey(regionKey)
-                ? captureScheduledTicks(structure) : null;
+        // observer / fluid delays instead of silently dropping them. Callers
+        // that remove the old region first (LevelPhysics#refreshStructure) pass
+        // the captured tag explicitly because there is no region left here.
+        final CompoundTag previousTicks = preservedTicks != null
+                ? preservedTicks
+                : regions.containsKey(regionKey) ? captureScheduledTicks(structure) : null;
         if (regions.containsKey(regionKey)) {
             removeStructure(structure);
         }
@@ -568,6 +598,22 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         this.entityProjector = entityProjector;
     }
 
+    /**
+     * Pure chunk-registration decision. A chunk needs its tick containers
+     * (re)registered when the currently loaded {@link LevelChunk} object is not
+     * the one that was registered before. Reusing only the chunk key would skip
+     * a chunk that unloaded and was replaced, leaving its new tick container
+     * unregistered and silently dropping every repeater/observer schedule.
+     *
+     * @param registeredChunk chunk object registered last time, or {@code null}
+     * @param currentChunk    chunk object currently loaded, or {@code null}
+     * @return whether the current chunk requires an unpack/register pass
+     */
+    static boolean needsTickContainerRegistration(@Nullable Object registeredChunk,
+                                                  @Nullable Object currentChunk) {
+        return currentChunk != null && registeredChunk != currentChunk;
+    }
+
     private void activateActiveChunks() {
         if (activeChunks.isEmpty()) {
             return;
@@ -587,10 +633,17 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             if (chunk == null) {
                 continue;
             }
-            if (initializedChunks.add(chunkKey)) {
+            final LevelChunk registered = initializedChunks.get(chunkKey);
+            if (needsTickContainerRegistration(registered, chunk)) {
                 try {
                     chunk.unpackTicks(level.getGameTime());
                     chunk.registerTickContainerInLevel(level);
+                    initializedChunks.put(chunkKey, chunk);
+                    if (registered == null) {
+                        totalChunkActivations++;
+                    } else {
+                        totalChunkReinitializations++;
+                    }
                 } catch (Throwable t) {
                     reportTickFailure("register chunk ticks " + chunk.getPos(), t);
                 }
@@ -761,7 +814,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         }
         if (resolved != null) {
             StructureBlockEntityData.put(structure, resolved);
+            structure.bumpBlockEntityRevision();
         }
+        // `Level#setBlockEntity` registers tickers through the chunk, but the
+        // region may have just been copied while its entity-section status was
+        // still changing. Run the activation pass now so restored furnaces,
+        // hoppers and moving pistons tick on the very next void tick instead of
+        // waiting for an unrelated chunk refresh.
+        activateActiveChunks();
     }
 
     /** Whether {@code state} is a legal block for the saved block-entity id. */
@@ -897,7 +957,6 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return root;
         }
         final long now = level.getGameTime();
-        final IntBounds3 bounds = structure.volume().bounds();
         final ListTag blocks = new ListTag();
         final ListTag fluids = new ListTag();
         for (long chunkKey : region.chunks) {
@@ -909,14 +968,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
-                ticks.getAll().forEach(tick -> addSavedTick(blocks, region, bounds, now,
+                ticks.getAll().forEach(tick -> addSavedTick(blocks, region, now,
                         tick.pos(), BuiltInRegistries.BLOCK.getKey(tick.type()).toString(),
                         tick.triggerTick(), tick.priority(), tick.subTickOrder()));
             }
             if (chunk.getFluidTicks() instanceof LevelChunkTicks<?> rawFluids) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawFluids;
-                ticks.getAll().forEach(tick -> addSavedTick(fluids, region, bounds, now,
+                ticks.getAll().forEach(tick -> addSavedTick(fluids, region, now,
                         tick.pos(), BuiltInRegistries.FLUID.getKey(tick.type()).toString(),
                         tick.triggerTick(), tick.priority(), tick.subTickOrder()));
             }
@@ -930,8 +989,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         return root;
     }
 
-    private static void addSavedTick(ListTag list, Region region, IntBounds3 bounds,
-                                     long now, BlockPos pos, String type, long triggerTick,
+    private static void addSavedTick(ListTag list, Region region, long now,
+                                     BlockPos pos, String type, long triggerTick,
                                      TickPriority priority, long subTickOrder) {
         final int localX = pos.getX() - region.baseX;
         final int localY = pos.getY() - region.baseY;
@@ -944,9 +1003,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         final CompoundTag entry = new CompoundTag();
         // Store absolute structure-local voxels so the tick survives a refresh
         // whose region/bounds origin changed.
-        entry.putInt("X", bounds.minX() + localX);
-        entry.putInt("Y", bounds.minY() + localY);
-        entry.putInt("Z", bounds.minZ() + localZ);
+        // region.volumeMin is the bounds minimum used when the region was
+        // copied. structure.volume().bounds() may already have changed by the
+        // time a split/refresh captures ticks, which misallocated them.
+        entry.putInt("X", region.volumeMinX + localX);
+        entry.putInt("Y", region.volumeMinY + localY);
+        entry.putInt("Z", region.volumeMinZ + localZ);
         entry.putString("Type", type);
         entry.putLong("Delay", Math.max(0L, triggerTick - now));
         entry.putInt("Priority", priority.getValue());
@@ -969,10 +1031,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return;
         }
         final long now = level.getGameTime();
-        final IntBounds3 bounds = structure.volume().bounds();
         clearRegionTicks(region);
-        restoreTickList(root.getListOrEmpty("Block"), true, region, bounds, now);
-        restoreTickList(root.getListOrEmpty("Fluid"), false, region, bounds, now);
+        restoreTickList(root.getListOrEmpty("Block"), true, region, now);
+        restoreTickList(root.getListOrEmpty("Fluid"), false, region, now);
     }
 
     private void clearRegionTicks(Region region) {
@@ -1004,7 +1065,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     }
 
     private void restoreTickList(ListTag list, boolean blockTicks, Region region,
-                                 IntBounds3 bounds, long now) {
+                                 long now) {
         for (int i = 0; i < list.size(); i++) {
             final CompoundTag entry = list.getCompoundOrEmpty(i);
             if (entry.isEmpty()) {
@@ -1015,9 +1076,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 continue;
             }
             final BlockPos pos = new BlockPos(
-                    region.baseX + entry.getIntOr("X", 0) - bounds.minX(),
-                    region.baseY + entry.getIntOr("Y", 0) - bounds.minY(),
-                    region.baseZ + entry.getIntOr("Z", 0) - bounds.minZ());
+                    region.baseX + entry.getIntOr("X", 0) - region.volumeMinX,
+                    region.baseY + entry.getIntOr("Y", 0) - region.volumeMinY,
+                    region.baseZ + entry.getIntOr("Z", 0) - region.volumeMinZ);
             ensureChunk(pos);
             final long delay = Math.max(0L, entry.getLongOr("Delay", 0L));
             final TickPriority priority = TickPriority.byValue(
@@ -1350,6 +1411,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             }
             if (changed) {
                 StructureBlockEntityData.put(structure, data);
+                structure.bumpBlockEntityRevision();
             }
         }
         return mirrored;
@@ -1533,6 +1595,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             drainBlockEvents();
             if (!activeChunks.isEmpty()) {
                 level.tickBlockEntities();
+                // Vanilla skips a ticker when the chunk is not BLOCK_TICKING or
+                // its entity section is not loaded, and an unregistered ticker
+                // is skipped even when both are true. Both gates exist in the
+                // auxiliary level (its entity sections are managed by us), so
+                // close the gap with a bounded direct-ticker fallback.
+                runBlockEntityFallbackTicks();
                 // Dispensers/droppers/block events can spawn entities. Flush
                 // them before any later phase could tick them.
                 ejectEntities();
@@ -1692,6 +1760,86 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         }
     }
 
+    /**
+     * Ticks block entities that vanilla {@code tickBlockEntities()} skipped.
+     *
+     * <p>The auxiliary level does not run a normal {@code ServerLevel.tick} and
+     * its entity sections are promoted manually. Vanilla's block-entity loop
+     * has two independent gates for every ticker: the chunk must be
+     * {@code BLOCK_TICKING} and its entity section must be loaded, and the
+     * ticker itself must have been registered on the level. A newly restored or
+     * newly created block entity can miss either one for a tick (or longer when
+     * the entity-section load future is delayed), which stalls hoppers,
+     * furnaces, moving pistons and any block entity that schedules its own
+     * follow-up work.</p>
+     *
+     * <p>Only the skipped entries are ticked here, so an entity is never
+     * double-ticked. The state ticker is invoked directly, matching vanilla's
+     * validity check, while staying bounded by the active chunk list.</p>
+     */
+    private void runBlockEntityFallbackTicks() {
+        if (activeChunks.isEmpty()) {
+            return;
+        }
+        final boolean runsNormally = level.tickRateManager().runsNormally();
+        for (long chunkKey : List.copyOf(activeChunks.keySet())) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null) {
+                continue;
+            }
+            final LevelChunkTickAccessor accessor = (LevelChunkTickAccessor) (Object) chunk;
+            final var tickers = accessor.crythst$blockEntityTickers();
+            final var blockEntities = ((ChunkAccessBlockEntityAccessor) (Object) chunk)
+                    .crythst$blockEntities();
+            final boolean chunkTicking = chunk.getFullStatus() != null
+                    && chunk.getFullStatus().isOrAfter(FullChunkStatus.BLOCK_TICKING);
+            for (var entry : List.copyOf(blockEntities.entrySet())) {
+                final BlockEntity blockEntity = entry.getValue();
+                if (blockEntity == null || blockEntity.isRemoved()) {
+                    continue;
+                }
+                final BlockPos pos = entry.getKey();
+                final boolean vanillaWouldTick = runsNormally
+                        && tickers.containsKey(pos)
+                        && chunkTicking
+                        && level.areEntitiesLoaded(ChunkPos.pack(pos))
+                        && level.shouldTickBlocksAt(pos);
+                if (vanillaWouldTick) {
+                    continue;
+                }
+                final BlockState state = chunk.getBlockState(pos);
+                if (!blockEntity.getType().isValid(state)) {
+                    continue;
+                }
+                if (tickBlockEntityNow(blockEntity, state, pos)) {
+                    totalBlockEntityFallbackTicks++;
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private boolean tickBlockEntityNow(BlockEntity blockEntity, BlockState state, BlockPos pos) {
+        final BlockEntityTicker ticker;
+        try {
+            ticker = state.getTicker(level, (BlockEntityType) blockEntity.getType());
+        } catch (Throwable t) {
+            reportTickFailure("resolve block-entity ticker at " + pos.toShortString(), t);
+            return false;
+        }
+        if (ticker == null) {
+            return false;
+        }
+        try {
+            ticker.tick(level, pos, state, blockEntity);
+            return true;
+        } catch (Throwable t) {
+            reportTickFailure("tick block entity at " + pos.toShortString(), t);
+            return false;
+        }
+    }
+
     /** True while vanilla tick phases are running. */
     public boolean isTicking() {
         return ticking;
@@ -1781,6 +1929,113 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         return totalEjectionFailures;
     }
 
+    /** Cumulative chunks whose tick containers were registered. */
+    public long totalChunkActivations() {
+        return totalChunkActivations;
+    }
+
+    /** Activated chunks whose {@code LevelChunk} object was replaced. */
+    public long totalChunkReinitializations() {
+        return totalChunkReinitializations;
+    }
+
+    /** Cumulative block events queued for the deferred event phase. */
+    public long totalBlockEventsQueued() {
+        return totalBlockEventsQueued;
+    }
+
+    /**
+     * Actual state-ticker invocations by the fallback pass. Vanilla's own
+     * {@code tickBlockEntities()} calls are not observable here; the
+     * registration/loaded counters show whether vanilla could run them.
+     */
+    public long totalBlockEntityFallbackTicks() {
+        return totalBlockEntityFallbackTicks;
+    }
+
+    /**
+     * Live block entities recorded in active regions. Reads only loaded chunks
+     * and is intended for commands/diagnostics.
+     */
+    public int activeBlockEntityCount() {
+        int count = 0;
+        for (Region region : regions.values()) {
+            for (long packed : region.blockEntityPositions) {
+                final BlockPos pos = BlockPos.of(packed);
+                final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                        pos.getX() >> 4, pos.getZ() >> 4);
+                if (chunk != null && chunk.getBlockEntity(pos) != null) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Block-entity tickers registered on the chunks of active regions. A ticker
+     * can still be skipped by vanilla when the chunk/entity section is not
+     * ticking, which is exactly what the loaded-status diagnostic exposes.
+     */
+    public int activeBlockEntityTickerCount() {
+        int count = 0;
+        for (long chunkKey : activeChunks.keySet()) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk != null) {
+                count += ((LevelChunkTickAccessor) (Object) chunk)
+                        .crythst$blockEntityTickers().size();
+            }
+        }
+        return count;
+    }
+
+    /** Tickers in the auxiliary level's global (non-pending) list. */
+    public int globalBlockEntityTickerCount() {
+        return ((LevelBlockEntityTickerAccessor) (Object) level)
+                .crythst$blockEntityTickers().size();
+    }
+
+    /** Tickers queued while the previous block-entity pass was running. */
+    public int pendingBlockEntityTickerCount() {
+        return ((LevelBlockEntityTickerAccessor) (Object) level)
+                .crythst$pendingBlockEntityTickers().size();
+    }
+
+    /** Active chunks whose {@code LevelChunk} reports its loaded flag. */
+    public int loadedActiveChunkCount() {
+        int count = 0;
+        for (long chunkKey : activeChunks.keySet()) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk != null && ((LevelChunkTickAccessor) (Object) chunk).crythst$isLoaded()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Sections in active chunks that carry random-ticking blocks/fluids. This
+     * explains a zero random-tick counter for redstone-only structures.
+     */
+    public int randomTickingSectionCount() {
+        int count = 0;
+        for (long chunkKey : activeChunks.keySet()) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null) {
+                continue;
+            }
+            for (LevelChunkSection section : chunk.getSections()) {
+                if (section != null && section.isRandomlyTicking()) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     /** Pending scheduled block ticks across all registered chunk containers. */
     public int pendingBlockTicks() {
         return level.getBlockTicks().count();
@@ -1789,6 +2044,24 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     /** Pending scheduled fluid ticks across all registered chunk containers. */
     public int pendingFluidTicks() {
         return level.getFluidTicks().count();
+    }
+
+    /**
+     * One-line diagnostics for the block-entity gate: registration count,
+     * loaded chunk count and whether the entity sections were promoted. This
+     * distinguishes "no ticker registered" from "ticker registered but chunk
+     * not ticking".
+     */
+    public String blockEntityDiagnostics() {
+        return "blockEntities=" + activeBlockEntityCount()
+                + " beTickers=" + activeBlockEntityTickerCount()
+                + " globalBeTickers=" + globalBlockEntityTickerCount()
+                + " pendingBeTickers=" + pendingBlockEntityTickerCount()
+                + " loadedChunks=" + loadedActiveChunkCount() + "/" + activeChunks.size()
+                + " randomSections=" + randomTickingSectionCount()
+                + " chunkActivations=" + totalChunkActivations
+                + " chunkReinitializations=" + totalChunkReinitializations
+                + " eventsQueued=" + totalBlockEventsQueued;
     }
 
     public @Nullable StructureAttachedEntities attachedEntities() {
@@ -1808,6 +2081,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 + " pendingFluidTicks=" + pendingFluidTicks()
                 + " randomTicks=" + totalRandomTicks
                 + " blockEvents=" + totalBlockEvents
+                + " blockEventsQueued=" + totalBlockEventsQueued
+                + " blockEntityFallbackTicks=" + totalBlockEntityFallbackTicks
                 + " neighbors=" + totalNeighborUpdates
                 + " mirroredBlocks=" + totalMirroredBlocks
                 + " skippedBlocks=" + totalSkippedBlocks
@@ -1815,6 +2090,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 + " entitiesEjected=" + totalEjectedEntities
                 + " attachedAdopted=" + totalAdoptedAttachedEntities
                 + " ejectionFailures=" + totalEjectionFailures
+                + " " + blockEntityDiagnostics()
                 + " " + tickDiagnostics()
                 + " lastFailure=" + (lastFailureDescription.isEmpty()
                         ? "none" : lastFailureDescription);
@@ -1970,6 +2246,16 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
     private void discard(Region region) {
         discardRegionEntities(region);
+        // Remove this region's pending scheduled work before its blocks go
+        // away. The chunk container itself can outlive an inactive region (and
+        // is saved with the chunk), so leaving overdue repeater/observer ticks
+        // behind makes them fire unexpectedly the next time the chunk is
+        // activated.
+        try {
+            clearRegionTicks(region);
+        } catch (Throwable t) {
+            Crythst.LOGGER.debug("Could not clear void-level region ticks", t);
+        }
         beginSuppressChanges();
         try {
             region.clearBlocks(level);
@@ -2210,6 +2496,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     return;
                 }
                 pendingBlockEvents.add(new BlockEventData(pos, block, paramA, paramB));
+                owner.totalBlockEventsQueued++;
                 return;
             }
             final BlockState state = getBlockState(pos);
