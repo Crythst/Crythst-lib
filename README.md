@@ -12,13 +12,69 @@
 
 > 功能模组可以把 Crythst 作为底层依赖，只取需要的模块；也可以同时使用物理结构、渲染、交互和同步，构建“会移动/会倒塌/可交互的方块世界”。
 
+## 30 秒了解 Crythst
+
+Minecraft 原版把方块放在固定的世界网格里。Crythst 允许把一块方块区域“拿起来”，变成一个会移动、旋转、碰撞并承载实体的**物理结构**。
+
+它适合做：
+
+- 可驾驶/可飞行的方块载具、飞船、列车；
+- 会旋转、翻倒、被撞击的方块平台；
+- 需要保留原版方块模型、选择、挖掘、放置、容器和红石行为的移动结构。
+
+Crythst 提供：
+
+- Bullet 刚体 + 体素碰撞体；
+- 结构方块的真实模型渲染与 section 批量缓存；
+- 结构上的原版方块逻辑（辅助 void level）；
+- 玩家/实体碰撞、方向重力、选择/交互、持久化与多人同步。
+
+Crythst 不提供：
+
+- 开箱即用的飞船/载具内容（这是使用它的模组的职责）；
+- Sable 的 `dev.ryanhcode.sable.*` API 兼容包；
+- 完整的 plot/sub-level 世界模型。当前实现是“宿主世界 + 每结构辅助 void 区域”。
+
+### 新读者阅读顺序
+
+1. 先看下面的 [快速开始](#快速开始)，把库跑起来；
+2. 读 [docs/architecture.md](docs/architecture.md) 了解服务端/客户端、物理世界和渲染的分层；
+3. 做功能模组时看 [docs/api.md](docs/api.md) 和 [docs/api-cookbook.md](docs/api-cookbook.md)；
+4. 做移动结构玩法时看 [docs/player-structure-interaction.md](docs/player-structure-interaction.md)、[docs/entity-physics-collision.md](docs/entity-physics-collision.md) 和 [docs/void-level-ticking.md](docs/void-level-ticking.md)；
+5. 评估 Sable / Create Aeronautics 兼容性时看 [API_GAP_ANALYSIS.md](API_GAP_ANALYSIS.md)。
+
+## 关键概念
+
+| 概念 | 含义 |
+| --- | --- |
+| 物理体 body | Bullet 中的一个刚体，拥有质量、速度、pose 和碰撞形状 |
+| 结构体素 voxel | 结构局部整数网格中的一格；一个结构由多个体素组成 |
+| 结构体 `PhysicsStructure` | 物理体 + 体素体积 + 材质/质量 + 渲染/碰撞/交互入口 |
+| pose / `blockScale` | pose 是结构局部坐标到世界坐标的刚体变换；`blockScale` 是一格的世界尺寸 |
+| 辅助 void level | 每个宿主维度懒创建的真实 `ServerLevel`，保存结构方块副本并运行原版方块逻辑 |
+| 客户端快照 | 多人环境下客户端拿到的只读结构/姿态数据，用于渲染、选择和预测 |
+
+## 与 Sable / sable-port 的关系
+
+Crythst 是**独立实现**，不是 Sable 或 sable-port 的 fork，也不包含它们的代码。
+
+- **Sable** 是上游项目，探索“可移动方块结构的刚体仿真”，使用 **PolyForm Shield License 1.0.0**。
+- **sable-port** 是 Sable 面向 Fabric 的移植/适配版本，同样使用 **PolyForm Shield License 1.0.0**。
+- Crythst 的设计问题空间受到二者启发；批量渲染、section 遮挡、选择、辅助方块逻辑等部分参考了其思路和术语，但代码独立实现。
+- 本仓库未复制 Sable/sable-port 的源代码、注释或资源文件；当前审计未发现整文件或大段连续代码复制。
+- 少量公共 API 名称、包结构和术语有意对齐（如 `ForceGroup`、`MassData`、`RigidBodyHandle`、`PhysicsPipeline`、约束配置、`VoxelColliderData`），这些类的实现是独立的。
+- Crythst 不提供 `dev.ryanhcode.sable.*` 兼容包；面向 Sable 的模组需要按 Crythst API 移植。
+- 若未来引入任何 Sable/sable-port 代码，必须按 PolyForm Shield 处理，不能继续仅以 MIT 发布。
+
+来源与证据见 `docs/license-audit-2026-11-22.md`。以上是工程来源说明，**不构成法律意见**。
+
 ## 模块
 
 | 模块 | 职责 | 主要入口 |
 | --- | --- | --- |
 | `physics` | 刚体、约束、查询、角色、固定步长、可重定位原点 | `CrythstApi`, `PhysicsWorld`, `RigidBodyHandle` |
 | `physics.voxel` / `structure` | 体素贪心碰撞、质量/惯性、移动方块结构 | `VoxelColliderBuilder`, `PhysicsStructure` |
-| `integration.minecraft` | 每维度物理世界、真实空 Level 方块逻辑、地形碰撞、玩家重力 | `MinecraftPhysics`, `LevelPhysics`, `PlayerGravity` |
+| `integration.minecraft` | 每维度物理世界、辅助 void level 方块逻辑、地形碰撞、玩家重力 | `MinecraftPhysics`, `LevelPhysics`, `PlayerGravity` |
 | `integration.minecraft.entity` | 实体与结构碰撞（`Entity.move` 内）、实体停留在结构上、Create 实体软兼容 | `EntityStructureCollision`, `EntityStructureRidingManager` |
 | `integration.minecraft.interaction` | 选择/射线、挖掘/放置结构方块、拾取方块、反作用冲量、铲水反作用 | `StructureSelection`, `StructureInteraction` |
 | `integration.minecraft.storage` | 结构快照、方块实体 NBT、持久化、稳定 UUID | `StructurePersistence`, `StructureSavedData` |
@@ -31,13 +87,17 @@
 
 ## 目录
 
+- [30 秒了解 Crythst](#30-秒了解-crythst)
+- [关键概念](#关键概念)
+- [与 Sable / sable-port 的关系](#与-sable--sable-port-的关系)
+- [模块](#模块)
 - [核心能力](#核心能力)
 - [平台支持](#平台支持)
 - [快速开始](#快速开始)
 - [包布局](#包布局)
 - [构建](#构建)
 - [命令](#命令)
-- [许可](#许可)
+- [许可与来源声明](#许可与来源声明)
 - [状态与路线图](#状态与路线图)
 - [TODO](TODO.md)
 
@@ -66,7 +126,7 @@
 | --- | --- | --- |
 | 每维度物理世界 | 每个 `ServerLevel` 自动维护独立世界 | `MinecraftPhysics`, `LevelPhysics` |
 | 地形碰撞 | 16³ section 静态合并体、缓存、方块编辑失效、碰撞组 | `TerrainCollision` |
-| 真实空 Level 方块逻辑 | 懒创建真实空 `ServerLevel`，复制结构方块，只 tick 含方块 chunk | `EmptyPhysicsLevel` |
+| 辅助 void level 方块逻辑 | 懒创建真实 `ServerLevel`，复制结构方块并运行原版方块 tick/邻居/红石/流体逻辑 | `EmptyPhysicsLevel` |
 | 玩家重力方向 | 修改空中重力、相机朝向、OBB 碰撞和交互视线 | `PlayerGravity`, `PlayerObbCollision` |
 | 实体碰撞/搭乘 | 碰撞集成进原版 `Entity.move`，实体被结构挡住但不推动结构；站在结构上的实体随结构移动 | `EntityStructureCollision`, `EntityStructureRidingManager` |
 | 结构选择/交互 | 结构命中共用原版 `Level.clip`；原版轮廓、挖掘/放置/中键拾取、反作用冲量、铲水反作用 | `StructureSelection`, `StructureInteraction` |
@@ -521,15 +581,11 @@ PhysicsStructure structure = physics.createStructure(
 Crythst 本身以 **MIT License** 发布，版权归 mikaple 所有。完整文本见 [LICENSE](LICENSE)。  
 本声明是工程来源说明，**不构成法律意见**；正式发布前应进行独立的许可证复核。
 
-### 与 Sable 的关系
+### 来源声明
 
-- Crythst 是**独立实现**。物理层的问题空间受到 Sable 启发：用体素碰撞形状表示可移动方块结构，并进行刚体仿真。
-- 本仓库**不包含**从 Sable 或任何 Sable 移植版本复制的源代码文件、注释文本或资源文件。就当前审计范围而言，未发现整文件复制或大段连续代码复制；物理后端也完全不同（Crythst 使用 Bullet / libbulletjme，Sable 使用 Rapier / Rust）。
-- 为便于迁移和兼容，**少量公共 API 名称、包结构和术语有意与 Sable 对齐**（例如 `ForceGroup`、`MassData`、`RigidBodyHandle`、`PhysicsPipeline`、约束配置、`VoxelColliderData` 等）。这些类的实现是独立的，但“完全没有类布局/命名对齐”的绝对说法并不准确。
-- 渲染批处理、section 遮挡、选择、空维度方块逻辑等部分参考了 Sable 的设计思路或命名术语；相关算法为独立实现。
-- Sable 本身使用 **PolyForm Shield License 1.0.0**（含 Noncompete 与 Required Notice）。Crythst 不包含 Sable 代码，也不以 Sable 的名义分发。若未来引入任何 Sable 代码，必须按 PolyForm Shield 处理，不能继续仅以 MIT 发布。
+Crythst 是独立实现，不是 Sable 或 sable-port 的 fork，也不包含它们的源代码、注释或资源。设计问题空间受到 Sable/sable-port 启发，少量公共 API 名称、包结构和术语有意对齐；详细边界与证据见上文 [与 Sable / sable-port 的关系](#与-sable--sable-port-的关系) 和 `docs/license-audit-2026-11-22.md`。Sable 与 sable-port 均使用 PolyForm Shield License 1.0.0；若未来引入其代码，必须按其条款处理，不能继续仅以 MIT 发布。
 
-来源审计与逐项证据见 `docs/license-audit-2026-11-22.md`。该文档是工程审计，不是法律意见。
+来源审计是工程说明，不是法律意见；正式发布前应进行独立的许可证复核。
 
 ### 第三方组件
 
@@ -551,7 +607,7 @@ Crythst 本身以 **MIT License** 发布，版权归 mikaple 所有。完整文�
 - 刚体、体素结构、贪心碰撞盒、完整 3×3 惯性张量；
 - 数据驱动方块质量、摩擦、弹性、浮力和末地石低密度；
 - 任意方向重力、玩家相机姿态、非默认重力下的玩家 OBB 后置碰撞校正；
-- 每维度物理世界、真实空 `ServerLevel` 方块逻辑、按 section 缓存且随编辑失效的地形碰撞；
+- 每维度物理世界、辅助 void level 方块逻辑、按 section 缓存且随编辑失效的地形碰撞；
 - 集成进 `Entity.move` 的实体单向结构碰撞、实体停留在移动结构上、Create-Fly 软兼容；
 - 结构选择共用原版 `clip`、原版轮廓、挖掘/放置/中键拾取、挖掘反作用力、铲水反作用力；
 - 结构按 26 邻接自动分裂，零质量体自动移除；
