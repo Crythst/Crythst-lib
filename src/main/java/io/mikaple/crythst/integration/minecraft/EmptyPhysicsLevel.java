@@ -21,7 +21,9 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
@@ -58,6 +60,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.redstone.Orientation;
 import net.minecraft.world.ticks.LevelChunkTicks;
 import net.minecraft.world.ticks.ScheduledTick;
+import net.minecraft.world.ticks.TickPriority;
 import net.minecraft.world.level.storage.DerivedLevelData;
 import net.minecraft.world.level.storage.ServerLevelData;
 import net.minecraft.world.phys.Vec3;
@@ -867,6 +870,161 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     blockEntity.saveWithFullMetadata(level.registryAccess()));
         }
         return data == null ? Map.of() : data;
+    }
+
+    /**
+     * Captures pending scheduled block/fluid ticks for a structure. The
+     * auxiliary level is transient, so without this a repeater/observer/fluid
+     * delay that was active when the world was saved is lost on re-entry.
+     *
+     * @return a tag suitable for {@link #applyScheduledTicks}; empty when the
+     *         structure has no region or no pending ticks
+     */
+    public CompoundTag captureScheduledTicks(PhysicsStructure structure) {
+        final CompoundTag root = new CompoundTag();
+        if (closed || structure == null || structure.closed()) {
+            return root;
+        }
+        final Region region = regions.get(structure.body().id());
+        if (region == null) {
+            return root;
+        }
+        final long now = level.getGameTime();
+        final ListTag blocks = new ListTag();
+        final ListTag fluids = new ListTag();
+        for (long chunkKey : region.chunks) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null) {
+                continue;
+            }
+            if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
+                ticks.getAll().forEach(tick -> addSavedTick(blocks, region, now,
+                        tick.pos(), BuiltInRegistries.BLOCK.getKey(tick.type()).toString(),
+                        tick.triggerTick(), tick.priority(), tick.subTickOrder()));
+            }
+            if (chunk.getFluidTicks() instanceof LevelChunkTicks<?> rawFluids) {
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawFluids;
+                ticks.getAll().forEach(tick -> addSavedTick(fluids, region, now,
+                        tick.pos(), BuiltInRegistries.FLUID.getKey(tick.type()).toString(),
+                        tick.triggerTick(), tick.priority(), tick.subTickOrder()));
+            }
+        }
+        if (!blocks.isEmpty()) {
+            root.put("Block", blocks);
+        }
+        if (!fluids.isEmpty()) {
+            root.put("Fluid", fluids);
+        }
+        return root;
+    }
+
+    private static void addSavedTick(ListTag list, Region region, long now,
+                                     BlockPos pos, String type, long triggerTick,
+                                     TickPriority priority, long subTickOrder) {
+        final int localX = pos.getX() - region.baseX;
+        final int localY = pos.getY() - region.baseY;
+        final int localZ = pos.getZ() - region.baseZ;
+        if (localX < 0 || localY < 0 || localZ < 0
+                || localX >= region.sizeX || localY >= region.sizeY
+                || localZ >= region.sizeZ) {
+            return;
+        }
+        final CompoundTag entry = new CompoundTag();
+        entry.putInt("X", localX);
+        entry.putInt("Y", localY);
+        entry.putInt("Z", localZ);
+        entry.putString("Type", type);
+        entry.putLong("Delay", Math.max(0L, triggerTick - now));
+        entry.putInt("Priority", priority.getValue());
+        entry.putLong("Order", subTickOrder);
+        list.add(entry);
+    }
+
+    /**
+     * Restores pending scheduled ticks captured by
+     * {@link #captureScheduledTicks}. Must run after {@link #addStructure}, so
+     * the chunk tick containers exist.
+     */
+    public void applyScheduledTicks(PhysicsStructure structure, CompoundTag root) {
+        if (closed || structure == null || root == null
+                || structure.closed()) {
+            return;
+        }
+        final Region region = regions.get(structure.body().id());
+        if (region == null) {
+            return;
+        }
+        final long now = level.getGameTime();
+        clearRegionTicks(region);
+        restoreTickList(root.getListOrEmpty("Block"), true, region, now);
+        restoreTickList(root.getListOrEmpty("Fluid"), false, region, now);
+    }
+
+    private void clearRegionTicks(Region region) {
+        for (long chunkKey : region.chunks) {
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null) {
+                continue;
+            }
+            if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
+                ticks.removeIf(tick -> inRegion(region, tick.pos()));
+            }
+            if (chunk.getFluidTicks() instanceof LevelChunkTicks<?> rawFluids) {
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawFluids;
+                ticks.removeIf(tick -> inRegion(region, tick.pos()));
+            }
+        }
+    }
+
+    private static boolean inRegion(Region region, BlockPos pos) {
+        final int x = pos.getX() - region.baseX;
+        final int y = pos.getY() - region.baseY;
+        final int z = pos.getZ() - region.baseZ;
+        return x >= 0 && y >= 0 && z >= 0
+                && x < region.sizeX && y < region.sizeY && z < region.sizeZ;
+    }
+
+    private void restoreTickList(ListTag list, boolean blockTicks, Region region, long now) {
+        for (int i = 0; i < list.size(); i++) {
+            final CompoundTag entry = list.getCompoundOrEmpty(i);
+            if (entry.isEmpty()) {
+                continue;
+            }
+            final Identifier id = Identifier.tryParse(entry.getStringOr("Type", ""));
+            if (id == null) {
+                continue;
+            }
+            final BlockPos pos = new BlockPos(
+                    region.baseX + entry.getIntOr("X", 0),
+                    region.baseY + entry.getIntOr("Y", 0),
+                    region.baseZ + entry.getIntOr("Z", 0));
+            ensureChunk(pos);
+            final long delay = Math.max(0L, entry.getLongOr("Delay", 0L));
+            final TickPriority priority = TickPriority.byValue(
+                    entry.getIntOr("Priority", TickPriority.NORMAL.getValue()));
+            final long order = entry.getLongOr("Order", 0L);
+            if (blockTicks) {
+                final Block block = BuiltInRegistries.BLOCK.getOptional(id).orElse(null);
+                if (block != null) {
+                    level.getBlockTicks().schedule(
+                            new ScheduledTick<>(block, pos, now + delay, priority, order));
+                }
+            } else {
+                final Fluid fluid = BuiltInRegistries.FLUID.getOptional(id).orElse(null);
+                if (fluid != null) {
+                    level.getFluidTicks().schedule(
+                            new ScheduledTick<>(fluid, pos, now + delay, priority, order));
+                }
+            }
+        }
     }
 
     /**

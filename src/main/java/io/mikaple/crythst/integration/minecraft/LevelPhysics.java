@@ -742,6 +742,24 @@ public final class LevelPhysics implements AutoCloseable {
         }
     }
 
+    /**
+     * Captures pending block/fluid scheduled ticks for persistence. No-op when
+     * the auxiliary void level is unavailable.
+     */
+    public net.minecraft.nbt.CompoundTag captureScheduledTicks(PhysicsStructure structure) {
+        return subLevel == null
+                ? new net.minecraft.nbt.CompoundTag()
+                : subLevel.captureScheduledTicks(structure);
+    }
+
+    /** Re-schedules ticks captured by {@link #captureScheduledTicks}. */
+    public void applyScheduledTicks(PhysicsStructure structure,
+                                    net.minecraft.nbt.CompoundTag ticks) {
+        if (subLevel != null) {
+            subLevel.applyScheduledTicks(structure, ticks);
+        }
+    }
+
     public void invalidateTerrainAt(net.minecraft.core.BlockPos pos) {
         terrain.invalidateAt(pos);
     }

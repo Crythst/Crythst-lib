@@ -176,6 +176,7 @@ public final class StructureSavedData extends SavedData {
                 applyBlockStates(structure, saved.volume());
                 StructureBlockEntityData.put(structure, saved.blockEntities());
                 physics.applyBlockEntities(structure, saved.blockEntities());
+                physics.applyScheduledTicks(structure, saved.scheduledTicks());
                 live.put(id, structure);
                 identities.put(structure, id);
             } catch (Throwable t) {
@@ -213,7 +214,8 @@ public final class StructureSavedData extends SavedData {
                         structure.pose(),
                         SavedStructureVolume.fromStructure(structure),
                         captureBlockEntities(structure),
-                        StructureParameters.from(structure));
+                        StructureParameters.from(structure),
+                        physics.captureScheduledTicks(structure));
                 captured.put(id, saved.toTag());
             } catch (Throwable t) {
                 Crythst.LOGGER.error("Could not capture Crythst structure #{} in {}",

@@ -31,7 +31,8 @@ public record SavedStructure(
         Transform3d pose,
         SavedStructureVolume volume,
         Map<BlockPos, CompoundTag> blockEntities,
-        StructureParameters parameters
+        StructureParameters parameters,
+        CompoundTag scheduledTicks
 ) {
     public SavedStructure {
         Objects.requireNonNull(id, "id");
@@ -48,6 +49,14 @@ public record SavedStructure(
             }
         }
         blockEntities = Collections.unmodifiableMap(copied);
+        scheduledTicks = scheduledTicks == null ? new CompoundTag() : scheduledTicks.copy();
+    }
+
+    /** Backward-compatible constructor without pending scheduled ticks. */
+    public SavedStructure(UUID id, Transform3d pose, SavedStructureVolume volume,
+                          Map<BlockPos, CompoundTag> blockEntities,
+                          StructureParameters parameters) {
+        this(id, pose, volume, blockEntities, parameters, new CompoundTag());
     }
 
     public StructureDef toStructureDef() {
@@ -84,6 +93,9 @@ public record SavedStructure(
             blockEntityTags.add(blockEntityTag);
         }
         tag.put("BlockEntities", blockEntityTags);
+        if (!scheduledTicks.isEmpty()) {
+            tag.put("ScheduledTicks", scheduledTicks.copy());
+        }
         return tag;
     }
 
@@ -129,6 +141,7 @@ public record SavedStructure(
 
         final StructureParameters parameters = StructureParameters.fromTag(
                 tag.getCompoundOrEmpty("Parameters"));
-        return new SavedStructure(id, pose, volume, blockEntities, parameters);
+        return new SavedStructure(id, pose, volume, blockEntities, parameters,
+                tag.getCompoundOrEmpty("ScheduledTicks"));
     }
 }
