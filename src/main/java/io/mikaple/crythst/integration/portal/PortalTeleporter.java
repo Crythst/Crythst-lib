@@ -72,6 +72,13 @@ public final class PortalTeleporter {
     private static final double MAX_CLIENT_TRAVERSAL_SPEED = 10.0;
     private static final double MAX_CLIENT_TRAVERSAL_SPEED_SQUARED =
             MAX_CLIENT_TRAVERSAL_SPEED * MAX_CLIENT_TRAVERSAL_SPEED;
+    /**
+     * A client-only crossing prediction is accepted only when its intersection
+     * point is within this radius of the server player's body centre. This
+     * covers network latency without letting a packet claim a crossing from a
+     * free-floating position anywhere near the portal.
+     */
+    private static final double MAX_CLIENT_CROSSING_DISTANCE = 2.5;
 
     private static final Map<UUID, Integer> ENTITY_READY = new ConcurrentHashMap<>();
     private static final Map<String, Integer> BODY_READY = new ConcurrentHashMap<>();
@@ -140,9 +147,32 @@ public final class PortalTeleporter {
                 payload.currentCentre().z)) > 64.0) {
             return;
         }
-        final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(
+
+        // Prefer the server's own swept segment. The client samples are only a
+        // prediction/timing hint: if the server already saw the movement, its
+        // segment is authoritative. Otherwise require the claimed intersection
+        // to be physically close to the server player.
+        final Vector3d serverPrevious = previousTraversalPoint(player);
+        final Vector3d serverCurrent = traversalPoint(player);
+        final PortalCrossing.Crossing serverCrossing = PortalCrossing.findCrossing(
+                portal.shape(), serverPrevious, serverCurrent);
+        final PortalCrossing.Crossing clientCrossing = PortalCrossing.findCrossing(
                 portal.shape(), payload.previousCentre(), payload.currentCentre());
-        if (crossing == null || !crossing.inside()) {
+        final boolean serverInside = serverCrossing != null && serverCrossing.inside();
+        final boolean clientInside = clientCrossing != null && clientCrossing.inside();
+        final Vec3 serverCentre = player.getBoundingBox().getCenter();
+        final boolean accepted = PortalTraversalAuthority.accepts(
+                serverInside, clientInside,
+                clientCrossing == null ? null : clientCrossing.point(),
+                new Vector3d(serverCentre.x, serverCentre.y, serverCentre.z),
+                MAX_CLIENT_CROSSING_DISTANCE);
+        if (!accepted) {
+            if (clientInside) {
+                // The client claims a crossing the server cannot corroborate
+                // and is too far from the authoritative body centre. Undo the
+                // local prediction instead of leaving a rubber-band.
+                correctPlayer(player);
+            }
             return;
         }
         final int tick = server.getTickCount();
@@ -153,22 +183,25 @@ public final class PortalTeleporter {
 
         final PortalTransform transform =
                 PortalTransform.between(portal.plane(), destination.plane());
-        // Derive the eye from the validated body centre and the server's own
-        // dimensions. The packet's eye is only a proximity check; using it for
-        // placement would let a client shift the destination by several blocks.
-        final Vector3d centre = payload.currentCentre();
-        final double halfHeight = player.getBbHeight() * 0.5;
+        // Placement, velocity and rotation come from the server player, never
+        // from a client-supplied target vector.
+        final Vec3 serverEyePos = player.getEyePosition();
         final Vector3d serverEye = new Vector3d(
-                centre.x, centre.y - halfHeight + player.getEyeHeight(), centre.z);
+                serverEyePos.x, serverEyePos.y, serverEyePos.z);
         final Vector3d feet = PortalTeleportMath.playerFeetForTransformedEye(
                 transform, serverEye, player.getEyeHeight());
-        final Vector3d velocity = transform.transformDirection(payload.velocity());
+        Vec3 serverMovement = player.getKnownMovement();
+        if (serverMovement.lengthSqr() < 1.0e-8) {
+            serverMovement = player.getDeltaMovement();
+        }
+        final Vector3d velocity = transform.transformDirection(new Vector3d(
+                serverMovement.x, serverMovement.y, serverMovement.z));
         final double speedSquared = velocity.lengthSquared();
         if (speedSquared > MAX_CLIENT_TRAVERSAL_SPEED_SQUARED) {
             velocity.mul(MAX_CLIENT_TRAVERSAL_SPEED / Math.sqrt(speedSquared));
         }
         final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
-                PortalTransform.viewDirection(payload.yaw(), payload.pitch())));
+                PortalTransform.viewDirection(player.getYRot(), player.getXRot())));
         if (player.connection != null) {
             player.connection.teleport(new PositionMoveRotation(
                     new Vec3(feet.x, feet.y, feet.z),
@@ -181,6 +214,19 @@ public final class PortalTeleporter {
         player.setDeltaMovement(velocity.x, velocity.y, velocity.z);
         player.setOldPosAndRot();
         ENTITY_READY.put(player.getUUID(), tick + COOLDOWN_TICKS);
+    }
+
+    /** Sends the authoritative server pose to undo an unverifiable prediction. */
+    private static void correctPlayer(ServerPlayer player) {
+        if (player.connection == null) {
+            return;
+        }
+        player.connection.teleport(new PositionMoveRotation(
+                player.position(),
+                player.getDeltaMovement(),
+                player.getYRot(),
+                player.getXRot()), Set.<Relative>of());
+        player.setOldPosAndRot();
     }
 
     /** Fabric {@code END_SERVER_TICK} callback. */

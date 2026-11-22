@@ -1,6 +1,7 @@
 package io.mikaple.crythst.client.render.portal;
 
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.world.phys.Vec3;
@@ -23,6 +24,7 @@ record PortalRenderData(
         Matrix4f screenViewProjection,
         Vec3 screenCameraPosition,
         PortalMaskGeometry.Mask mask,
+        ChunkSectionsToRender chunkSections,
         int layer,
         int parentLayer,
         int sectionCount) {

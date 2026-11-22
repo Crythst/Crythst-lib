@@ -16,6 +16,7 @@ import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.renderpearl.api.commands.RenderPassDescriptor;
 import com.mojang.renderpearl.api.textures.FilterMode;
 import com.mojang.renderpearl.api.textures.GpuSampler;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 import io.mikaple.crythst.mixin.client.PortalCameraAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
@@ -42,7 +43,6 @@ import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.util.ARGB;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.phys.Vec3;
-import org.joml.Matrix4f;
 import org.joml.Matrix4fStack;
 import org.joml.Vector4f;
 
@@ -223,7 +223,7 @@ final class PortalRenderPass {
 
         final LayerTargets targets = targetsFor(layer.layer(), main.width, main.height);
         final PortalMaskGeometry.Mask mask = layer.mask();
-        if (targets == null || mask.isEmpty()) {
+        if (targets == null || mask.isEmpty() || layer.chunkSections() == null) {
             return;
         }
 
@@ -235,8 +235,14 @@ final class PortalRenderPass {
 
         boolean completed = false;
         try {
-        // 2. Build the opening mask.
+        // 2. Build the opening mask, depth-tested against the pre-layer scene
+        // depth. Only pixels where the portal plane is actually the visible
+        // surface are marked.
         drawMask(encoder, targets, mask);
+        // 2b. Clear depth to reverse-Z far only through the verified polygon.
+        // Entry-world occluders outside the mask keep their depth until the
+        // final masked depth restore.
+        drawDepthClear(encoder, main, mask);
 
         // 3. Set up destination camera/fog/projection. The real Camera is
         // temporarily aimed at the destination only so FogRenderer can use the
@@ -273,11 +279,12 @@ final class PortalRenderPass {
         RenderSystem.setShaderFog(fogSlice);
         updateGlobalSettings(minecraft, layer.state(), main);
 
-        // 4. Clear only the portal rectangle. This is the "depth cleared inside
-        // the opening" step; the composite later restores outside pixels.
-        encoder.clearColorAndDepthTextures(
-                main.getColorTexture(), fogColor, main.getDepthTexture(), 0.0,
-                mask.minX(), mask.minY(), mask.width(), mask.height(), 0);
+        // 4. Fill colour with the destination fog. This is a full-frame clear,
+        // but the composite restores every pixel outside the opening, so it
+        // cannot leak. Depth is intentionally untouched here: the polygon
+        // depth-clear above only opened the verified portal pixels, while the
+        // final depth restore puts the pre-layer depth back outside the mask.
+        encoder.clearColorTexture(main.getColorTexture(), fogColor);
 
         // 5. Destination sky. SkyRenderer creates its own full-screen pass, so
         // the snapshot/composite restores the screen outside the opening.
@@ -288,13 +295,15 @@ final class PortalRenderPass {
         }
 
         // 6. Destination world into the main colour+depth attachments.
-        renderDestinationWorld(minecraft, levelRenderer, layer, main, mask, fog);
+        renderDestinationWorld(minecraft, levelRenderer, layer, main, mask);
 
         // 7. Composite: keep destination pixels inside the opening, restore the
         // snapshot outside it. Layer 2 also multiplies by the parent mask.
         composite(minecraft, main, targets, layer);
-        encoder.copyTextureToTexture(targets.snapshot.getDepthTexture(), main.getDepthTexture(),
-                0, 0, 0, 0, 0, main.width, main.height);
+        // 8. Restore snapshot depth outside the final mask only. Destination
+        // depth survives inside the opening, which is what lets layer 2 be
+        // occluded by layer 1's destination geometry.
+        restoreDepth(encoder, main, targets, layer);
         completed = true;
         } finally {
             if (!completed) {
@@ -322,24 +331,16 @@ final class PortalRenderPass {
 
     private void renderDestinationWorld(Minecraft minecraft, LevelRenderer levelRenderer,
                                         PortalRenderData layer, RenderTarget main,
-                                        PortalMaskGeometry.Mask mask, FogData fog) {
+                                        PortalMaskGeometry.Mask mask) {
         final LevelRenderState state = layer.state();
         final OptionsRenderState options = minecraft.gameRenderer
                 .gameRenderState().optionsRenderState;
-        final var visible = levelRenderer.visibleSections();
-        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection>
-                savedVisible = List.copyOf(visible);
-        final List<net.minecraft.client.renderer.chunk.SectionRenderDispatcher.RenderSection>
-                savedNearby = List.copyOf(levelRenderer.nearbyVisibleSections());
         FeatureRenderDispatcher.PreparedFrame featureFrame = null;
         try {
             if (featureDispatcher == null) {
                 // Rebuild after a failed prepare on a previous layer/frame.
                 ensureResources();
             }
-            visible.clear();
-            visible.addAll(layer.sections());
-
             final SubmitNodeStorage submits = new SubmitNodeStorage();
             submits.setUseImprovedTransparency(false);
             submitFeatures(minecraft, levelRenderer, state, submits);
@@ -371,20 +372,9 @@ final class PortalRenderPass {
             levelRenderer.weatherEffectRenderer().prepare(
                     state.cameraRenderState.pos, state.weatherRenderState);
 
-            final Matrix4f terrainMatrix = new Matrix4f(
-                    state.cameraRenderState.viewRotationMatrix);
-            // Match the main pass's chunk-render mode. DynamicGpuData keeps ONE
-            // chunk-section storage: calling prepareChunkRenders() while the main
-            // pass used prepareChunkRendersIndirect() (or vice versa) closes and
-            // recreates that storage at initial capacity every frame, producing
-            // the endless "Resizing Chunk Sections UBO/Instanced" log spam and
-            // per-frame buffer churn.
-            final ChunkSectionsToRender chunkSections =
-                    levelRenderer.isChunkRenderingUsingMultiDrawIndirect()
-                            ? levelRenderer.prepareChunkRendersIndirect(terrainMatrix,
-                                    !minecraft.gameRenderer.useImprovedTransparency())
-                            : levelRenderer.prepareChunkRenders(terrainMatrix,
-                                    !minecraft.gameRenderer.useImprovedTransparency());
+            // Prepared once during extraction with the dedicated portal section
+            // storage; no prepareChunkRenders() in the framegraph pass.
+            final ChunkSectionsToRender chunkSections = layer.chunkSections();
             final GpuSampler sampler = RenderSystem.getSamplerCache()
                     .getClampToEdge(FilterMode.LINEAR);
             final var blockAtlas = minecraft.getTextureManager()
@@ -420,10 +410,6 @@ final class PortalRenderPass {
             if (featureFrame != null) {
                 featureFrame.close();
             }
-            visible.clear();
-            visible.addAll(savedVisible);
-            levelRenderer.nearbyVisibleSections().clear();
-            levelRenderer.nearbyVisibleSections().addAll(savedNearby);
         }
     }
 
@@ -469,6 +455,7 @@ final class PortalRenderPass {
         final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
                         () -> "Crythst portal mask")
                 .withColorAttachment(targets.mask.getColorTextureView())
+                .withDepthAttachment(targets.snapshot.getDepthTextureView())
                 .withRenderArea(new RenderPass.RenderArea(
                         mask.minX(), mask.minY(), mask.width(), mask.height()))
                 .build();
@@ -481,12 +468,72 @@ final class PortalRenderPass {
         }
     }
 
-    private void composite(Minecraft minecraft, RenderTarget main, LayerTargets targets,
-                           PortalRenderData layer) {
+    /**
+     * Writes reverse-Z far depth through the already-verified opening polygon.
+     * Draws the same clipped geometry as the mask; color writes are masked off.
+     * Occluder pixels outside the polygon keep their pre-layer depth until the
+     * final masked depth restore.
+     */
+    private void drawDepthClear(CommandEncoder encoder, RenderTarget main,
+                                PortalMaskGeometry.Mask mask) {
+        final int bytes = mask.triangles().length * Float.BYTES;
+        if (bytes <= 0 || bytes > maskBufferBytes) {
+            return;
+        }
+        final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
+                        () -> "Crythst portal depth clear")
+                .withColorAttachment(main.getColorTextureView())
+                .withDepthAttachment(main.getDepthTextureView())
+                .withRenderArea(new RenderPass.RenderArea(
+                        mask.minX(), mask.minY(), mask.width(), mask.height()))
+                .build();
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder().createRenderPass(descriptor)) {
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
+                    PortalPassRenderTypes.depthClear()));
+            renderPass.setVertexBuffer(0, maskBuffer.slice(0, bytes));
+            renderPass.draw(mask.vertexCount(), 1, 0, 0);
+        }
+    }
+
+    /**
+     * Restores snapshot depth only outside the combined final mask. Inside the
+     * opening the destination depth is kept, so a child layer is occluded by
+     * parent-layer geometry instead of always clearing the rectangle.
+     */
+    private void restoreDepth(CommandEncoder encoder, RenderTarget main,
+                              LayerTargets targets, PortalRenderData layer) {
+        final GpuTextureView parentMask = parentMask(main, targets, layer);
+        final GpuSampler nearest = RenderSystem.getSamplerCache()
+                .getClampToEdge(FilterMode.NEAREST);
+        final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
+                        () -> "Crythst portal depth restore")
+                .withColorAttachment(main.getColorTextureView())
+                .withDepthAttachment(main.getDepthTextureView())
+                .build();
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder().createRenderPass(descriptor)) {
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
+                    PortalPassRenderTypes.depthRestore()));
+            renderPass.setUniform("Sampler0",
+                    targets.snapshot.getDepthTextureView(), nearest);
+            renderPass.setUniform("Sampler1", targets.mask.getColorTextureView(), nearest);
+            renderPass.setUniform("Sampler2", parentMask, nearest);
+            renderPass.draw(3, 1, 0, 0);
+        }
+    }
+
+    private GpuTextureView parentMask(RenderTarget main, LayerTargets targets,
+                                      PortalRenderData layer) {
         final LayerTargets parent = layer.parentLayer() > 0
                 ? targetsFor(layer.parentLayer(), main.width, main.height) : targets;
-        final var parentMask = parent != null && parent != targets
+        return parent != null && parent != targets
                 ? parent.mask.getColorTextureView() : targets.mask.getColorTextureView();
+    }
+
+    private void composite(Minecraft minecraft, RenderTarget main, LayerTargets targets,
+                           PortalRenderData layer) {
+        final var parentMask = parentMask(main, targets, layer);
         final GpuSampler nearest = RenderSystem.getSamplerCache()
                 .getClampToEdge(FilterMode.NEAREST);
         try (RenderPass renderPass = RenderSystem.getDevice()

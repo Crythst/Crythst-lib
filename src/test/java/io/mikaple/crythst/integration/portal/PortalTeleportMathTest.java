@@ -107,6 +107,16 @@ class PortalTeleportMathTest {
     }
 
     @Test
+    void clientCrossingMustBeWithinTheServerRadius() {
+        final Vector3d centre = new Vector3d(0.0, 64.0, 0.0);
+        assertTrue(PortalTeleportMath.isWithin(new Vector3d(1.5, 64.0, 0.0), centre, 2.5));
+        assertTrue(PortalTeleportMath.isWithin(new Vector3d(0.0, 66.5, 0.0), centre, 2.5));
+        assertFalse(PortalTeleportMath.isWithin(new Vector3d(2.6, 64.0, 0.0), centre, 2.5));
+        assertFalse(PortalTeleportMath.isWithin(new Vector3d(0.0, 64.0, -2.6), centre, 2.5));
+        assertFalse(PortalTeleportMath.isWithin(null, centre, 2.5));
+    }
+
+    @Test
     void sweptTestFindsFastCrossings() {
         final double t = PortalTeleportMath.segmentPlaneParameter(
                 new Vector3d(0.0, 0.0, 50.0),

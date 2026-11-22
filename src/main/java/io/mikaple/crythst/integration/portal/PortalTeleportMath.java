@@ -80,6 +80,17 @@ public final class PortalTeleportMath {
         return normal.mul(side);
     }
 
+    /** True when {@code point} lies within {@code radius} of {@code centre}. */
+    public static boolean isWithin(Vector3dc point, Vector3dc centre, double radius) {
+        if (point == null || centre == null || !Double.isFinite(radius) || radius < 0.0) {
+            return false;
+        }
+        final double dx = point.x() - centre.x();
+        final double dy = point.y() - centre.y();
+        final double dz = point.z() - centre.z();
+        return dx * dx + dy * dy + dz * dz <= radius * radius;
+    }
+
     /** True when every component of {@code vector} is finite. */
     public static boolean isFinite(Vector3dc vector) {
         return vector != null

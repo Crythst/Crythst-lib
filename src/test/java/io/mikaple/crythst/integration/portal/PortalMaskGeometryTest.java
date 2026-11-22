@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.portal;
 
 import io.mikaple.crythst.client.render.portal.PortalMaskGeometry;
+import io.mikaple.crythst.client.render.portal.PortalMaskPolicy;
 import org.joml.Matrix4f;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.Test;
@@ -18,8 +19,9 @@ class PortalMaskGeometryTest {
     }
 
     private static Matrix4f projection() {
+        // Same reverse-Z convention as the client (near -> 1, far -> 0).
         return new Matrix4f().setPerspective(
-                (float) Math.toRadians(70.0), 16.0f / 9.0f, 0.05f, 1000.0f, true);
+                (float) Math.toRadians(70.0), 16.0f / 9.0f, 1000.0f, 0.05f, true);
     }
 
     @Test
@@ -70,6 +72,41 @@ class PortalMaskGeometryTest {
         final PortalMaskGeometry.Mask mask = PortalMaskGeometry.build(
                 sideOn, projection(), new Vector3d(0.1, 0.0, 0.0), 1920, 1080);
         assertTrue(mask.vertexCount() >= 3);
+    }
+
+    @Test
+    void portalPlaneDepthIsProjectedInReverseZ() {
+        final PortalPlane nearPlane = new PortalPlane(
+                new Vector3d(0.0, 0.0, 8.0),
+                new Vector3d(0.0, 0.0, 1.0),
+                new Vector3d(1.0, 0.0, 0.0), 2.0, 3.0);
+        final PortalPlane farPlane = new PortalPlane(
+                new Vector3d(0.0, 0.0, -8.0),
+                new Vector3d(0.0, 0.0, 1.0),
+                new Vector3d(1.0, 0.0, 0.0), 2.0, 3.0);
+        final PortalMaskGeometry.Mask nearMask = PortalMaskGeometry.build(
+                PortalShape.rectangle(nearPlane), projection(),
+                new Vector3d(0.0, 0.0, 10.0), 1920, 1080);
+        final PortalMaskGeometry.Mask farMask = PortalMaskGeometry.build(
+                PortalShape.rectangle(farPlane), projection(),
+                new Vector3d(0.0, 0.0, 10.0), 1920, 1080);
+        assertTrue(nearMask.vertexCount() >= 3);
+        assertTrue(farMask.vertexCount() >= 3);
+        final float nearZ = nearMask.triangles()[2];
+        final float farZ = farMask.triangles()[2];
+        assertTrue(nearZ > farZ, "reverse-Z depth must decrease with distance");
+        assertTrue(nearZ > 0.0f && nearZ < 1.0f);
+        assertTrue(farZ > 0.0f && farZ < 1.0f);
+    }
+
+    @Test
+    void maskDepthClassificationIsReverseZ() {
+        // Portal plane is in front of the scene pixel -> visible.
+        assertTrue(PortalMaskPolicy.depthTestPasses(0.80f, 0.70f));
+        // Scene pixel (wall) is in front of the portal plane -> occluded.
+        assertTrue(!PortalMaskPolicy.depthTestPasses(0.60f, 0.70f));
+        // Coplanar passes.
+        assertTrue(PortalMaskPolicy.depthTestPasses(0.50f, 0.50f));
     }
 
     @Test

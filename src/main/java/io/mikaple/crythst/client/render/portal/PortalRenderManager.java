@@ -3,6 +3,7 @@ package io.mikaple.crythst.client.render.portal;
 import com.mojang.blaze3d.framegraph.FrameGraphBuilder;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.resource.ResourceHandle;
+import com.mojang.blaze3d.systems.RenderSystem;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Camera;
@@ -11,8 +12,11 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
+import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -46,6 +50,8 @@ public final class PortalRenderManager {
 
     private final PortalVisibility visibility = new PortalVisibility();
     private final PortalRenderPass pass = new PortalRenderPass();
+    /** Lazily created on the render thread; dedicated per-frame section storage. */
+    private PortalChunkSections chunkSections;
 
     private volatile boolean registered;
     private volatile boolean destinationExtracting;
@@ -160,6 +166,18 @@ public final class PortalRenderManager {
         }
         final int width = mainTarget.width;
         final int height = mainTarget.height;
+        if (chunkSections == null) {
+            chunkSections = new PortalChunkSections();
+        }
+        // One ring rotation per main extraction. Keeping this storage separate
+        // from RenderSystem.getDynamicUniforms() avoids fighting the main
+        // pass's mapped/instanced Chunk Sections UBO and its resize log spam.
+        chunkSections.beginFrame();
+        final OptionsRenderState options = gameRenderer.gameRenderState().optionsRenderState;
+        final var blockAtlas = minecraft.getTextureManager()
+                .getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+        final int atlasWidth = blockAtlas.getWidth(0);
+        final int atlasHeight = blockAtlas.getHeight(0);
         final Vector3d cameraPosition = new Vector3d(
                 mainCamera.pos.x, mainCamera.pos.y, mainCamera.pos.z);
 
@@ -205,9 +223,13 @@ public final class PortalRenderManager {
             if (mask.isEmpty()) {
                 continue;
             }
+            final ChunkSectionsToRender chunkRender = chunkSections.prepare(
+                    levelRenderer.sectionRenderDispatcher(), view.viewRotation(),
+                    extractedState.sections(), atlasWidth, atlasHeight, options);
             extracted.add(new PortalRenderData(portal, view, extractedState.state(),
                     extractedState.sections(), new Matrix4f(view.mainViewProjection()),
-                    mainCamera.pos, mask, 1, 0, extractedState.sectionCount()));
+                    mainCamera.pos, mask, chunkRender, 1, 0,
+                    extractedState.sectionCount()));
             rendered.add(portal.id());
             sectionCount += extractedState.sectionCount();
             rootsRendered++;
@@ -217,7 +239,8 @@ public final class PortalRenderManager {
             }
             final PortalRenderData child = extractChild(
                     minecraft, camera, deltaTracker, partialTick, level, levelRenderer,
-                    gameRenderer, portal, view, extractedState, rendered, width, height);
+                    gameRenderer, portal, view, extractedState, rendered, width, height,
+                    atlasWidth, atlasHeight, options);
             if (child != null) {
                 extracted.add(child);
                 sectionCount += child.sectionCount();
@@ -225,6 +248,11 @@ public final class PortalRenderManager {
             }
         }
 
+        if (!extracted.isEmpty()) {
+            // Grow the shared sequential index buffer during extraction, before
+            // any pass is recorded, instead of mid-framegraph.
+            RenderSystem.resizeAllAutoStorageIndexBuffers();
+        }
         layers = List.copyOf(extracted);
         lastVisiblePortals = rootsRendered;
         lastSectionCount = sectionCount;
@@ -240,7 +268,9 @@ public final class PortalRenderManager {
                                           GameRenderer gameRenderer, PortalSnapshot parent,
                                           PortalViewCamera parentView,
                                           PortalVisibility.Result parentState,
-                                          Set<UUID> rendered, int width, int height) {
+                                          Set<UUID> rendered, int width, int height,
+                                          int atlasWidth, int atlasHeight,
+                                          OptionsRenderState options) {
         final CameraRenderState parentCamera = parentState.state().cameraRenderState;
         final List<PortalSnapshot> candidates = new ArrayList<>();
         final Vector3d parentPosition = new Vector3d(
@@ -286,9 +316,12 @@ public final class PortalRenderManager {
             if (mask.isEmpty()) {
                 continue;
             }
+            final ChunkSectionsToRender chunkRender = chunkSections.prepare(
+                    levelRenderer.sectionRenderDispatcher(), childView.viewRotation(),
+                    childState.sections(), atlasWidth, atlasHeight, options);
             return new PortalRenderData(child, childView, childState.state(),
                     childState.sections(), screenViewProjection, parentCamera.pos,
-                    mask, 2, 1, childState.sectionCount());
+                    mask, chunkRender, 2, 1, childState.sectionCount());
         }
         return null;
     }
@@ -315,5 +348,9 @@ public final class PortalRenderManager {
     private void close() {
         layers = List.of();
         pass.close();
+        if (chunkSections != null) {
+            chunkSections.close();
+            chunkSections = null;
+        }
     }
 }

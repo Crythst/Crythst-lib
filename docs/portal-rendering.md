@@ -57,12 +57,19 @@ frame.execute
   └─ crythst_portals
        ├─ copy main colour+depth -> per-layer snapshot
        ├─ draw opening polygon -> per-layer RGBA8 mask
-       ├─ clear main colour+depth only in the portal screen rectangle
+       │    (depth-tested against the snapshot depth, reverse-Z)
+       ├─ draw the same polygon into main depth as far (WRITE_NONE colour)
+       ├─ clear main colour to destination fog (full frame; composite restores)
        ├─ SkyRenderer.render (destination sky/fog)
-       ├─ ChunkSectionsToRender + FeatureRenderDispatcher into main colour+depth
-       ├─ composite snapshot outside mask (parent mask for layer 2)
-       └─ copy snapshot depth back
+       ├─ pre-prepared ChunkSectionsToRender + FeatureRenderDispatcher
+       ├─ composite snapshot colour outside mask * parent mask
+       └─ depth-restore pass: snapshot depth outside mask * parent mask only
 ```
+
+The chunk draw groups are prepared once per frame during extraction into a
+dedicated mapped `DynamicGpuDataStorageMapped`, not during framegraph execution.
+That avoids the shared `DynamicGpuData` mapped/instanced storage being closed and
+recreated at capacity 2 every frame.
 
 The destination pass uses the following RenderPearl/Fabric API surface:
 
@@ -72,9 +79,10 @@ The destination pass uses the following RenderPearl/Fabric API surface:
 - `ChunkSectionsToRender.renderGroup` and `FeatureRenderDispatcher.PreparedFrame`
 - `SkyRenderer.render`, `FogRenderer`, `GlobalSettingsUniform`,
   `ProjectionMatrixBuffer`
-- `CommandEncoder.copyTextureToTexture` and
-  `CommandEncoder.clearColorAndDepthTextures` with a region
-- custom `RenderPipeline`s (`crythst:portal_mask`, `crythst:portal_composite`)
+- `CommandEncoder.copyTextureToTexture` and `CommandEncoder.clearColorTexture`
+- custom `RenderPipeline`s (`crythst:portal_mask`, `crythst:portal_depth_clear`,
+  `crythst:portal_depth_restore`, `crythst:portal_composite`)
+- `DepthStencilState` for the mask read-only depth test and the depth passes
 
 ## 3. Why the opening is a mask, not hardware stencil
 
@@ -94,13 +102,19 @@ There are no stencil compare, reference, write-mask or pass-op fields.
 `RenderPassDescriptor` likewise has only colour and depth attachments. Stencil
 formats exist in `GpuFormat`, but no pipeline state can use them.
 
-The implemented equivalent is a real per-pixel mask:
+The implemented equivalent is a real per-pixel, depth-tested mask:
 
-- the portal polygon is clipped in homogeneous space and triangulated,
-- the triangles are rasterized into an RGBA8 mask attachment,
+- the portal polygon is clipped in homogeneous space and triangulated; each
+  vertex carries the entry/parent plane's reverse-Z depth,
+- the triangles are rasterized into an RGBA8 mask attachment while depth-testing
+  against the per-layer depth snapshot with `GREATER_THAN_OR_EQUAL`,
+- the same polygon is drawn into the main depth as reverse-Z far, opening only
+  the verified portal pixels,
 - the destination world is drawn into the **main** colour+depth attachments,
 - a composite pass keeps destination pixels where the mask is set and restores
-  the snapshot elsewhere.
+  the snapshot colour elsewhere,
+- a depth-restore pass puts the snapshot depth back **outside** the final mask,
+  leaving destination depth inside it.
 
 This is a mask pass, not a texture quad. It is not described as hardware stencil
 in code or docs.
@@ -132,6 +146,11 @@ still required for distant or cross-dimension views.
 - Ancestor ids are excluded; over-limit children are not extracted.
 - Layer 2 multiplies its mask by layer 1's mask, so it cannot paint outside the
   outer opening.
+- Layer 2's mask is depth-tested against layer 1's *destination* depth (the
+  layer snapshot), so a wall in front of portal 2 occludes it instead of being
+  painted over.
+- Depth is restored only outside `mask2 * mask1`; layer 1's destination depth
+  survives inside the outer opening for layer 2 and later depth consumers.
 - The current cap is 2 layers. Supporting deeper chains would require baking the
   full ancestor-mask product into each layer or a stencil stack; the public
   RenderPearl mask path only has one parent-mask sampler.
@@ -158,11 +177,14 @@ Client (`PortalCrossingController`):
 - no mandatory fade; the legacy fade is opt-in (`-Dcrythst.portal.fade=true`).
 
 After predicting, the client sends a small `crythst:portal_traversal` intent
-packet containing the pre-transform swept samples. The server re-validates the
-polygon crossing and the player's proximity, then applies the rigid transform
-itself and sends `player.connection.teleport(...)`. It never accepts a target
-vector from the client. If its crossing result differs, the correction
-overwrites the prediction.
+packet containing the pre-transform swept samples. The server prefers its own
+swept segment reconstructed from `xo/yo/zo` + the current body centre. If the
+server has not yet received that movement (latency), it accepts the client
+prediction only when its intersection point is within 2.5 blocks of the
+authoritative body centre. Placement, velocity and rotation are read from the
+server player (`getEyePosition`, `getKnownMovement`/delta movement, yaw/pitch),
+never from a client-supplied target. Unverifiable predictions get an
+authoritative `player.connection.teleport(...)` correction.
 
 ## 7. Sync and moving portals
 
@@ -197,9 +219,9 @@ overwrites the prediction.
 | --- | --- |
 | Per-frame parallax through the opening | **Implemented.** Destination state is extracted and drawn every frame. |
 | Camera crossing without a snap / black screen | **Implemented for same-dimension links** by client prediction + server correction. Cross-dimension waits for the server transition. |
-| Per-pixel opening, not a rectangular texture | **Implemented** as a clipped polygon mask + composite. Hardware stencil is blocked by RenderPearl. |
+| Per-pixel opening, not a rectangular texture | **Implemented** as a clipped polygon mask, depth-tested against the per-layer scene depth, plus composite/depth-restore. Hardware stencil is blocked by RenderPearl. |
 | Destination entities / block entities / particles / sky / fog | **Implemented** for entities, block entities, particles, sky, fog, clouds, weather and world border. OIT/see-through/always-on-top features, block-breaking overlays, transient blocks and destination gizmos are not yet submitted. |
-| At least 2 recursion layers | **Implemented** (layer 1 + layer 2). |
+| At least 2 recursion layers | **Implemented** (layer 1 + layer 2); layer 2 is depth-tested against layer 1's destination depth and depth is restored only outside `mask2 * mask1`. |
 | Same-dimension + cross-dimension + multiplayer | Same-dimension render + teleport, cross-dimension teleport, multiplayer registry sync. Cross-dimension **rendering** is blocked (one `ClientLevel`). |
 | Moving portals | Pose updates and per-frame recapture work through `PortalManager.move`; automatic carrier binding is not implemented. |
 | Cost scales with opening pixels, not whole-world redraw | **Partial.** Destination terrain/entities are scissored to the opening bounds, but the destination section extraction is full visible-set extraction and the sky/snapshot are full-frame. See §10. |
@@ -209,17 +231,20 @@ overwrites the prediction.
 
 The destination draw itself is scoped:
 
-- `RenderPass.RenderArea` limits the terrain/entity/BE fill to the portal's
-  screen rectangle,
-- `clearColorAndDepthTextures` clears only that rectangle,
-- the mask is rasterized only in that rectangle.
+- `RenderPass.RenderArea` limits terrain/entity/BE fill and the mask/depth-clear
+  passes to the portal's screen rectangle,
+- the polygon depth clear writes only the clipped opening,
+- chunk draw groups are prepared once per frame during extraction with a
+  dedicated, pre-sized mapped storage (no per-frame UBO recreation/log spam).
 
-However, two operations remain full-frame:
+Three operations remain full-frame:
 
-1. **snapshot colour+depth** per rendered layer, because the composite needs the
-   pre-portal pixels;
+1. **snapshot colour+depth** per rendered layer, because composite/depth-restore
+   need the pre-layer pixels/depth;
 2. **destination sky**, because `SkyRenderer.render` creates its own full-screen
-   `RenderPass` and exposes no render-area parameter.
+   `RenderPass` and exposes no render-area parameter;
+3. **composite and depth-restore full-screen triangles** (the depth restore
+   discards inside the mask, but still visits the screen).
 
 The destination section extract also walks the destination visible set from the
 main `ViewArea`, so its CPU cost scales with destination sections rather than
@@ -256,7 +281,14 @@ opening pixels. Profiling on the target machine is required before claiming the
 Pure tests (no Minecraft bootstrap):
 
 - `PortalMaskGeometryTest`: front-facing mask, behind-camera rejection,
-  near-plane clipping, off-screen bounds.
+  near-plane clipping, off-screen bounds, reverse-Z plane depth, and depth
+  classification.
+- `PortalMaskPolicyTest`: layer mask product, destination keep/discard and
+  snapshot-depth restore policy.
+- `PortalTraversalAuthorityTest`: server-segment precedence and the 2.5-block
+  latency fallback for client predictions.
+- `PortalTeleportMathTest`: finite samples, server-body radius and transform
+  math.
 - `PortalRecursionTest`: layer increments, limit, ancestor exclusion.
 - `PortalCrossingSweepTest`: swept projectile-style segment, polygon rejection,
   exit safe zone.

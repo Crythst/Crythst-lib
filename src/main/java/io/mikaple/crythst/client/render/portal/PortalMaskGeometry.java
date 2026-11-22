@@ -26,7 +26,15 @@ public final class PortalMaskGeometry {
     private PortalMaskGeometry() {
     }
 
-    /** A convex screen-space mask polygon plus its integer pixel bounds. */
+    /**
+     * A convex screen-space mask polygon plus its integer pixel bounds.
+     *
+     * <p>{@code triangles} stores three floats per vertex: normalized device
+     * {@code x}, {@code y} and the portal plane's normalized depth {@code z}.
+     * The depth is the entry (or parent) plane's depth in the same projection
+     * that produced the scene depth buffer, so the mask pass can depth-test the
+     * opening against it with reverse-Z {@code GREATER_THAN_OR_EQUAL}.</p>
+     */
     public record Mask(float[] triangles, int minX, int minY, int width, int height) {
         public static final Mask EMPTY = new Mask(new float[0], 0, 0, 0, 0);
 
@@ -84,14 +92,19 @@ public final class PortalMaskGeometry {
         float minNdcY = Float.POSITIVE_INFINITY;
         float maxNdcX = Float.NEGATIVE_INFINITY;
         float maxNdcY = Float.NEGATIVE_INFINITY;
-        final float[] ndc = new float[clipped.size() * 2];
+        final float[] ndc = new float[clipped.size() * 3];
         for (int i = 0; i < clipped.size(); i++) {
             final Vector4f clip = clipped.get(i);
             final float invW = 1.0f / Math.max(clip.w, W_EPSILON);
             final float x = clamp(clip.x * invW, -1.0f, 1.0f);
             final float y = clamp(clip.y * invW, -1.0f, 1.0f);
-            ndc[i * 2] = x;
-            ndc[i * 2 + 1] = y;
+            // Reverse-Z: visible depth is 0 (far) .. 1 (near). Clamping avoids
+            // the rasterizer clipping the mask polygon at the near/far planes;
+            // entry-world geometry cannot exist outside [0, 1] anyway.
+            final float z = clamp(clip.z * invW, 0.0f, 1.0f);
+            ndc[i * 3] = x;
+            ndc[i * 3 + 1] = y;
+            ndc[i * 3 + 2] = z;
             minNdcX = Math.min(minNdcX, x);
             minNdcY = Math.min(minNdcY, y);
             maxNdcX = Math.max(maxNdcX, x);
@@ -107,13 +120,13 @@ public final class PortalMaskGeometry {
         for (int i = 1; i < clipped.size() - 1; i++) {
             triangles[cursor++] = ndc[0];
             triangles[cursor++] = ndc[1];
-            triangles[cursor++] = 0.0f;
-            triangles[cursor++] = ndc[i * 2];
-            triangles[cursor++] = ndc[i * 2 + 1];
-            triangles[cursor++] = 0.0f;
-            triangles[cursor++] = ndc[(i + 1) * 2];
-            triangles[cursor++] = ndc[(i + 1) * 2 + 1];
-            triangles[cursor++] = 0.0f;
+            triangles[cursor++] = ndc[2];
+            triangles[cursor++] = ndc[i * 3];
+            triangles[cursor++] = ndc[i * 3 + 1];
+            triangles[cursor++] = ndc[i * 3 + 2];
+            triangles[cursor++] = ndc[(i + 1) * 3];
+            triangles[cursor++] = ndc[(i + 1) * 3 + 1];
+            triangles[cursor++] = ndc[(i + 1) * 3 + 2];
         }
 
         final int x0 = clampPixel((int) Math.floor((minNdcX * 0.5f + 0.5f) * targetWidth), targetWidth);

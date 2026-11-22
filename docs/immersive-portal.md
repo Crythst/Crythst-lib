@@ -393,12 +393,15 @@ LevelRenderer.addMainPass
 PortalRenderPass（每个 portal/层）
   1. 保存主 color+depth 到该层 snapshot
   2. 把洞口多边形画到该层 mask
-  3. 只在洞口屏幕矩形内 clear 主 color+depth（depth=0）
-  4. 目标天空（SkyRenderer.render）
-  5. 目标地形/实体/方块实体/粒子/云/天气/世界边界
+  3. mask 对 snapshot depth 做 reverse-Z 深度测试；只标记真正可见的洞口像素
+  4. 用同一洞口多边形把主 depth 写成远平面（不写颜色）
+  5. 主 color 填目标雾色（全屏，composite 会恢复洞口外）
+  6. 目标天空（SkyRenderer.render）
+  7. 目标地形/实体/方块实体/粒子/云/天气/世界边界
      直接画进主 color+depth，renderArea 限制在洞口 bbox
-  6. composite：mask 内保留目标像素，mask 外恢复 snapshot
-  7. 把 snapshot depth 拷回主 depth
+  8. composite：mask 内保留目标像素，mask 外恢复 snapshot
+  9. depth-restore：只在 `mask * parentMask` 外把 snapshot depth 写回，
+     洞口内保留目标深度（供第 2 层遮挡）
 ```
 
 关键点：
@@ -439,10 +442,12 @@ stencil attachment 参数。因此本项目使用 **mask attachment + composite*
 已实现：
 
 - 同维度、同帧、同 FBO 的目标世界渲染；
-- 多边形逐像素洞口（mask + composite，非矩形贴图）；
+- 多边形逐像素洞口（对每层场景深度做 reverse-Z 深度测试的 mask + composite，
+  非矩形贴图）；
+- 洞口深度按多边形清理、`mask * parentMask` 外恢复 snapshot depth；
 - 出口平面斜近平面裁剪；
 - 目标端地形、实体、方块实体、粒子、天空、雾、云、天气、世界边界；
-- 2 层递归；
+- 2 层递归（第 2 层 mask 对第 1 层目标深度做深度测试，不会被第 1 层目标端几何穿透）；
 - 同维度客户端连续穿越预测 + 服务端权威校正；
 - 玩家/普通实体/投射物 swept 穿越、载具乘客、物理体 pose/速度/角速度、跨维度实体传送；
 - 10 tick 冷却与出口防回穿；
@@ -465,9 +470,10 @@ stencil attachment 参数。因此本项目使用 **mask attachment + composite*
 - **水/拴绳细节**：跨维度传送会解除拴绳；同维度保留，交由 vanilla leash tick。
 - **游戏内自动测试/截图回归**：本仓库没有 Fabric client-gametest，且本次未运行
   `runClient`；纯数学测试已覆盖 mask、递归、swept crossing、相机连续性和变换。
-- **性能预算**：目标 pass 的 fill 与洞口 bbox 相关，但 snapshot 和目标天空仍是
-  全屏；目标 section 提取仍按目标可见集成本。需要在目标机器上实测，不能凭空宣称
-  达到 3 ms。
+- **性能预算**：目标 pass 的 fill 与洞口 bbox 相关，但 snapshot、目标天空、
+  composite 和 depth-restore 仍是全屏；目标 section 提取仍按目标可见集成本。
+  chunk section UBO 已改为提取阶段写入的独立预分配存储，避免每帧重建和日志刷屏。
+  需要在目标机器上实测，不能凭空宣称达到 3 ms。
 
 ---
 
