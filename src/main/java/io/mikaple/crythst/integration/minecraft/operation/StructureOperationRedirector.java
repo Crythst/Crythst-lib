@@ -6,6 +6,7 @@ import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -32,10 +33,11 @@ import org.joml.Vector3d;
  * not replace raycasting or validation: callers still obtain the authoritative
  * {@link StructureBlockHitResult} from the normal server-side structure
  * raycast. The redirector only turns that hit into an auxiliary-level
- * {@link BlockHitResult} and invokes vanilla
- * {@link ServerPlayerGameMode#useItemOn} / {@link ServerPlayerGameMode#destroyBlock}
- * against the void level. It then asks {@link LevelPhysics} to mirror block
- * changes and project any spawned drops/entities back to the host world.</p>
+ * {@link BlockHitResult} and runs the vanilla block-use/placement logic with
+ * an explicit auxiliary {@code UseOnContext}, or
+ * {@link ServerPlayerGameMode#destroyBlock} against the void level. It then
+ * asks {@link LevelPhysics} to mirror block changes and project any spawned
+ * drops/entities back to the host world.</p>
  *
  * <p><strong>Feature flag:</strong> all entry points return
  * {@link Status#DISABLED} unless {@link CrythstConfig#useVoidLevelOperations}
@@ -156,9 +158,16 @@ public final class StructureOperationRedirector {
     }
 
     /**
-     * Invokes vanilla right-click use in the void level. This covers menu
-     * providers, {@code BlockState.useItemOn}, {@code useWithoutItem} and
-     * {@code ItemStack.useOn} through the real player game mode.
+     * Runs vanilla right-click logic in the void level.
+     *
+     * <p>{@link ServerPlayerGameMode#useItemOn} cannot be used directly here:
+     * its item branch builds a {@link net.minecraft.world.item.context.UseOnContext}
+     * from {@code player.level()} (the host world), so a {@code BlockItem}
+     * would try to place at the auxiliary coordinates inside the host level.
+     * This method mirrors the vanilla order with an explicit auxiliary
+     * {@code UseOnContext}: block use, empty-hand use, then
+     * {@code ItemStack#useOn}. Menus, buttons, doors, dispensers and block
+     * placement therefore all run against the live void block.</p>
      */
     public static Result useOn(ServerPlayer player, StructureBlockHitResult hit,
                                InteractionHand hand) {
@@ -183,11 +192,10 @@ public final class StructureOperationRedirector {
         final LookRestore look = stack.getItem() instanceof BlockItem
                 ? LookRestore.apply(player, mapped.structure()) : null;
         try {
-            final InteractionResult interaction = player.gameMode.useItemOn(
-                    player, mapped.live().level(), stack, hand, mapped.auxiliaryHit());
+            final InteractionResult interaction = performUse(player, mapped, stack, hand);
             return new Result(Status.HANDLED, interaction);
         } catch (Throwable t) {
-            Crythst.LOGGER.warn("Void-level useItemOn failed for structure body #{}",
+            Crythst.LOGGER.warn("Void-level use failed for structure body #{}",
                     mapped.structure().body().id(), t);
             return Result.of(Status.FAILED);
         } finally {
@@ -198,6 +206,69 @@ public final class StructureOperationRedirector {
                 physics.endAuxiliaryAudioProjection();
             }
             finish(player, hostLevel);
+        }
+    }
+
+    /**
+     * Vanilla use order with an explicit level, so every context resolves to
+     * the auxiliary copy instead of the host world.
+     */
+    private static InteractionResult performUse(ServerPlayer player, Mapped mapped,
+                                                ItemStack stack, InteractionHand hand) {
+        final ServerLevel auxiliary = mapped.live().level();
+        final BlockPos pos = mapped.live().pos();
+        final BlockState state = mapped.live().state();
+        final BlockHitResult auxiliaryHit = mapped.auxiliaryHit();
+
+        // Vanilla ServerPlayerGameMode.useItemOn skips block use entirely while
+        // sneaking with a non-empty hand, so Shift+right-click places a block
+        // instead of opening a chest/toggling a lever. Mirror that rule here.
+        final boolean secondaryUse = player.isSecondaryUseActive()
+                && (!player.getMainHandItem().isEmpty()
+                        || !player.getOffhandItem().isEmpty());
+        InteractionResult result = InteractionResult.PASS;
+        if (!secondaryUse) {
+            result = state.useItemOn(stack, auxiliary, player, hand, auxiliaryHit);
+            if (result == null) {
+                result = InteractionResult.PASS;
+            }
+            if (result instanceof InteractionResult.TryEmptyHandInteraction
+                    && hand == InteractionHand.MAIN_HAND) {
+                final InteractionResult empty = state.useWithoutItem(
+                        auxiliary, player, auxiliaryHit);
+                if (empty != null && empty.consumesAction()) {
+                    return empty;
+                }
+            }
+            if (result.consumesAction()) {
+                return result;
+            }
+        }
+        // Mirror vanilla ServerPlayerGameMode: only a non-empty stack that is
+        // off cooldown runs ItemStack#useOn, and creative must not lose items.
+        if (stack.isEmpty() || player.getCooldowns().isOnCooldown(stack)) {
+            return result;
+        }
+        final int count = stack.getCount();
+        final InteractionResult item = stack.useOn(new AuxiliaryUseOnContext(
+                auxiliary, player, hand, stack, auxiliaryHit));
+        if (player.hasInfiniteMaterials() && stack.getCount() != count) {
+            stack.setCount(count);
+        }
+        return item == null ? result : item;
+    }
+
+    /**
+     * {@link net.minecraft.world.item.context.UseOnContext} with the
+     * auxiliary level bound explicitly. The protected vanilla constructor is
+     * only reachable through a subclass.
+     */
+    private static final class AuxiliaryUseOnContext
+            extends net.minecraft.world.item.context.UseOnContext {
+        private AuxiliaryUseOnContext(ServerLevel level, ServerPlayer player,
+                                      InteractionHand hand, ItemStack stack,
+                                      BlockHitResult hit) {
+            super(level, player, hand, stack, hit);
         }
     }
 
@@ -257,24 +328,47 @@ public final class StructureOperationRedirector {
         final ServerLevel hostLevel = (ServerLevel) player.level();
         final ServerPlayerGameMode gameMode = player.gameMode;
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
+        final EmptyPhysicsLevel auxiliary = physics == null ? null : physics.auxiliaryLevel();
+        final BlockState previous = mapped.live().state();
         final boolean projecting = physics != null
                 && physics.beginAuxiliaryAudioProjection(mapped.structure());
+        boolean destroyed = false;
         try {
             gameMode.setLevel(mapped.live().level());
-            final boolean destroyed = gameMode.destroyBlock(mapped.live().pos());
-            return new Result(destroyed ? Status.HANDLED : Status.FAILED,
-                    destroyed ? InteractionResult.SUCCESS : InteractionResult.FAIL);
+            if (auxiliary != null) {
+                // Vanilla skips Block.playerDestroy (and therefore the 2001
+                // destroy event) in creative and when the tool is wrong. Emit
+                // exactly one host-side event ourselves instead of relying on
+                // client prediction, which is disabled for structure attacks.
+                auxiliary.beginSuppressBreakFeedback();
+            }
+            destroyed = gameMode.destroyBlock(mapped.live().pos());
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level destroyBlock failed for structure body #{}",
                     mapped.structure().body().id(), t);
             return Result.of(Status.FAILED);
         } finally {
+            if (auxiliary != null) {
+                auxiliary.endSuppressBreakFeedback();
+            }
             gameMode.setLevel(hostLevel);
             if (projecting) {
                 physics.endAuxiliaryAudioProjection();
             }
             finish(player, hostLevel);
         }
+        if (destroyed && auxiliary != null) {
+            final BlockPos pos = mapped.live().pos();
+            final Vec3 center = auxiliary.projectAuxiliaryPoint(
+                    pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+            if (center != null) {
+                StructureFeedback.breakBlock(hostLevel,
+                        new Vector3d(center.x, center.y, center.z),
+                        previous, mapped.structure().blockScale(), hostLevel.getRandom());
+            }
+        }
+        return new Result(destroyed ? Status.HANDLED : Status.FAILED,
+                destroyed ? InteractionResult.SUCCESS : InteractionResult.FAIL);
     }
 
     /**

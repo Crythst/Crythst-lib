@@ -1,6 +1,9 @@
 package io.mikaple.crythst.integration.minecraft.entity.placement;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.integration.minecraft.LevelPhysics;
+import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
@@ -54,10 +57,11 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <h2>Item frame stability</h2>
  * <p>Item frames are spawned with the vanilla {@code Fixed} flag set, because
- * there is no real support block for vanilla's survival check. The entity is
- * positioned exactly on the structure surface for the current session.
- * Attaching the frame to a moving structure is not implemented; if the
- * structure moves or disappears the frame stays where it was placed.</p>
+ * there is no real support block for vanilla's survival check. If the entity
+ * is a decoration or a seat it is also registered with
+ * {@link StructureAttachedEntities}, so its host mirror follows the current
+ * structure pose and keeps full vanilla rendering. Other entities stay at the
+ * surface point where they were spawned.</p>
  */
 public final class StructureEntityPlacement {
     private static final Map<Item, StructureEntityPlacementHandler> HANDLERS =
@@ -159,11 +163,34 @@ public final class StructureEntityPlacement {
                 player, level, stack, hit, surface, hand);
         try {
             final StructureEntityPlacementHandler.Result result = handler.place(context);
-            return result == null ? StructureEntityPlacementHandler.Result.failed() : result;
+            if (result == null || !result.success() || result.entity() == null) {
+                return result == null ? StructureEntityPlacementHandler.Result.failed() : result;
+            }
+            attachIfManaged(level, hit, result.entity());
+            return result;
         } catch (RuntimeException e) {
             Crythst.LOGGER.warn("Structure entity placement handler failed for {}",
                     stack.getItem(), e);
             return StructureEntityPlacementHandler.Result.failed();
+        }
+    }
+
+    /**
+     * Decorations (item frames, paintings) and seats are not ordinary entities
+     * that should fall off a structure face. Register them with the attachment
+     * registry so the host mirror follows the current structure pose and keeps
+     * its full vanilla model/rendering.
+     */
+    private static void attachIfManaged(ServerLevel level, StructureBlockHitResult hit,
+                                        Entity entity) {
+        final LevelPhysics physics = MinecraftPhysics.getIfPresent(level);
+        if (physics == null || entity.isRemoved()) {
+            return;
+        }
+        final StructureAttachedEntities attached = physics.attachedEntities();
+        final StructureAttachedEntities.Kind kind = attached.classify(entity);
+        if (kind != null) {
+            attached.attachAtCurrentPosition(entity, hit.structure(), kind);
         }
     }
 
