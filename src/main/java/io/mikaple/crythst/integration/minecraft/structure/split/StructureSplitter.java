@@ -1,6 +1,7 @@
 package io.mikaple.crythst.integration.minecraft.structure.split;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.integration.minecraft.EditableStatefulVolume;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
@@ -460,6 +461,24 @@ public final class StructureSplitter {
         return tail + 1;
     }
 
+    /**
+     * Builds the editable stateful volume that represents one component.
+     *
+     * <p>This is the volume a split body is assembled from. It is exposed so
+     * callers and tests can inspect what a split body's {@code volume()} will
+     * be — in particular that it is an {@link EditableStatefulVolume} and
+     * therefore stays breakable and placeable.</p>
+     *
+     * @param source    the volume the component was found in
+     * @param component one entry of {@link #findComponents(VoxelVolume)}
+     * @return a fresh volume holding exactly this component's voxels
+     */
+    public static VoxelVolume componentVolume(VoxelVolume source, Component component) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(component, "component");
+        return copyComponent(source, source.bounds(), component, Map.of());
+    }
+
     private static ComponentVolume copyComponent(VoxelVolume source, IntBounds3 bounds,
                                                  Component component,
                                                  Map<Cell, BlockState> states) {
@@ -489,8 +508,12 @@ public final class StructureSplitter {
      * every non-colliding logic block (repeater, observer, torch, wire, fluid,
      * ...). The sparse state map keeps the cost proportional to the number of
      * blocks in this component instead of the full original bounds.</p>
+     *
+     * <p>It is also {@link EditableStatefulVolume}: interaction, explosions and
+     * the ticking level must keep editing split bodies, and testing for the
+     * concrete {@code MutableVoxelVolume} class alone would reject them.</p>
      */
-    private static final class ComponentVolume implements StatefulVoxelVolume {
+    private static final class ComponentVolume implements EditableStatefulVolume {
         private final MutableVoxelVolume grid;
         private final Map<Cell, BlockState> states = new HashMap<>();
 
@@ -498,11 +521,20 @@ public final class StructureSplitter {
             this.grid = new MutableVoxelVolume(bounds);
         }
 
-        private void setBlock(int x, int y, int z, boolean solid, double mass,
-                              PhysicsMaterial material, BlockState state) {
+        @Override
+        public void setBlock(int x, int y, int z, boolean solid, double mass,
+                             PhysicsMaterial material, BlockState state) {
             grid.setBlock(x, y, z, solid, mass, material);
-            if (state != null && !state.isAir()) {
-                states.put(new Cell(x, y, z), state);
+            final Cell cell = new Cell(x, y, z);
+            if (state == null || state.isAir()) {
+                // A cleared voxel must not keep a stale state: stateAt() reads
+                // this map before the interaction side table, so a leftover
+                // entry would resurrect a broken block.
+                states.remove(cell);
+            } else {
+                // Non-colliding logic blocks (repeater, observer, torch, wire,
+                // fluid) stay non-solid but still need their state.
+                states.put(cell, state);
             }
         }
 

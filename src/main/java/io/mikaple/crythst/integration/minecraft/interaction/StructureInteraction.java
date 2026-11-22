@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.minecraft.interaction;
 
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.BlockPhysicsMapper;
+import io.mikaple.crythst.integration.minecraft.EditableStatefulVolume;
 import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
@@ -122,11 +123,13 @@ public final class StructureInteraction {
     private static final Map<ServerPlayer, Long> LAST_USE_TICK = new WeakHashMap<>();
 
     /**
-     * Minimal edit surface shared by {@link MutableVoxelVolume} and restored
-     * stateful volumes. Keeping this adapter here avoids forcing every volume
-     * type to implement a common mutable interface.
+     * Minimal edit surface shared by {@link MutableVoxelVolume}, split
+     * components and restored stateful volumes. Keeping this adapter here
+     * avoids forcing every volume type to implement a common mutable
+     * interface; package visibility lets tests assert which volumes the
+     * interaction layer accepts.
      */
-    private interface EditableVolume {
+    interface EditableVolume {
         void setBlock(int x, int y, int z, boolean solid, double mass,
                       PhysicsMaterial material, BlockState state);
     }
@@ -134,7 +137,13 @@ public final class StructureInteraction {
     private StructureInteraction() {
     }
 
-    private static EditableVolume editableVolume(VoxelVolume volume) {
+    static EditableVolume editableVolume(VoxelVolume volume) {
+        // Checked before the mutable branch: a stateful volume also has to
+        // record the block state being written, and the plain mutable adapter
+        // below drops it.
+        if (volume instanceof EditableStatefulVolume stateful) {
+            return stateful::setBlock;
+        }
         if (volume instanceof MutableVoxelVolume mutable) {
             return (x, y, z, solid, mass, material, state) -> {
                 if (solid) {
