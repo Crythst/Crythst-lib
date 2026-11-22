@@ -12,8 +12,8 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
  * -Dcrythst.portal.capture=false
  * -Dcrythst.portal.forceProcedural=true
  * -Dcrythst.portal.capture.dump=true
- * -Dcrythst.portal.capture.intervalMs=100
- * -Dcrythst.portal.capture.scale=1.0
+ * -Dcrythst.portal.capture.intervalMs=150
+ * -Dcrythst.portal.capture.scale=0.75
  * </pre>
  */
 final class PortalCaptureSettings {
@@ -24,16 +24,16 @@ final class PortalCaptureSettings {
     static final boolean DUMP_TARGET = Boolean.getBoolean("crythst.portal.capture.dump");
 
     static final float SCALE = readScale();
-    static final int MAX_WIDTH = 1280;
-    static final int MAX_HEIGHT = 720;
+    static final int MAX_WIDTH = 960;
+    static final int MAX_HEIGHT = 540;
     static final int MAX_PORTALS_PER_ROUND = 1;
     static final int SECTION_COMPILE_BUDGET = 8;
-    static final double MAX_CAPTURE_DISTANCE = 160.0;
+    static final double MAX_CAPTURE_DISTANCE = 96.0;
     static final double MAX_CAPTURE_DISTANCE_SQUARED =
             MAX_CAPTURE_DISTANCE * MAX_CAPTURE_DISTANCE;
 
     static final long BASE_INTERVAL_NANOS = readIntervalNanos();
-    static final long MAX_INTERVAL_NANOS = Math.max(BASE_INTERVAL_NANOS, 250_000_000L);
+    static final long MAX_INTERVAL_NANOS = Math.max(BASE_INTERVAL_NANOS, 500_000_000L);
     static final long TIMING_LOG_INTERVAL_NANOS = 1_000_000_000L;
 
     /** Camera motion below this is considered unchanged for texture reuse. */
@@ -57,7 +57,7 @@ final class PortalCaptureSettings {
 
     private static long readIntervalNanos() {
         final String raw = System.getProperty("crythst.portal.capture.intervalMs");
-        long millis = 100L;
+        long millis = 150L;
         if (raw != null) {
             try {
                 millis = Long.parseLong(raw.trim());
@@ -70,7 +70,7 @@ final class PortalCaptureSettings {
 
     private static float readScale() {
         final String raw = System.getProperty("crythst.portal.capture.scale");
-        double scale = 1.0;
+        double scale = 0.75;
         if (raw != null) {
             try {
                 scale = Double.parseDouble(raw.trim());

@@ -24,6 +24,7 @@ import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -97,6 +98,7 @@ public final class StructureAttachedEntities {
     private final Map<UUID, Attachment> attachments = new LinkedHashMap<>();
     private final Set<EntityType<?>> rideableTypes = ConcurrentHashMap.newKeySet();
     private final Set<String> rideableClassNames = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, Integer> adoptionFailures = new HashMap<>();
     private long totalAttached;
     private long totalAdoptedFromVoid;
     private long totalReleased;
@@ -298,6 +300,7 @@ public final class StructureAttachedEntities {
             if (mirror == null) {
                 failures++;
                 lastFailure = "could not create host mirror for " + voidEntity.getType();
+                recordAdoptionFailure(voidEntity);
                 return false;
             }
             if (!host.addFreshEntity(mirror)) {
@@ -306,10 +309,12 @@ public final class StructureAttachedEntities {
                     mirror.discard();
                     failures++;
                     lastFailure = "host rejected mirror for " + voidEntity.getType();
+                    recordAdoptionFailure(voidEntity);
                     return false;
                 }
             }
             voidEntity.discard();
+            adoptionFailures.remove(id);
             totalAdoptedFromVoid++;
             return attach(mirror, structure, local, localYaw, kind);
         } catch (Throwable t) {
@@ -320,7 +325,22 @@ public final class StructureAttachedEntities {
             if (mirror != null && host.getEntity(id) == null) {
                 mirror.discard();
             }
+            recordAdoptionFailure(voidEntity);
             return false;
+        }
+    }
+
+    /**
+     * A void entity that cannot be recreated in the host world (for example an
+     * unknown modded type) must not be retried every tick. After a few attempts
+     * drop the void copy instead of spamming "Skipping Entity with id [invalid]"
+     * and leaking work.
+     */
+    private void recordAdoptionFailure(Entity voidEntity) {
+        final int attempts = adoptionFailures.merge(voidEntity.getUUID(), 1, Integer::sum);
+        if (attempts >= 3) {
+            adoptionFailures.remove(voidEntity.getUUID());
+            voidEntity.discard();
         }
     }
 
@@ -328,7 +348,12 @@ public final class StructureAttachedEntities {
                                               float worldYaw, Kind kind) {
         final TagValueOutput output = TagValueOutput.createWithContext(
                 ProblemReporter.DISCARDING, host.registryAccess());
-        voidEntity.saveWithoutId(output);
+        // saveWithoutId omits the "id" field that EntityType#loadEntityRecursive
+        // needs; without it every adoption logs "Skipping Entity with id
+        // [invalid]" and retries forever. saveAsPassenger writes the id too.
+        if (!voidEntity.saveAsPassenger(output)) {
+            return null;
+        }
         final CompoundTag tag = output.buildResult();
         if (kind == Kind.DECORATION) {
             // Item frames support a Fixed flag so they do not pop off when the
@@ -392,11 +417,26 @@ public final class StructureAttachedEntities {
             final Transform3d pose = structure.pose();
             final Vector3d world = pose.transformPoint(attachment.localAnchor);
             final float worldYaw = worldYaw(structure, attachment.localYaw);
-            entity.setPos(world.x, world.y, world.z);
-            entity.setYRot(worldYaw);
+            moveMirror(entity, world, worldYaw);
             entity.setDeltaMovement(Vec3.ZERO);
             attachment.ticks++;
             updatePassengers(attachment, pose);
+        }
+    }
+
+    /**
+     * Moves one host mirror. Hanging entities override {@code setPos} and only
+     * update their attached block position, so plain {@code setPos} leaves the
+     * frame/painting at its old world coordinates. Set the raw entity position
+     * first, then let the override refresh the attached position and box.
+     */
+    private static void moveMirror(Entity entity, Vector3d world, float worldYaw) {
+        entity.setYRot(worldYaw);
+        if (entity instanceof net.minecraft.world.entity.decoration.BlockAttachedEntity) {
+            entity.setPosRaw(world.x, world.y, world.z);
+            entity.setPos(world.x, world.y, world.z);
+        } else {
+            entity.setPos(world.x, world.y, world.z);
         }
     }
 

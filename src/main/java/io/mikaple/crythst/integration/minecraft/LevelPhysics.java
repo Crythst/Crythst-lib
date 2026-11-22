@@ -55,6 +55,7 @@ public final class LevelPhysics implements AutoCloseable {
     private EmptyPhysicsLevel subLevel;
     private boolean subLevelCreationFailed;
     private EmptyPhysicsLevel.TickResult lastVoidTick = EmptyPhysicsLevel.TickResult.EMPTY;
+    private int voidTickLogCounter;
 
     /**
      * Last auxiliary-entity projection pass. Entities spawned by dispensers and
@@ -429,6 +430,10 @@ public final class LevelPhysics implements AutoCloseable {
                     subLevel.tick(config.subLevelRandomTickSpeed);
             lastVoidTick = result;
             applyAuxiliaryEdits(result.changedStructures());
+            if (Boolean.getBoolean("crythst.void.logTicks")
+                    && (++voidTickLogCounter % 100 == 0)) {
+                Crythst.LOGGER.info("Crythst void status: {}", voidTickStatus());
+            }
         } catch (Throwable t) {
             subLevel.reportTickFailure("tick", t);
         }
@@ -828,6 +833,7 @@ public final class LevelPhysics implements AutoCloseable {
                 + " attachedAdopted=" + subLevel.totalAdoptedAttachedEntities()
                 + " ejectionFailures=" + subLevel.totalEjectionFailures()
                 + " attached=" + attachedEntities.summary()
+                + " " + subLevel.tickDiagnostics()
                 + " last=" + lastVoidTick.summary();
     }
 

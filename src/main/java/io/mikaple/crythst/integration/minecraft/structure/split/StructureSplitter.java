@@ -337,12 +337,19 @@ public final class StructureSplitter {
             final BlockPos pos = entry.getKey();
             // Block-entity keys are structure-local voxels relative to the
             // volume minimum (see StructureSavedData.captureBlockEntities).
-            final Integer owner = owners.get(new Cell(
-                    bounds.minX() + pos.getX(),
-                    bounds.minY() + pos.getY(),
-                    bounds.minZ() + pos.getZ()));
+            final int absoluteX = bounds.minX() + pos.getX();
+            final int absoluteY = bounds.minY() + pos.getY();
+            final int absoluteZ = bounds.minZ() + pos.getZ();
+            final Integer owner = owners.get(new Cell(absoluteX, absoluteY, absoluteZ));
             if (owner != null) {
-                splitBlockEntities.get(owner).put(pos, entry.getValue());
+                // Split components have their own bounds minimum. Convert the
+                // original-relative key to the component-relative key instead
+                // of carrying the old origin into applyBlockEntities.
+                final IntBounds3 componentBounds = components.get(owner).bounds();
+                splitBlockEntities.get(owner).put(new BlockPos(
+                        absoluteX - componentBounds.minX(),
+                        absoluteY - componentBounds.minY(),
+                        absoluteZ - componentBounds.minZ()), entry.getValue());
             }
         }
 

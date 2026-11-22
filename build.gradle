@@ -90,11 +90,16 @@ loom {
             client()
             name = 'Crythst Client'
             runDir = 'runs/client'
+            // Keep the dev client bounded; the portal capture and structure
+            // caches can otherwise grow the default JVM heap until the system
+            // OOM killer terminates the process.
+            vmArgs '-Xms512m', '-Xmx2G'
         }
         server {
             server()
             name = 'Crythst Server'
             runDir = 'runs/server'
+            vmArgs '-Xms512m', '-Xmx2G'
         }
     }
 }
@@ -170,6 +175,10 @@ jar {
         rename { 'NOTICE-crythst' }
     }
     from('THIRD_PARTY_NOTICES.md')
+    // Development/test fixtures derived from Minecraft assets must not be
+    // redistributed in the release jar. Keep them on the dev classpath for
+    // tests, but exclude them from the artifact.
+    exclude 'assets/crythst/textures/test/**'
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

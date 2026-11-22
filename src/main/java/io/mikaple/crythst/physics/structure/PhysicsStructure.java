@@ -58,6 +58,8 @@ public final class PhysicsStructure implements AutoCloseable {
      * refresh and cleared by {@link #reindex(VoxelVolume)} and {@link #close()}.
      */
     private volatile List<BlockEntityStructureActor> blockEntityActors = List.of();
+    /** Incremented whenever the voxel content is rebuilt or edited. */
+    private volatile long contentRevision;
     private boolean closed;
 
     public PhysicsStructure(PhysicsWorld world, StructureDef definition) {
@@ -362,6 +364,16 @@ public final class PhysicsStructure implements AutoCloseable {
         renderTimeline.reset(pose(), System.nanoTime());
         StructureBlockHooks.fireBlockChanges(this, previousStates, newVolume);
         this.blockStateSnapshot = StructureBlockHooks.captureBlockStates(newVolume);
+        this.contentRevision++;
+    }
+
+    /**
+     * Monotonic content revision. Renderers use it to rebuild a snapshot only
+     * when blocks actually changed, including edits mirrored from the
+     * auxiliary void level.
+     */
+    public long contentRevision() {
+        return contentRevision;
     }
 
     public void setMaterial(PhysicsMaterial material) {

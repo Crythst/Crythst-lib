@@ -55,9 +55,6 @@ public final class StructureBlockSnapshots {
     public static final long MAX_TOTAL_BLOCKS = 131_072L;
     /** Maximum number of structures retained. */
     public static final int MAX_STRUCTURES = 64;
-    /** Rebuild a snapshot every N server ticks (200 ms at 20 TPS). */
-    public static final int REBUILD_INTERVAL_TICKS = 4;
-
     private static final Map<ResourceKey<Level>, Map<Long, Snapshot>> SNAPSHOTS =
             new ConcurrentHashMap<>();
     private static final AtomicBoolean REGISTERED = new AtomicBoolean();
@@ -65,7 +62,6 @@ public final class StructureBlockSnapshots {
     private static final BlockState AIR = Blocks.AIR.defaultBlockState();
     private static final BlockState STONE = Blocks.STONE.defaultBlockState();
 
-    private static long tickCounter;
     private static boolean cappedWarningLogged;
 
     private StructureBlockSnapshots() {
@@ -98,8 +94,6 @@ public final class StructureBlockSnapshots {
             return;
         }
 
-        tickCounter++;
-        final boolean rebuildThisTick = tickCounter % REBUILD_INTERVAL_TICKS == 0;
         final Set<ResourceKey<Level>> activeDimensions = new HashSet<>();
         long totalBlocks = 0L;
         for (Map<Long, Snapshot> levelSnapshots : SNAPSHOTS.values()) {
@@ -135,7 +129,11 @@ public final class StructureBlockSnapshots {
                 seen.add(bodyId);
 
                 final Snapshot existing = snapshots.get(bodyId);
-                if (existing != null && !rebuildThisTick) {
+                // Rebuild as soon as the structure content changed, including
+                // edits mirrored from the auxiliary void tick. Pose-only
+                // updates do not touch contentRevision and stay free.
+                if (existing != null
+                        && existing.revision() == structure.contentRevision()) {
                     continue;
                 }
                 if (existing == null && size() >= MAX_STRUCTURES) {
@@ -294,7 +292,7 @@ public final class StructureBlockSnapshots {
         return new Snapshot(structure.body().id(),
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 sizeX, bounds.sizeY(), sizeZ,
-                blocks, nonAir, NEXT_REVISION.incrementAndGet());
+                blocks, nonAir, structure.contentRevision());
     }
 
     /**

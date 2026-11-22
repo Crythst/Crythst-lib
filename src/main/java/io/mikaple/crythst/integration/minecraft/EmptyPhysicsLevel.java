@@ -41,6 +41,7 @@ import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.LevelEvent;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -52,8 +53,11 @@ import net.minecraft.world.level.levelgen.FlatLevelSource;
 import net.minecraft.world.level.levelgen.flat.FlatLevelGeneratorSettings;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
 import net.minecraft.world.level.levelgen.structure.StructureSet;
+import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.redstone.Orientation;
+import net.minecraft.world.ticks.LevelChunkTicks;
+import net.minecraft.world.ticks.ScheduledTick;
 import net.minecraft.world.level.storage.DerivedLevelData;
 import net.minecraft.world.level.storage.ServerLevelData;
 import net.minecraft.world.phys.Vec3;
@@ -317,10 +321,13 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private PhysicsStructure projectedStructure;
     /** True while our own copy/clear writes must not be mirrored back. */
     private int suppressChangeDepth;
+    /** True while the interaction layer emits host-side break feedback itself. */
+    private boolean suppressBreakFeedback;
     /** True while the tick phases run; block events are queued during this time. */
     private boolean ticking;
     private int neighborBudget;
     private long totalBlockTicks;
+    private long totalScheduledPasses;
     private long totalFluidTicks;
     private long totalBlockEvents;
     private long totalRandomTicks;
@@ -472,12 +479,16 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             endSuppressChanges();
         }
 
-        // Now that every neighbour exists, wake the snapshot exactly like a
-        // live loaded chunk: onPlace schedules repeaters/torches/fluids,
-        // neighbour updates seed redstone and shape updates, and fluid ticks
-        // make copied water/lava actually flow.
-        wakeCopiedRegion(region);
+        // Promote and register the chunk tick containers *before* waking the
+        // copied blocks. LevelTicks#schedule drops requests for a chunk whose
+        // container is not registered yet, so waking first would lose every
+        // repeater/observer/fluid tick seeded by onPlace.
         activateActiveChunks();
+        // Now that every neighbour exists and the chunks are block-ticking,
+        // wake the snapshot exactly like a live loaded chunk: onPlace schedules
+        // repeaters/torches/fluids, neighbour updates seed redstone and shape
+        // updates, and fluid ticks make copied water/lava actually flow.
+        wakeCopiedRegion(region);
     }
 
     /**
@@ -677,6 +688,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      * Reattaches captured block-entity NBT to the auxiliary level after a
      * structure is restored from saved data. Coordinates are structure-local
      * voxels relative to the volume bounds minimum.
+     *
+     * <p>Older saves (and structures split before block-entity keys were
+     * normalised) may store a different origin. If the direct mapping points at
+     * a block whose state does not accept the saved block-entity type, the
+     * nearest matching block in the region is used instead; the side table is
+     * rewritten to the resolved keys so the next save is consistent.</p>
      */
     public void applyBlockEntities(PhysicsStructure structure,
                                    java.util.Map<net.minecraft.core.BlockPos, net.minecraft.nbt.CompoundTag> data) {
@@ -687,31 +704,110 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         if (region == null) {
             return;
         }
-        final net.minecraft.world.level.block.state.BlockState fallback =
-                Blocks.STONE.defaultBlockState();
+        final IntBounds3 bounds = structure.volume().bounds();
+        final java.util.Set<Long> claimed = new HashSet<>();
+        Map<BlockPos, CompoundTag> resolved = null;
         for (var entry : data.entrySet()) {
-            final net.minecraft.core.BlockPos local = entry.getKey();
-            final net.minecraft.core.BlockPos pos = new net.minecraft.core.BlockPos(
+            final BlockPos local = entry.getKey();
+            final CompoundTag tag = entry.getValue();
+            BlockPos pos = new BlockPos(
                     region.baseX + local.getX(), region.baseY + local.getY(),
                     region.baseZ + local.getZ());
             ensureChunk(pos);
-            final net.minecraft.world.level.block.state.BlockState state =
-                    level.getBlockState(pos);
+            if (!acceptsBlockEntity(level.getBlockState(pos), tag)) {
+                final BlockPos relocated = findBlockEntityPosition(
+                        region, bounds, tag, pos, claimed);
+                if (relocated == null) {
+                    Crythst.LOGGER.debug(
+                            "Could not find a matching block for saved block entity {} in region {}",
+                            tag.getStringOr("id", "?"), structure.body().id());
+                    continue;
+                }
+                pos = relocated;
+            }
+            final BlockState state = level.getBlockState(pos);
             if (state.isAir()) {
                 continue;
             }
             try {
-                final net.minecraft.world.level.block.entity.BlockEntity blockEntity =
-                        net.minecraft.world.level.block.entity.BlockEntity.loadStatic(
-                                pos, state, entry.getValue(), level.registryAccess());
+                final BlockEntity blockEntity = BlockEntity.loadStatic(
+                        pos, state, tag, level.registryAccess());
                 if (blockEntity != null) {
                     level.setBlockEntity(blockEntity);
                     region.blockEntityPositions.add(pos.asLong());
+                    claimed.add(pos.asLong());
+                    if (resolved == null) {
+                        resolved = new LinkedHashMap<>(data);
+                    }
+                    resolved.remove(local);
+                    resolved.put(new BlockPos(
+                            pos.getX() - region.baseX,
+                            pos.getY() - region.baseY,
+                            pos.getZ() - region.baseZ), tag);
                 }
             } catch (Throwable t) {
                 Crythst.LOGGER.warn("Could not restore block entity at {} in auxiliary level", pos, t);
             }
         }
+        if (resolved != null) {
+            StructureBlockEntityData.put(structure, resolved);
+        }
+    }
+
+    /** Whether {@code state} is a legal block for the saved block-entity id. */
+    private static boolean acceptsBlockEntity(BlockState state, CompoundTag tag) {
+        if (state == null || state.isAir()) {
+            return false;
+        }
+        final Identifier id = Identifier.tryParse(tag.getStringOr("id", ""));
+        if (id == null) {
+            return true;
+        }
+        final var type = net.minecraft.core.registries.BuiltInRegistries
+                .BLOCK_ENTITY_TYPE.getValue(id);
+        return type == null || type.isValid(state);
+    }
+
+    /**
+     * Finds the nearest block in a region that accepts the saved block-entity
+     * type. Used only for legacy or pre-split keys whose origin no longer
+     * matches the current volume bounds.
+     */
+    private @Nullable BlockPos findBlockEntityPosition(Region region, IntBounds3 bounds,
+                                                       CompoundTag tag, BlockPos preferred,
+                                                       java.util.Set<Long> claimed) {
+        final Identifier id = Identifier.tryParse(tag.getStringOr("id", ""));
+        if (id == null) {
+            return null;
+        }
+        final var type = net.minecraft.core.registries.BuiltInRegistries
+                .BLOCK_ENTITY_TYPE.getValue(id);
+        if (type == null) {
+            return null;
+        }
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (int y = 0; y < region.sizeY; y++) {
+            for (int z = 0; z < region.sizeZ; z++) {
+                for (int x = 0; x < region.sizeX; x++) {
+                    final BlockPos pos = new BlockPos(
+                            region.baseX + x, region.baseY + y, region.baseZ + z);
+                    if (claimed.contains(pos.asLong())) {
+                        continue;
+                    }
+                    final BlockState state = level.getBlockState(pos);
+                    if (!type.isValid(state)) {
+                        continue;
+                    }
+                    final double distance = pos.distSqr(preferred);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = pos;
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     /**
@@ -1292,35 +1388,72 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     }
 
     private void runScheduledBlockTicks() {
-        final TickBudget budget = new TickBudget(MAX_BLOCK_TICKS_PER_TICK);
-        level.getBlockTicks().tick(level.getGameTime(), MAX_BLOCK_TICKS_PER_TICK,
-                (pos, block) -> {
-                    if (!budget.tryConsume()) {
-                        totalDroppedWork++;
-                        return;
-                    }
-                    final BlockState state = level.getBlockState(pos);
-                    if (state.is(block)) {
-                        state.tick(level, pos, level.getRandom());
-                        totalBlockTicks++;
-                    }
-                });
+        totalScheduledPasses++;
+        final long gameTime = level.getGameTime();
+        int budget = MAX_BLOCK_TICKS_PER_TICK;
+        for (long chunkKey : activeChunks.keySet()) {
+            if (budget <= 0) {
+                totalDroppedWork++;
+                break;
+            }
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null
+                    || !(chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawTicks)) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawTicks;
+            // Drain the chunk container directly. LevelTicks.tick additionally
+            // consults DistanceManager#inBlockTickingRange and can silently
+            // leave due ticks queued for an auxiliary level that is not part of
+            // the host server's normal simulation graph.
+            while (budget > 0) {
+                final ScheduledTick<Block> tick = ticks.peek();
+                if (tick == null || tick.triggerTick() > gameTime) {
+                    break;
+                }
+                ticks.poll();
+                budget--;
+                final BlockState state = level.getBlockState(tick.pos());
+                if (state.is(tick.type())) {
+                    state.tick(level, tick.pos(), level.getRandom());
+                    totalBlockTicks++;
+                }
+            }
+        }
     }
 
     private void runScheduledFluidTicks() {
-        final TickBudget budget = new TickBudget(MAX_FLUID_TICKS_PER_TICK);
-        level.getFluidTicks().tick(level.getGameTime(), MAX_FLUID_TICKS_PER_TICK,
-                (pos, fluid) -> {
-                    if (!budget.tryConsume()) {
-                        totalDroppedWork++;
-                        return;
-                    }
-                    final FluidState state = level.getFluidState(pos);
-                    if (state.getType().isSame(fluid)) {
-                        state.tick(level, pos, level.getBlockState(pos));
-                        totalFluidTicks++;
-                    }
-                });
+        final long gameTime = level.getGameTime();
+        int budget = MAX_FLUID_TICKS_PER_TICK;
+        for (long chunkKey : activeChunks.keySet()) {
+            if (budget <= 0) {
+                totalDroppedWork++;
+                break;
+            }
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+            if (chunk == null
+                    || !(chunk.getFluidTicks() instanceof LevelChunkTicks<?> rawTicks)) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawTicks;
+            while (budget > 0) {
+                final ScheduledTick<Fluid> tick = ticks.peek();
+                if (tick == null || tick.triggerTick() > gameTime) {
+                    break;
+                }
+                ticks.poll();
+                budget--;
+                final FluidState state = level.getFluidState(tick.pos());
+                if (state.getType().isSame(tick.type())) {
+                    state.tick(level, tick.pos(), level.getBlockState(tick.pos()));
+                    totalFluidTicks++;
+                }
+            }
+        }
     }
 
     /**
@@ -1392,6 +1525,26 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     /** True while vanilla tick phases are running. */
     public boolean isTicking() {
         return ticking;
+    }
+
+    /**
+     * Suppresses aux-level destroy-block events while the interaction layer
+     * emits exactly one host-side event for a redirected break. Without this,
+     * creative (and wrong-tool) breaks would have no feedback at all because
+     * vanilla skips {@code Block.playerDestroy} there.
+     */
+    public void beginSuppressBreakFeedback() {
+        suppressBreakFeedback = true;
+    }
+
+    /** Ends the redirect break-feedback suppression. */
+    public void endSuppressBreakFeedback() {
+        suppressBreakFeedback = false;
+    }
+
+    /** Whether aux destroy-block events are currently suppressed. */
+    public boolean suppressingBreakFeedback() {
+        return suppressBreakFeedback;
     }
 
     /** Consumes one neighbour-update slot; always true outside the tick pass. */
@@ -1492,8 +1645,57 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 + " entitiesEjected=" + totalEjectedEntities
                 + " attachedAdopted=" + totalAdoptedAttachedEntities
                 + " ejectionFailures=" + totalEjectionFailures
+                + " " + tickDiagnostics()
                 + " lastFailure=" + (lastFailureDescription.isEmpty()
                         ? "none" : lastFailureDescription);
+    }
+
+    /**
+     * Focused diagnostics for the chunk-ticket/tick-list path. Prints the game
+     * time and the block-ticking status of one active chunk, which distinguishes
+     * a missing ticket from a frozen clock or lost scheduled ticks.
+     */
+    public String tickDiagnostics() {
+        if (activeChunks.isEmpty()) {
+            return "gameTime=" + level.getGameTime() + " tickChunk=no-chunks";
+        }
+        int simulated = 0;
+        int activePendingBlocks = 0;
+        int activePendingFluids = 0;
+        long firstTrigger = Long.MAX_VALUE;
+        String firstPos = "-";
+        for (long key : activeChunks.keySet()) {
+            if (level.getChunkSource().chunkMap.getDistanceManager()
+                    .inBlockTickingRange(key)) {
+                simulated++;
+            }
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    ChunkPos.getX(key), ChunkPos.getZ(key));
+            if (chunk != null) {
+                activePendingBlocks += chunk.getBlockTicks().count();
+                activePendingFluids += chunk.getFluidTicks().count();
+                if (chunk.getBlockTicks()
+                        instanceof net.minecraft.world.ticks.LevelChunkTicks<?> ticks) {
+                    final var peek = ticks.peek();
+                    if (peek != null && peek.triggerTick() < firstTrigger) {
+                        firstTrigger = peek.triggerTick();
+                        firstPos = peek.pos().toShortString();
+                    }
+                }
+            }
+        }
+        final long key = activeChunks.keySet().iterator().next();
+        final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                ChunkPos.getX(key), ChunkPos.getZ(key));
+        return "gameTime=" + level.getGameTime()
+                + " scheduledPasses=" + totalScheduledPasses
+                + " simulated=" + simulated + "/" + activeChunks.size()
+                + " activePendingBlocks=" + activePendingBlocks
+                + " activePendingFluids=" + activePendingFluids
+                + " firstTrigger=" + (firstTrigger == Long.MAX_VALUE ? "-" : firstTrigger)
+                + " firstPos=" + firstPos
+                + " chunkStatus=" + (chunk == null ? "unloaded" : chunk.getFullStatus())
+                + " activeTickets=" + level.getChunkSource().hasActiveTickets();
     }
 
     /**
@@ -1613,6 +1815,14 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 activeChunks.remove(chunkKey);
                 initializedChunks.remove(chunkKey);
                 try {
+                    // Remove the chunk's tick containers from the level tick
+                    // lists as well. Leaving them registered would keep
+                    // scheduled ticks for a no-longer-simulated chunk forever.
+                    final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                            ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+                    if (chunk != null) {
+                        chunk.unregisterTickContainerFromLevel(level);
+                    }
                     removeBlockTickingTicket(chunkKey);
                 } catch (Throwable t) {
                     Crythst.LOGGER.debug("Could not remove void-level chunk tickets", t);
@@ -1749,15 +1959,18 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                     Holder<SoundEvent> sound, SoundSource source,
                                     float volume, float pitch, long seed) {
             final Vec3 mapped = projectPoint(x, y, z);
+            // The interacting client does not run vanilla's local sound
+            // prediction (the structure click is consumed before prediction),
+            // so do not exclude the acting player from the projected sound.
             if (mapped != null) {
-                host.playSeededSound(except, mapped.x, mapped.y, mapped.z,
+                host.playSeededSound(null, mapped.x, mapped.y, mapped.z,
                         sound, source, volume, pitch, seed);
                 return;
             }
             if (projecting()) {
                 // Some vanilla blocks play at the player position, which is
                 // already a host coordinate.
-                host.playSeededSound(except, x, y, z, sound, source, volume, pitch, seed);
+                host.playSeededSound(null, x, y, z, sound, source, volume, pitch, seed);
             }
             // Otherwise do not leave audio in the player-less void level.
         }
@@ -1767,23 +1980,28 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                     Holder<SoundEvent> sound, SoundSource source,
                                     float volume, float pitch, long seed) {
             if (sourceEntity instanceof Player) {
-                host.playSeededSound(except, sourceEntity, sound, source, volume, pitch, seed);
+                host.playSeededSound(null, sourceEntity, sound, source, volume, pitch, seed);
                 return;
             }
             final Vec3 mapped = projectPoint(sourceEntity.getX(), sourceEntity.getY(),
                     sourceEntity.getZ());
             if (mapped != null) {
-                host.playSeededSound(except, mapped.x, mapped.y, mapped.z,
+                host.playSeededSound(null, mapped.x, mapped.y, mapped.z,
                         sound, source, volume, pitch, seed);
                 return;
             }
             if (projecting()) {
-                host.playSeededSound(except, sourceEntity, sound, source, volume, pitch, seed);
+                host.playSeededSound(null, sourceEntity, sound, source, volume, pitch, seed);
             }
         }
 
         @Override
         public void levelEvent(@Nullable Entity source, int type, BlockPos pos, int data) {
+            if (type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK
+                    && owner != null && owner.suppressingBreakFeedback()) {
+                // The redirect break path emits one host-side destroy event.
+                return;
+            }
             final BlockPos mapped = projectBlockPos(pos.getX() + 0.5, pos.getY() + 0.5,
                     pos.getZ() + 0.5);
             if (mapped != null) {
