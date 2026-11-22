@@ -1,10 +1,12 @@
 package io.mikaple.crythst.client.render.item;
 
 import com.mojang.renderpearl.api.pipeline.BindGroupLayout;
-import com.mojang.renderpearl.api.pipeline.BlendFunction;
-import com.mojang.renderpearl.api.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.CompareOp;
+import com.mojang.renderpearl.api.pipeline.DepthStencilState;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.client.renderer.oit.OitPipelineSet;
 import net.minecraft.client.renderer.rendertype.CrythstRenderTypes;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -14,80 +16,128 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The {@link RenderType} used by the star effect.
+ * The {@link RenderType}s used by the star mask overlay.
  *
- * <p>In 26.3 the shader is chosen by a {@link RenderPipeline}, while
- * {@link net.minecraft.client.resources.model.geometry.BakedQuad.MaterialInfo#itemRenderType()}
- * selects the {@link RenderType} for each quad. The flow is therefore:</p>
- * <ol>
- *     <li>Copy every state of vanilla {@link RenderPipelines#ITEM_CUTOUT} (vertex
- *     format, bind groups, depth/blend, ...) and only replace the vertex/fragment
- *     shaders with {@code assets/crythst/shaders/core/star.vsh/.fsh};</li>
- *     <li>Build a new {@link RenderType} from it (Sampler0 = item atlas);</li>
- *     <li>In {@link StarItemModelRenderer}, replace each quad's itemRenderType
- *     with that RenderType.</li>
- * </ol>
+ * <p>Two overlay types exist because vanilla item rendering splits submissions
+ * by {@link RenderType#hasBlending()}:</p>
+ * <ul>
+ *     <li>{@code crythst_star} - opaque, used for cutout quads. It joins the
+ *     solid feature phase and is therefore drawn after the real solid model.</li>
+ *     <li>{@code crythst_star_translucent} - blended, used for translucent
+ *     quads. It joins the translucent phase, with an {@link OitPipelineSet} so
+ *     improved transparency (OIT) works too.</li>
+ * </ul>
  *
- * <p>The whole effect branches per pixel inside one fragment shader: fully
- * transparent pixels become an animated translucent rim, pure-black pixels
- * become a recessed star field with purple walls, everything else samples the
- * original texture.</p>
+ * <p>Both copy the bind groups, vertex format, primitive topology and culling
+ * of {@link RenderPipelines#ITEM_CUTOUT} / {@link RenderPipelines#ITEM_TRANSLUCENT},
+ * then replace the shaders with {@code assets/crythst/shaders/core/star.vsh/.fsh}
+ * and force {@code writeDepth = false} with a reversed-Z
+ * {@link CompareOp#GREATER_THAN_OR_EQUAL} test. The second pass therefore
+ * decorates only pixels where the real model is already the front-most
+ * surface; it can neither z-fight with the model nor write depth that would
+ * affect later geometry.</p>
  *
  * <p>Pipelines need no registration: {@code PipelineCache} compiles them on
  * demand from the shader sources of the current resource packs.</p>
  */
 final class StarRenderTypes {
 
-    /** One RenderType per atlas (quads may come from items.png or blocks.png). */
-    private static final Map<Identifier, RenderType> STAR_BY_ATLAS = new ConcurrentHashMap<>();
-    private static volatile RenderPipeline starPipeline;
+    private static final String STAR_RENDER_TYPE_NAME = "crythst_star";
+    private static final String STAR_TRANSLUCENT_RENDER_TYPE_NAME = "crythst_star_translucent";
+
+    private static final Identifier STAR_TRANSLUCENT_PIPELINE =
+            Identifier.fromNamespaceAndPath(CrythstItemSpecialRenderers.STAR_PIPELINE.getNamespace(),
+                    "star_item_translucent");
+
+    /** One RenderType per atlas and per blend mode (items.png or blocks.png). */
+    private static final Map<AtlasKey, RenderType> STAR_BY_ATLAS = new ConcurrentHashMap<>();
+
+    private static volatile RenderPipeline opaquePipeline;
+    private static volatile RenderPipeline translucentPipeline;
+    private static volatile OitPipelineSet translucentOitPipelines;
 
     private StarRenderTypes() {
     }
 
-    /** The star-effect render type bound to the given atlas. */
-    static RenderType forAtlas(Identifier atlasLocation) {
-        return STAR_BY_ATLAS.computeIfAbsent(atlasLocation, atlas ->
-                createType(CrythstItemSpecialRenderers.STAR_RENDER_TYPE_NAME, starPipeline(), atlas));
+    /** The star overlay render type bound to the given atlas and blend mode. */
+    static RenderType forAtlas(Identifier atlasLocation, boolean translucent) {
+        AtlasKey key = new AtlasKey(atlasLocation, translucent);
+        return STAR_BY_ATLAS.computeIfAbsent(key, ignored -> translucent
+                ? createType(STAR_TRANSLUCENT_RENDER_TYPE_NAME, translucentPipeline(),
+                atlasLocation, translucentOitPipelines())
+                : createType(STAR_RENDER_TYPE_NAME, opaquePipeline(), atlasLocation, null));
     }
 
-    private static RenderType createType(String name, RenderPipeline pipeline, Identifier atlas) {
-        RenderSetup setup = RenderSetup.builder(pipeline)
+    private static RenderType createType(String name, RenderPipeline pipeline, Identifier atlas,
+                                         OitPipelineSet oitPipelines) {
+        RenderSetup.RenderSetupBuilder setup = RenderSetup.builder(pipeline)
                 .withTexture("Sampler0", atlas)
                 .useLightmap()
                 .useOverlay()
-                .affectsCrumbling()
-                .setOutline(RenderSetup.OutlineProperty.AFFECTS_OUTLINE)
-                .createRenderSetup();
-        return CrythstRenderTypes.create(name, setup);
+                .setOutline(RenderSetup.OutlineProperty.NONE);
+        if (oitPipelines != null) {
+            setup.setOitPipelines(oitPipelines).sortOnUpload();
+        }
+        return CrythstRenderTypes.create(name, setup.createRenderSetup());
     }
 
-    private static RenderPipeline starPipeline() {
-        RenderPipeline result = starPipeline;
+    private static RenderPipeline opaquePipeline() {
+        RenderPipeline result = opaquePipeline;
         if (result == null) {
-            // Model baking happens on worker threads; several items may bake at once.
             synchronized (StarRenderTypes.class) {
-                result = starPipeline;
+                result = opaquePipeline;
                 if (result == null) {
-                    result = buildPipeline();
-                    starPipeline = result;
+                    result = buildPipeline(RenderPipelines.ITEM_CUTOUT,
+                            CrythstItemSpecialRenderers.STAR_PIPELINE);
+                    opaquePipeline = result;
                 }
             }
         }
         return result;
     }
 
-    private static RenderPipeline buildPipeline() {
-        RenderPipeline base = RenderPipelines.ITEM_CUTOUT;
+    private static RenderPipeline translucentPipeline() {
+        RenderPipeline result = translucentPipeline;
+        if (result == null) {
+            synchronized (StarRenderTypes.class) {
+                result = translucentPipeline;
+                if (result == null) {
+                    result = buildPipeline(RenderPipelines.ITEM_TRANSLUCENT,
+                            STAR_TRANSLUCENT_PIPELINE);
+                    translucentPipeline = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static OitPipelineSet translucentOitPipelines() {
+        OitPipelineSet result = translucentOitPipelines;
+        if (result == null) {
+            synchronized (StarRenderTypes.class) {
+                result = translucentOitPipelines;
+                if (result == null) {
+                    result = buildOitPipelines();
+                    translucentOitPipelines = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static RenderPipeline buildPipeline(RenderPipeline base, Identifier location) {
         RenderPipeline.Builder builder = RenderPipeline.builder()
                 // Points at our shaders: assets/crythst/shaders/core/star.{vsh,fsh}
                 .withVertexShader(CrythstItemSpecialRenderers.STAR_SHADER)
                 .withFragmentShader(CrythstItemSpecialRenderers.STAR_SHADER)
-                .withLocation(CrythstItemSpecialRenderers.STAR_PIPELINE)
-                // Cutout like vanilla item_cutout; the fragment shader decides what
-                // happens in transparent regions.
-                .withShaderDefine("ALPHA_CUTOUT", 0.1f);
+                .withLocation(location)
+                // The overlay only draws effect-mask texels; everything else is
+                // discarded instead of sampling the real texture.
+                .withShaderDefine("STAR_MASK_ONLY");
 
+        // Preserve the vanilla item pipeline layout (uniforms, vertex format,
+        // colour target format/blending). Only depth behaviour and shaders
+        // differ.
         for (BindGroupLayout layout : base.getBindGroupLayouts()) {
             builder.withBindGroupLayout(layout);
         }
@@ -95,19 +145,50 @@ final class StarRenderTypes {
             builder.withVertexBinding(i, base.getVertexFormatBinding(i));
         }
         for (int i = 0; i < base.getColorTargetStates().size(); i++) {
-            // Enable alpha blending: the rim is translucent (opaque pixels keep
-            // alpha=1, so the blend result is unchanged).
-            builder.withColorTargetState(i, i == 0
-                    ? new ColorTargetState(BlendFunction.TRANSLUCENT)
-                    : base.getColorTargetStates().get(i));
+            builder.withColorTargetState(i, base.getColorTargetStates().get(i));
         }
 
         return builder
                 .withPrimitiveTopology(base.getPrimitiveTopology())
-                .withDepthStencilState(base.getDepthStencilState())
+                // The real pass owns depth. The overlay tests against it, but
+                // must never write depth: later geometry (including translucent
+                // quads and other items) must not be occluded by the star pass.
+                .withDepthStencilState(new DepthStencilState(
+                        depthCompare(StarRenderPlan.STAR_DEPTH_TEST),
+                        StarRenderPlan.STAR_WRITES_DEPTH))
                 .withPolygonMode(base.getPolygonMode())
                 .withCull(base.isCull())
                 .withPushConstantSize(base.pushConstantSize())
                 .build();
+    }
+
+    private static CompareOp depthCompare(StarRenderPlan.DepthTest depthTest) {
+        return switch (depthTest) {
+            case GREATER_THAN_OR_EQUAL -> CompareOp.GREATER_THAN_OR_EQUAL;
+        };
+    }
+
+    /**
+     * OIT variants for translucent star quads. The shader already contains the
+     * {@code OIT_ALPHA_ONLY}/{@code OIT_ACCUMULATE} branches; the set lets the
+     * same RenderType participate in improved transparency instead of
+     * crashing with "does not have OIT pipelines set up".
+     */
+    private static OitPipelineSet buildOitPipelines() {
+        RenderPipeline.Snippet base = RenderPipeline.builder(RenderPipelines.OIT_ITEM_SNIPPET)
+                .withBindGroupLayout(BindGroupLayouts.GLOBALS)
+                .withVertexShader(CrythstItemSpecialRenderers.STAR_SHADER)
+                .withFragmentShader(CrythstItemSpecialRenderers.STAR_SHADER)
+                .withShaderDefine("STAR_MASK_ONLY")
+                .buildSnippet();
+
+        return OitPipelineSet.builder("star_item", RenderPipeline.builder(base))
+                .withAccumulateModifier(accumulate -> accumulate
+                        .withBindGroupLayout(BindGroupLayouts.SAMPLER1)
+                        .withBindGroupLayout(BindGroupLayouts.SAMPLER2))
+                .build();
+    }
+
+    private record AtlasKey(Identifier atlas, boolean translucent) {
     }
 }
