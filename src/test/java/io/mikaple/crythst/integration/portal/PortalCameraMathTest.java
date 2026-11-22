@@ -56,8 +56,8 @@ class PortalCameraMathTest {
         final Vector3d afterVelocity = transform.transformDirection(beforeVelocity);
         assertEquals(beforeVelocity.length(), afterVelocity.length(), 1.0e-9,
                 "speed is continuous across the seam");
-        assertTrue(afterVelocity.dot(exit().normal()) > 0.0,
-                "the transformed camera leaves through the exit front");
+        assertTrue(afterVelocity.dot(exit().normal()) < 0.0,
+                "negative travel stays negative at the exit");
     }
 
     @Test
@@ -110,6 +110,45 @@ class PortalCameraMathTest {
     }
 
     @Test
+    void parallelPortalsPreserveHeadingAndDisplayTheLinkedSide() {
+        final Vector3d forward = new Vector3d(0.0, 0.0, -1.0);
+        final PortalPlane entry = PortalPlane.fromLook(new Vector3d(0.0, 64.0, 0.0),
+                forward, 2.0, 4.0, 4.0);
+        final PortalPlane exit = PortalPlane.fromLook(new Vector3d(20.0, 64.0, 0.0),
+                forward, 2.0, 4.0, 4.0);
+        assertVectorEquals(forward, entry.normal());
+        final PortalTransform transform = PortalTransform.between(entry, exit);
+        final PortalCameraMath.Pose camera = PortalCameraMath.portalCamera(
+                transform, new Vector3d(0.0, 64.0, 0.0), new Quaterniond(), projection());
+        final Vector3d throughDoor = new Vector3d(forward).rotate(camera.orientation());
+
+        assertEquals(1.0, throughDoor.dot(exit.normal()), 1.0e-9);
+        assertTrue(exit.local(camera.position()).z < 0.0);
+        final Vector3d cameraRight = new Vector3d(1.0, 0.0, 0.0).rotate(camera.orientation());
+        final Vector3d landmark = exit.origin().fma(3.0, throughDoor).add(cameraRight);
+        assertTrue(PortalCameraMath.project(camera.viewProjection(), camera.position(), landmark).ndcX() > 0.0);
+    }
+
+    @Test
+    void differentlyOrientedDoorsShowTheSameHeadingAsTraversal() {
+        final Vector3d forward = new Vector3d(0.0, 0.0, -1.0);
+        final Vector3d exitForward = new Vector3d(1.0, 0.0, 0.0);
+        final Vector3d sourceEye = new Vector3d(0.0, 64.0, 0.0);
+        final PortalPlane entry = PortalPlane.fromLook(sourceEye, forward, 2.0, 4.0, 4.0);
+        final PortalPlane exit = PortalPlane.fromLook(new Vector3d(20.0, 64.0, 10.0),
+                exitForward, 2.0, 4.0, 4.0);
+        final PortalTransform link = PortalTransform.between(entry, exit);
+        final PortalCameraMath.Pose camera = PortalCameraMath.portalCamera(
+                link, sourceEye, new Quaterniond(), projection());
+        final Vector3d previewForward = new Vector3d(forward).rotate(camera.orientation());
+        final float[] playerAngles = PortalTransform.yawPitch(link.transformDirection(forward));
+        assertVectorEquals(exitForward, previewForward);
+        assertVectorEquals(exitForward, PortalTransform.viewDirection(playerAngles[0], playerAngles[1]));
+        assertEquals(-2.0, exit.signedDistance(camera.position()), 1.0e-9);
+        assertTrue(exit.signedDistance(link.transformPoint(entry.origin().add(forward))) > 0.0);
+    }
+
+    @Test
     void targetSizePreservesAspectAndCapsResolution() {
         final int[] full = PortalCameraMath.targetSize(1920, 1080, 1.0f, 1920, 1080);
         assertEquals(1920, full[0]);
@@ -148,6 +187,17 @@ class PortalCameraMathTest {
 
         final Vector4f cameraSide = clipped.transform(new Vector4f(0.0f, 0.0f, -1.0f, 1.0f));
         assertTrue(!clipValid(cameraSide), "geometry between camera and portal is clipped");
+    }
+
+    @Test
+    void obliqueClipKeepsDestinationTerrainAtAnAngle() {
+        final Matrix4f clipped = PortalClip.obliqueNearPlane(
+                projection(), new Matrix4f(), new Vector3d(),
+                new Vector3d(0.0, 0.0, -5.0), new Vector3d(1.0, 0.0, 1.0).normalize(),
+                PortalClip.DepthConvention.ZERO_TO_ONE_REVERSED);
+
+        assertTrue(clipValid(clipped.transform(new Vector4f(-30.0f, 0.0f, -40.0f, 1.0f))));
+        assertTrue(!clipValid(clipped.transform(new Vector4f(0.0f, 0.0f, -2.0f, 1.0f))));
     }
 
     @Test

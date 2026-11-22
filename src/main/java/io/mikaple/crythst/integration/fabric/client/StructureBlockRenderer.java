@@ -90,19 +90,18 @@ public final class StructureBlockRenderer {
      * and identity pose stack are available.
      */
     public static void render(LevelRenderContext context) {
-        if (!blockRenderingEnabled || Minecraft.getInstance().level == null
-                || !CrythstFabric.config().enabled) {
-            return;
-        }
-
         final LevelRenderState levelState = context.levelState();
-        final CameraRenderState camera = levelState == null ? null : levelState.cameraRenderState;
-        final SubmitNodeCollector collector = context.submitNodeCollector();
-        if (camera == null || camera.pos == null || collector == null || context.poseStack() == null) {
+        submit(Minecraft.getInstance(), levelState == null ? null : levelState.cameraRenderState,
+                context.submitNodeCollector());
+    }
+
+    public static void submit(Minecraft client, CameraRenderState camera, SubmitNodeCollector collector) {
+        if (!blockRenderingEnabled || client.level == null || !CrythstFabric.config().enabled
+                || camera == null || camera.pos == null || collector == null) {
             return;
         }
 
-        final float alpha = Minecraft.getInstance().getDeltaTracker()
+        final float alpha = client.getDeltaTracker()
                 .getGameTimeDeltaPartialTick(false);
         final List<PhysicsStructure> structures = ClientPhysicsView.structures();
 

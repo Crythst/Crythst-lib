@@ -124,6 +124,12 @@ public final class PortalTeleporter {
                 || !destination.dimension().equals(player.level().dimension())) {
             return;
         }
+        final int tick = server.getTickCount();
+        final Integer ready = ENTITY_READY.get(player.getUUID());
+        if (ready != null && tick < ready) {
+            return;
+        }
+
         // Reject non-finite samples first: NaN compares false against every
         // upper bound below, so a naive "too far" check silently accepts it and
         // then writes a NaN position/rotation into the player.
@@ -175,12 +181,6 @@ public final class PortalTeleporter {
             }
             return;
         }
-        final int tick = server.getTickCount();
-        final Integer ready = ENTITY_READY.get(player.getUUID());
-        if (ready != null && tick < ready) {
-            return;
-        }
-
         final PortalTransform transform =
                 PortalTransform.between(portal.plane(), destination.plane());
         // Placement, velocity and rotation come from the server player, never
@@ -188,8 +188,10 @@ public final class PortalTeleporter {
         final Vec3 serverEyePos = player.getEyePosition();
         final Vector3d serverEye = new Vector3d(
                 serverEyePos.x, serverEyePos.y, serverEyePos.z);
-        final Vector3d feet = PortalTeleportMath.playerFeetForTransformedEye(
-                transform, serverEye, player.getEyeHeight());
+        final PortalCrossing.Crossing crossing = serverInside ? serverCrossing : clientCrossing;
+        final Vector3d feet = PortalTeleportMath.playerFeetAfterCrossing(
+                transform, serverEye, player.getEyeHeight(), serverCentre.y - player.getY(),
+                crossing.alongPositiveDirection());
         Vec3 serverMovement = player.getKnownMovement();
         if (serverMovement.lengthSqr() < 1.0e-8) {
             serverMovement = player.getDeltaMovement();
@@ -267,9 +269,7 @@ public final class PortalTeleporter {
                     continue;
                 }
 
-                // One rigid transform for both directions: the transformed
-                // entry side is the destination side it leaves through, and
-                // the transformed velocity always points away from the plane.
+                // One rigid transform preserves the local direction of travel.
                 final PortalTransform transform =
                         PortalTransform.between(portal.plane(), destination.plane());
 
@@ -299,7 +299,7 @@ public final class PortalTeleporter {
                         result = "cooldown";
                     } else if (crossing != null) {
                         teleported = teleportEntity(
-                                entity, level, destination, destinationLevel, transform);
+                                entity, level, destination, destinationLevel, transform, crossing);
                         if (teleported) {
                             teleportedEntities.add(entity.getUUID());
                             ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
@@ -413,7 +413,7 @@ public final class PortalTeleporter {
 
     private static boolean teleportEntity(Entity entity, ServerLevel level,
                                           Portal destination, ServerLevel destinationLevel,
-                                          PortalTransform transform) {
+                                          PortalTransform transform, PortalCrossing.Crossing crossing) {
         final Vector3d velocity = new Vector3d(
                 entity.getDeltaMovement().x,
                 entity.getDeltaMovement().y,
@@ -424,20 +424,17 @@ public final class PortalTeleporter {
                 PortalTransform.viewDirection(entity.getYRot(), entity.getXRot())));
 
         final Vector3d base = entity instanceof ServerPlayer player
-                ? PortalTeleportMath.playerFeetForTransformedEye(
+                ? PortalTeleportMath.playerFeetAfterCrossing(
                         transform, new Vector3d(
                                 player.getEyePosition().x,
                                 player.getEyePosition().y,
                                 player.getEyePosition().z),
-                        player.getEyeHeight())
+                        player.getEyeHeight(), player.getBoundingBox().getCenter().y - player.getY(),
+                        crossing.alongPositiveDirection())
                 : transform.transformPoint(new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
         final Vector3d target = new Vector3d(base);
         if (!(entity instanceof ServerPlayer)) {
-            // The player's eye is placed exactly at T(eye): at the crossing
-            // instant the new camera position equals the transformed view
-            // through the portal, so the transition is geometrically
-            // continuous. Other entities get a tiny bias on the exit side the
-            // transformed motion actually leaves through.
+            // Other entities get a tiny bias along their transformed motion.
             final Vector3d entryLocal = transform.entry().local(
                     new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
             target.add(PortalTeleportMath.exitBias(

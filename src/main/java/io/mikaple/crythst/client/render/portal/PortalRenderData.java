@@ -3,6 +3,7 @@ package io.mikaple.crythst.client.render.portal;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
+import net.minecraft.client.renderer.gizmos.DrawableGizmoPrimitives;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -20,6 +21,7 @@ record PortalRenderData(
         PortalSnapshot portal,
         PortalViewCamera view,
         LevelRenderState state,
+        DrawableGizmoPrimitives hitboxes,
         List<SectionRenderDispatcher.RenderSection> sections,
         Matrix4f screenViewProjection,
         Vec3 screenCameraPosition,

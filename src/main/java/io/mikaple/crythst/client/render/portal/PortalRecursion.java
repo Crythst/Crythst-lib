@@ -20,6 +20,15 @@ public final class PortalRecursion {
 
     /** The next layer when a visible child portal is drawn, or 0 when denied. */
     public static int nextLayer(int parentLayer, int limit, UUID childId, Set<UUID> ancestors) {
+        return nextLayer(parentLayer, limit, childId, ancestors, null);
+    }
+
+    /**
+     * The exit surface is already the entry to the current view. Rendering it
+     * again would apply the inverse link and replace the view with its source.
+     */
+    public static int nextLayer(int parentLayer, int limit, UUID childId,
+                                Set<UUID> ancestors, UUID currentExitId) {
         if (parentLayer < MIN_LAYER || limit < MIN_LAYER) {
             return 0;
         }
@@ -27,7 +36,8 @@ public final class PortalRecursion {
         if (next > limit) {
             return 0;
         }
-        if (childId != null && ancestors != null && ancestors.contains(childId)) {
+        if (childId != null && (childId.equals(currentExitId)
+                || (ancestors != null && ancestors.contains(childId)))) {
             return 0;
         }
         return next;
