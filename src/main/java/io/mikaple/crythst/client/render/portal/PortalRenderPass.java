@@ -101,8 +101,6 @@ final class PortalRenderPass {
     private final List<LayerTargets> layerTargets = new ArrayList<>();
     private final List<PortalCloudRenderer> portalClouds = new ArrayList<>();
     private boolean failureLogged;
-    /** True when a layer-1 portal drew its opening, so the final occlusion depth is valid. */
-    private boolean renderedLayerOne;
 
     /**
      * Adds the portal pass and returns the newest main-target handle. The
@@ -168,7 +166,6 @@ final class PortalRenderPass {
 
         modelViewStack.pushMatrix();
         try {
-            renderedLayerOne = false;
             final Set<Integer> failedLayers = new HashSet<>();
             for (int index = 0; index < data.size(); index++) {
                 final PortalRenderData layer = data.get(index);
@@ -193,9 +190,6 @@ final class PortalRenderPass {
                                 "Crythst same-FBO portal pass failed; skipping frame", error);
                     }
                 }
-            }
-            if (renderedLayerOne) {
-                restoreOcclusionDepth(main);
             }
         } finally {
             modelViewStack.popMatrix();
@@ -315,16 +309,16 @@ final class PortalRenderPass {
         // 7. Composite: keep destination pixels inside the opening, restore the
         // snapshot outside it. Layer 2 also multiplies by the parent mask.
         composite(minecraft, main, targets, layer);
-        // 8. Restore snapshot depth outside the final mask only. Destination
-        // depth survives inside the opening, which is what lets layer 2 be
-        // occluded by layer 1's destination geometry.
-        restoreDepth(encoder, main, targets, layer);
-        // Records that layer 1 produced a valid opening: the final occlusion
-        // depth restore below needs this layer's snapshot depth, which already
-        // holds the portal plane depth through the rasterized mask polygon.
-        if (layer.layer() == 1) {
-            renderedLayerOne = true;
-        }
+        // 8. Put the entry-world depth back over the whole frame, then write the
+        // opening polygon's own depth through it. Nothing reads the destination
+        // depth after compositing, and the polygon write is what clips the
+        // entry-side passes drawn after this pass (batched structures, moving
+        // blocks, block entities, gizmos): inside the opening they are tested
+        // against the portal plane instead of against the destination world,
+        // and where an entry-side occluder already sits in front of the plane
+        // the depth test leaves that occluder untouched.
+        restoreEntryDepth(encoder, main, targets);
+        writeOcclusionDepth(main, targets, layer);
         completed = true;
         } finally {
             if (!completed) {
@@ -337,32 +331,61 @@ final class PortalRenderPass {
     }
 
     /**
-     * Restores the layer-1 snapshot depth over the whole frame once every layer
-     * has been composited.
+     * Copies the pre-layer depth snapshot back over the whole frame.
      *
-     * <p>Inside a layer-1 opening the snapshot depth already holds the rasterized
-     * portal plane depth, because the mask pass renders the clipped polygon
-     * against that attachment. Restoring it makes the later framegraph passes —
-     * batched structures, moving blocks, block entities and gizmos run after this
-     * pass — depth-test against the portal surface instead of the destination
-     * world. Without it, entry-world geometry behind the portal plane still
-     * passes the destination depth (a destination sky writes far) and is painted
-     * on top of the portal image, which reads as structures flickering through
-     * the opening. Outside the openings this only rewrites the entry-world depth
-     * the snapshot already held, so it is a no-op there.</p>
+     * <p>Inside the opening this restores the entry-world depth that sat behind
+     * the portal, which is the value {@link #writeOcclusionDepth} needs in order
+     * to decide whether the plane is visible there. Outside the opening it is
+     * exactly the depth the layer inherited, so the operation is idempotent.</p>
      */
-    private void restoreOcclusionDepth(RenderTarget main) {
-        final LayerTargets targets = targetsFor(1, main.width, main.height);
-        if (targets == null || targets.snapshot == null) {
-            return;
-        }
+    private void restoreEntryDepth(CommandEncoder encoder, RenderTarget main,
+                                   LayerTargets targets) {
         try {
-            RenderSystem.getDevice().createCommandEncoder().copyTextureToTexture(
-                    targets.snapshot.getDepthTexture(), main.getDepthTexture(),
-                    0, 0, 0, 0, 0, main.width, main.height);
+            encoder.copyTextureToTexture(targets.snapshot.getDepthTexture(),
+                    main.getDepthTexture(), 0, 0, 0, 0, 0, main.width, main.height);
         } catch (Throwable error) {
             PortalRenderDiagnostics.failure(
-                    "Crythst portal pass could not restore the occlusion depth", error);
+                    "Crythst portal pass could not restore the entry depth", error);
+        }
+    }
+
+    /**
+     * Rasterizes the opening polygon again with depth writes enabled, so the
+     * main depth buffer ends up holding the portal plane's own reverse-Z depth
+     * inside the opening.
+     *
+     * <p>This is the mask equivalent of a stencil-marked depth write: the same
+     * vertices the mask pass used (their {@code Position.z} is the plane depth),
+     * the same {@code GREATER_THAN_OR_EQUAL} test, but writing depth instead of
+     * colour. Pixels where entry-side geometry already sits in front of the
+     * plane fail the test and keep their depth, so the clip never punches a hole
+     * in foreground geometry. Without this write the later entry-side passes
+     * would test against the <em>destination</em> depth, which varies per pixel
+     * and produces the speckled, depth-fighting look inside the opening.</p>
+     */
+    private void writeOcclusionDepth(RenderTarget main, LayerTargets targets,
+                                     PortalRenderData layer) {
+        final PortalMaskGeometry.Mask mask = layer.mask();
+        if (mask == null || mask.isEmpty()) {
+            return;
+        }
+        final int bytes = mask.triangles().length * Float.BYTES;
+        if (bytes <= 0 || bytes > maskBufferBytes) {
+            return;
+        }
+        final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
+                        () -> "Crythst portal occlusion depth")
+                .withColorAttachment(main.getColorTextureView())
+                .withDepthAttachment(main.getDepthTextureView())
+                .withRenderArea(new RenderPass.RenderArea(
+                        mask.minX(), mask.minY(), mask.width(), mask.height()))
+                .build();
+        try (RenderPass renderPass = RenderSystem.getDevice()
+                .createCommandEncoder().createRenderPass(descriptor)) {
+            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
+                    PortalPassRenderTypes.maskDepth()));
+            renderPass.setVertexBuffer(0, maskBuffer.slice(0, bytes));
+            renderPass.draw(mask.vertexCount(), 1, 0, 0);
         }
     }
 
@@ -551,33 +574,6 @@ final class PortalRenderPass {
                     PortalPassRenderTypes.depthClear()));
             renderPass.setUniform("Sampler0", targets.mask.getColorTextureView(), nearest);
             renderPass.setUniform("Sampler1", parentMask, nearest);
-            renderPass.draw(3, 1, 0, 0);
-        }
-    }
-
-    /**
-     * Restores snapshot depth only outside the combined final mask. Inside the
-     * opening the destination depth is kept, so a child layer is occluded by
-     * parent-layer geometry instead of always clearing the rectangle.
-     */
-    private void restoreDepth(CommandEncoder encoder, RenderTarget main,
-                              LayerTargets targets, PortalRenderData layer) {
-        final GpuTextureView parentMask = parentMask(main, targets, layer);
-        final GpuSampler nearest = RenderSystem.getSamplerCache()
-                .getClampToEdge(FilterMode.NEAREST);
-        final RenderPassDescriptor descriptor = RenderPassDescriptor.builder(
-                        () -> "Crythst portal depth restore")
-                .withColorAttachment(main.getColorTextureView())
-                .withDepthAttachment(main.getDepthTextureView())
-                .build();
-        try (RenderPass renderPass = RenderSystem.getDevice()
-                .createCommandEncoder().createRenderPass(descriptor)) {
-            renderPass.setPipeline(RenderSystem.getCompiledPipeline(
-                    PortalPassRenderTypes.depthRestore()));
-            renderPass.setUniform("Sampler0",
-                    targets.snapshot.getDepthTextureView(), nearest);
-            renderPass.setUniform("Sampler1", targets.mask.getColorTextureView(), nearest);
-            renderPass.setUniform("Sampler2", parentMask, nearest);
             renderPass.draw(3, 1, 0, 0);
         }
     }

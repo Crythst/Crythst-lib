@@ -30,16 +30,14 @@ final class PortalPassRenderTypes {
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal_mask");
     private static final Identifier DEPTH_CLEAR_SHADER =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal_depth_clear");
-    private static final Identifier DEPTH_RESTORE_FRAGMENT =
-            Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal_depth_restore");
     private static final Identifier COMPOSITE_FRAGMENT =
             Identifier.fromNamespaceAndPath(Crythst.MOD_ID, "core/portal_composite");
     private static final Identifier SCREENQUAD =
             Identifier.withDefaultNamespace("core/screenquad");
 
     private static RenderPipeline mask;
+    private static RenderPipeline maskDepth;
     private static RenderPipeline depthClear;
-    private static RenderPipeline depthRestore;
     private static RenderPipeline composite;
 
     private PortalPassRenderTypes() {
@@ -73,6 +71,43 @@ final class PortalPassRenderTypes {
         return result;
     }
 
+    /**
+     * Writes the opening polygon's own reverse-Z depth into the main depth
+     * attachment, so entry-side geometry drawn by later passes is clipped at
+     * the portal plane instead of at the destination world's depth.
+     *
+     * <p>Same vertex data as {@link #mask()} (the polygon carries the plane
+     * depth in {@code Position.z}) and the same depth test, but depth writes are
+     * enabled and colour writes are masked off. The test keeps pixels where an
+     * entry-side occluder sits in front of the plane untouched.</p>
+     */
+    static RenderPipeline maskDepth() {
+        RenderPipeline result = maskDepth;
+        if (result == null) {
+            synchronized (PortalPassRenderTypes.class) {
+                result = maskDepth;
+                if (result == null) {
+                    result = RenderPipeline.builder()
+                            .withLocation(Identifier.fromNamespaceAndPath(
+                                    Crythst.MOD_ID, "portal_mask_depth"))
+                            .withVertexShader(MASK_SHADER)
+                            .withFragmentShader(MASK_SHADER)
+                            .withVertexBinding(0, DefaultVertexFormat.POSITION)
+                            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+                            .withColorTargetState(new ColorTargetState(
+                                    Optional.empty(), GpuFormat.RGBA8_UNORM,
+                                    ColorTargetState.WRITE_NONE))
+                            .withDepthStencilState(new DepthStencilState(
+                                    CompareOp.GREATER_THAN_OR_EQUAL, true))
+                            .withCull(false)
+                            .build();
+                    maskDepth = result;
+                }
+            }
+        }
+        return result;
+    }
+
     /** Writes reverse-Z far depth through the verified opening polygon. */
     static RenderPipeline depthClear() {
         RenderPipeline result = depthClear;
@@ -95,35 +130,6 @@ final class PortalPassRenderTypes {
                             .withCull(false)
                             .build();
                     depthClear = result;
-                }
-            }
-        }
-        return result;
-    }
-
-    /** Restores the pre-layer depth outside the combined final mask. */
-    static RenderPipeline depthRestore() {
-        RenderPipeline result = depthRestore;
-        if (result == null) {
-            synchronized (PortalPassRenderTypes.class) {
-                result = depthRestore;
-                if (result == null) {
-                    result = RenderPipeline.builder()
-                            .withLocation(Identifier.fromNamespaceAndPath(
-                                    Crythst.MOD_ID, "portal_depth_restore"))
-                            .withVertexShader(SCREENQUAD)
-                            .withFragmentShader(DEPTH_RESTORE_FRAGMENT)
-                            .withBindGroupLayout(
-                                    BindGroupLayouts.SAMPLER0_SAMPLER1_SAMPLER2)
-                            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
-                            .withColorTargetState(new ColorTargetState(
-                                    Optional.empty(), GpuFormat.RGBA8_UNORM,
-                                    ColorTargetState.WRITE_NONE))
-                            .withDepthStencilState(new DepthStencilState(
-                                    CompareOp.ALWAYS_PASS, true))
-                            .withCull(false)
-                            .build();
-                    depthRestore = result;
                 }
             }
         }
