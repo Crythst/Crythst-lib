@@ -136,6 +136,40 @@ The player OBB is then tested against each oriented voxel box. The structure
 boxes are physics-collider boxes, not individual block states, so a merged box
 is treated as one solid rectangular obstacle.
 
+## Swept contact
+
+A post-move correction can only see the pose the tick ended on. When a rotated
+body clears a thin obstacle completely inside one tick — a 5-block fall through
+a one-block floor, or a high-speed dash past a wall — both the old and the new
+box are free and nothing reports a penetration.
+
+`PlayerObbSweep` closes that hole. Before the correction loop runs, when the
+current box is already clear, the tick's motion `oldPosition -> position` is
+swept against the terrain boxes near the swept volume:
+
+```text
+for every face normal of the Minkowski sum (3 + 3 + 9 axes):
+    gap      = |delta·n| - radiusA(n) - radiusB(n)
+    if gap <= 0:  the pair overlaps on this axis now -> no entry time
+    closing  = -(motion·n) * sign(delta·n)
+    if closing <= 0:  this axis never closes -> the tick cannot touch
+    entry    = gap / closing
+contact time = max(entry)        # every axis must overlap at once
+contact normal = the axis that produced that max, oriented out of the obstacle
+```
+
+The feet anchor is clamped to `oldPosition + motion * time + SKIN * normal`, so
+the body stops one skin off the surface, and the contact normal joins the
+velocity projection so inward speed does not accumulate. Obstacles the start box
+already overlaps are skipped — that is the recovery case above, and resolving it
+here would drag the player backwards every tick.
+
+The test suite covers the direct cases: a fast horizontal run into a wall, a
+tunnelling fall through a one-block floor, a rotated-gravity wall, motion away
+from an obstacle, a free move, an already-overlapping obstacle (left to the
+correction loop) and the nearest of two obstacles
+(`PlayerObbSweepTest`).
+
 ## Correction loop
 
 `PlayerObbCollision.tick` runs at most three iterations per player tick:
@@ -198,9 +232,11 @@ vanilla movement:
    and `Entity.move` remain Y-up. Tilted OBB contacts are only corrected after
    the vanilla move has already happened.
 2. **Post-move correction can look like sinking or popping.** A fast-moving
-   player can penetrate deeply during one tick before the correction runs. The
+   player can penetrate deeply during one tick before the correction runs; the
    1.5-block per-iteration cap also means extreme penetrations take several
-   ticks to resolve.
+   ticks to resolve. A motion that would pass *through* an obstacle in one tick
+   is cut at the first contact by `PlayerObbSweep`, but that clamp is a stop, not
+   a slide: there is no step-up or slope following along the contact plane.
 3. **Server correction may rubber-band.** The server teleports the client to the
    corrected position. A client whose local prediction differs (especially
    around structures, which this particular pass only queries on the server)
@@ -230,6 +266,9 @@ vanilla movement:
    - sweep the OBB against block AABBs and structure OBBs with a conservative
      advancement or binary-search time of impact,
    - slide along the contact plane instead of only pushing out afterwards.
+   `PlayerObbSweep` now does the terrain half of this (swept SAT over the 15
+   Minkowski axes); extending it to structure OBBs and turning the stop into a
+   slide is what remains.
 2. Add a proper character controller step: ground detection along `-up`,
    step-up height, slope limit, and velocity projection including friction.
 3. Give this OBB pass the same client structure source already used by

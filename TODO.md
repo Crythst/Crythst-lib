@@ -127,7 +127,10 @@
 - [x] 地形 section 碰撞随方块编辑失效，并按刚体运动范围预取
 - [x] 调试接触点层在 `config.debug` / `/crythst debug` 下自动开启 `setDebugContactCapture`
 - [~] 多人结构的渲染/选择使用延迟姿态，而客户端碰撞使用最新快照；快速移动的远端结构可能有一个同步间隔的碰撞/视觉差异
-- [~] `PlayerObbCollision` 仍是移动后校正；`Entity.move` 碰撞已覆盖普通实体移动，客户端查询仍有边界
+- [~] `PlayerObbCollision` 仍是移动后校正；新增 `PlayerObbSweep` 用扫掠 SAT
+  （15 条 Minkowski 轴）把单 tick 穿过薄障碍的运动截断在首次接触处，穿透/隧穿
+  问题已在纯数学层覆盖并有单元测试；沿接触面滑动、结构 OBB 的扫掠以及客户端
+  结构查询边界仍未做。
 
 ### 当前真实缺口（来自 docs 审计）
 

@@ -111,18 +111,24 @@ public final class PlayerObbCollision {
         final Vector3d total = new Vector3d();
         final List<Vector3d> contactNormals = new ArrayList<>(4);
 
-        // A fast fall can move the rotated OBB completely past a thin ledge
-        // between ticks. Vanilla only swept the Y-up AABB, so recover the first
-        // grazing sample before resolving the current position.
+        // A fast move can carry the rotated OBB completely past a thin ledge
+        // between ticks: the old and the new box are both clear, so a
+        // post-move penetration test reports nothing. Sweep the tick's motion
+        // and cut it at the first contact instead.
         final OrientedBox currentBox = PlayerObb.obb(player, up);
         if (findPushAt(player, currentBox, up) == null) {
-            final Vector3d swept = sweptCorrection(player, currentBox, up);
-            if (swept != null) {
-                player.setPos(player.getX() + swept.x,
-                        player.getY() + swept.y,
-                        player.getZ() + swept.z);
-                total.add(swept);
-                addContact(contactNormals, new Vector3d(swept).normalize());
+            if (!sweepToFirstContact(player, up, total, contactNormals)) {
+                // The swept SAT test skips obstacles the box already overlaps
+                // (recovery, not tunnelling), so keep the coarse sample sweep
+                // as a fallback for grazing contacts it cannot resolve.
+                final Vector3d swept = sweptCorrection(player, currentBox, up);
+                if (swept != null) {
+                    player.setPos(player.getX() + swept.x,
+                            player.getY() + swept.y,
+                            player.getZ() + swept.z);
+                    total.add(swept);
+                    addContact(contactNormals, new Vector3d(swept).normalize());
+                }
             }
         }
 
@@ -255,6 +261,76 @@ public final class PlayerObbCollision {
             }
         }
         return support != null ? support : best;
+    }
+
+    /**
+     * Cuts this tick's motion at the first terrain contact.
+     *
+     * <p>Uses {@link PlayerObbSweep} so a motion that fully clears a thin
+     * obstacle within one tick is still stopped by it, which a post-move
+     * penetration test cannot detect.</p>
+     *
+     * @return {@code true} when an impact was found and applied
+     */
+    private static boolean sweepToFirstContact(Player player, Vector3d up,
+                                               Vector3d total, List<Vector3d> contactNormals) {
+        final Vec3 previous = player.oldPosition();
+        final Vec3 current = player.position();
+        final Vector3d motion = new Vector3d(
+                current.x - previous.x,
+                current.y - previous.y,
+                current.z - previous.z
+        );
+        if (motion.lengthSquared() < SWEEP_MIN_DISTANCE * SWEEP_MIN_DISTANCE) {
+            return false;
+        }
+
+        final OrientedBox from = PlayerObb.box(previous.x, previous.y, previous.z,
+                player.getBbWidth(), player.getBbHeight(), up);
+        final OrientedBox to = PlayerObb.box(current.x, current.y, current.z,
+                player.getBbWidth(), player.getBbHeight(), up);
+        final Aabb sweptBounds = from.toAabb().union(to.toAabb());
+        final List<Aabb> obstacles = terrainAround(player, sweptBounds.expand(BROADPHASE_MARGIN));
+
+        final PlayerObbSweep.Impact impact = PlayerObbSweep.firstImpact(from, motion, obstacles);
+        if (impact == null) {
+            return false;
+        }
+
+        final Vector3d target = PlayerObbSweep.positionBeforeImpact(
+                new Vector3d(previous.x, previous.y, previous.z), motion, impact);
+        final Vector3d delta = new Vector3d(target).sub(current.x, current.y, current.z);
+        if (delta.length() > MAX_SWEEP_CORRECTION) {
+            return false;
+        }
+
+        player.setPos(target.x, target.y, target.z);
+        total.add(delta);
+        addContact(contactNormals, impact.normal());
+        return true;
+    }
+
+    /**
+     * Terrain boxes overlapping {@code broad}, in Crythst's box type.
+     */
+    private static List<Aabb> terrainAround(Player player, Aabb broad) {
+        final net.minecraft.world.phys.AABB query = new net.minecraft.world.phys.AABB(
+                broad.min().x, broad.min().y, broad.min().z,
+                broad.max().x, broad.max().y, broad.max().z
+        );
+        final List<Aabb> obstacles = new ArrayList<>(8);
+        for (VoxelShape shape : player.level().getBlockCollisions(player, query)) {
+            if (shape.isEmpty()) {
+                continue;
+            }
+            for (net.minecraft.world.phys.AABB raw : shape.toAabbs()) {
+                obstacles.add(new Aabb(
+                        new Vector3d(raw.minX, raw.minY, raw.minZ),
+                        new Vector3d(raw.maxX, raw.maxY, raw.maxZ)
+                ));
+            }
+        }
+        return obstacles;
     }
 
     /**
