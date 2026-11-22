@@ -660,9 +660,11 @@ world.removeConstraint(handle);
 
 ```java
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
+import io.mikaple.crythst.api.physics.constraint.DofAxisConfiguration;
 import io.mikaple.crythst.api.physics.constraint.FixedConstraintConfiguration;
 import io.mikaple.crythst.api.physics.constraint.FreeConstraintConfiguration;
 import io.mikaple.crythst.api.physics.constraint.RotaryConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.SixDofConstraintConfiguration;
 import io.mikaple.crythst.api.physics.constraint.StructureConstraintHandle;
 
 PhysicsPipeline pipeline = CrythstApi.physics(serverLevel);
@@ -679,22 +681,42 @@ StructureConstraintHandle hinge = pipeline.addConstraint(a, b,
 StructureConstraintHandle point = pipeline.addConstraint(a,
         FreeConstraintConfiguration.toWorld(new Vector3d(100.0, 70.0, 0.0)));
 
+// 完整 6-DOF：逐轴限位/自由/锁定、电机、弹簧。
+StructureConstraintHandle sixDof = pipeline.addConstraint(a, b,
+        SixDofConstraintConfiguration.between(frameA, frameB,
+                DofAxisConfiguration.limited(-1.0, 2.0).withMotor(0.75, 120.0),
+                DofAxisConfiguration.locked(),
+                DofAxisConfiguration.free(),
+                DofAxisConfiguration.limited(-0.5, 0.5),
+                DofAxisConfiguration.free(),
+                DofAxisConfiguration.free()));
+sixDof.setLimits(SixDofAxis.LINEAR_X, -2.0, 2.0);
+sixDof.setDofMotor(SixDofAxis.LINEAR_X, true, 1.0, 200.0);
+sixDof.setDofSpring(SixDofAxis.ANGULAR_X, true, 10.0, 0.7);
+sixDof.appliedImpulse(); // 最近一步的总冲量；逐轴冲量 Bullet 不提供
+
 // 也可直接从结构创建：
 StructureConstraintHandle direct = a.addConstraint(b, config);
 StructureConstraintHandle world = a.addConstraintToWorld(config);
 List<StructureConstraintHandle> involvingA = a.constraints();
 a.removeConstraint(direct);
+pipeline.removeConstraints(a);   // 删除涉及 a 的全部约束
+a.removeAllConstraints();
 
 hinge.configuration();   // 创建时的不可变配置
 hinge.structureA();
 hinge.bodyIdA();
 hinge.isWorldAnchored();
+hinge.localAnchorA();
+hinge.worldAnchorA();
 hinge.setEnabled(false);
 ```
 
-`GenericConstraintConfiguration` 是沿 frame 局部 X 轴的 prismatic/slider 子集，不是完整
-6-DOF。完整 6-DOF、每个轴独立限位/电机和约束持久化尚未实现；重载后需按结构稳定
-身份和保存的配置重建。
+`SixDofConstraintConfiguration` 对应 Bullet `btGeneric6DofSpring2Constraint`
+（libbulletjme `New6Dof`），轴顺序为 X/Y/Z 平移、X/Y/Z 旋转。`disabled` 表示该轴
+自由（无约束），`locked()` 锁定在零，`limited(lo, hi)` 为范围。平移量纲为米/秒/牛，
+转动为弧度/秒/牛·米。约束通过稳定结构 UUID 持久化到 `crythst/constraints`，
+重载后按结构局部锚点恢复；找不到结构或原始后端约束（无 API 配置）时安全跳过。
 
 ### 7.7 松散箱体与绳索
 
@@ -1438,7 +1460,8 @@ points.clear();
 - actor 发现和 force-group 缓存都需要 refresh/reindex/remove 来清理旧状态。
 - `StructureLevelView` 不是 `Level` 子类；entities 仍属于主世界，chunk 查询不加载
   chunk，跨边界邻居图/光照/pathfinding 未实现。
-- 约束只提供 fixed/free/rotary/prismatic 子集；完整 6-DOF、约束持久化未实现。
+- 约束提供 fixed/free/rotary/prismatic/6-DOF 与持久化；6-DOF 只暴露 Bullet 的总关节
+  冲量，不提供逐轴冲量；无 API 配置的原始后端约束不持久化。
 - 绳索是子步冲量绳，不是 solver 约束，会拉伸且没有碰撞。
 - loading ticket pin 的是主世界 chunk，不提供 Sable plot-region ticket 语义。
 - 尚未提供：schematic 上下文、完整 force-group debug 面板、block-entity render

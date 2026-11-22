@@ -2,6 +2,7 @@ package io.mikaple.crythst.integration.fabric.network;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.client.network.ClientStructureCache;
+import io.mikaple.crythst.network.structure.StructureBlockEntityPayload;
 import io.mikaple.crythst.network.structure.StructurePosePayload;
 import io.mikaple.crythst.network.structure.StructureRemovePayload;
 import io.mikaple.crythst.network.structure.StructureRequestPayload;
@@ -49,6 +50,12 @@ final class StructureSyncClient {
                         requestFullSyncThrottled();
                     }
                 }));
+        ClientPlayNetworking.registerGlobalReceiver(StructureBlockEntityPayload.TYPE,
+                (payload, context) -> context.client().execute(() -> {
+                    if (!ClientStructureCache.applyBlockEntities(payload)) {
+                        requestFullSyncThrottled();
+                    }
+                }));
 
         // Do not clear on JOIN: the server may already have sent the first
         // batch. A fresh connection starts with an empty cache (cleared on
@@ -57,7 +64,15 @@ final class StructureSyncClient {
             ClientStructureCache.clear();
             lastResyncNanos = 0L;
         });
-        ClientTickEvents.END_CLIENT_TICK.register(StructureSyncClient::tickDimension);
+        ClientTickEvents.END_CLIENT_TICK.register(StructureSyncClient::tick);
+    }
+
+    private static void tick(Minecraft client) {
+        if (ClientStructureCache.consumeBlockEntityResyncRequest()) {
+            StructureSyncDebug.log("client block-entity base revision mismatch; requesting full resync");
+            requestFullSyncThrottled();
+        }
+        tickDimension(client);
     }
 
     /**

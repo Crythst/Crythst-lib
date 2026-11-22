@@ -5,14 +5,18 @@ import io.mikaple.crythst.api.CrythstEvents;
 import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.api.event.PhysicsTickEvent;
 import io.mikaple.crythst.api.physics.PhysicsPipeline;
+import io.mikaple.crythst.api.physics.StructureMassTracker;
 import io.mikaple.crythst.api.physics.StructurePhysicsRuntime;
+import io.mikaple.crythst.api.physics.force.ForceTotals;
 import io.mikaple.crythst.config.CrythstConfig;
 import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
+import io.mikaple.crythst.integration.minecraft.boundary.StructureBoundaryBridge;
 import io.mikaple.crythst.integration.minecraft.structure.StructureBlockSnapshots;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
 import io.mikaple.crythst.physics.PhysicsEngine;
+import io.mikaple.crythst.physics.debug.ForceDebugSnapshot;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.structure.StructureDef;
 import io.mikaple.crythst.physics.tick.PhysicsTimingMonitor;
@@ -60,6 +64,12 @@ public final class LevelPhysics implements AutoCloseable {
     private boolean subLevelCreationFailed;
     private EmptyPhysicsLevel.TickResult lastVoidTick = EmptyPhysicsLevel.TickResult.EMPTY;
     private int voidTickLogCounter;
+    /**
+     * Explicit host &lt;-&gt; structure boundary graph. Lazily allocated so a
+     * dimension without structures pays nothing and so construction order does
+     * not matter.
+     */
+    private StructureBoundaryBridge boundary;
 
     /**
      * Last auxiliary-entity projection pass. Entities spawned by dispensers and
@@ -73,8 +83,16 @@ public final class LevelPhysics implements AutoCloseable {
     private final Map<UUID, Long> entityProjectionRetryAfter = new HashMap<>();
     private boolean entityProjectionFailureLogged;
 
+    /**
+     * Upper bound on the per-tick force debug publication. The F3+F6 layer is
+     * bounded again while drawing; this cap prevents a pathological world with
+     * thousands of bodies from allocating an unbounded snapshot each tick.
+     */
+    private static final int MAX_FORCE_DEBUG_STRUCTURES = 64;
+
     private volatile List<PhysicsStructure> renderStructures = List.of();
     private volatile io.mikaple.crythst.physics.debug.PhysicsDebugSnapshot renderDebugSnapshot;
+    private volatile List<ForceDebugSnapshot> renderForceSnapshots = List.of();
 
     private long lastTickNanos = System.nanoTime();
     private boolean closed;
@@ -150,8 +168,43 @@ public final class LevelPhysics implements AutoCloseable {
         return renderDebugSnapshot;
     }
 
+    /**
+     * Per-structure force/torque snapshots for the {@code crythst:physics_forces}
+     * debug layer.
+     *
+     * <p>Published by the server thread once per tick and bounded to
+     * {@value #MAX_FORCE_DEBUG_STRUCTURES} structures. The returned list and
+     * every element are immutable, so the render thread can read it without
+     * touching Bullet or the live structures.</p>
+     */
+    public List<ForceDebugSnapshot> renderForceSnapshots() {
+        return renderForceSnapshots;
+    }
+
     private void refreshRenderStructures() {
         renderStructures = List.copyOf(structures);
+    }
+
+    private void publishForceDebugSnapshots() {
+        final List<ForceDebugSnapshot> snapshots =
+                new ArrayList<>(Math.min(structures.size(), MAX_FORCE_DEBUG_STRUCTURES));
+        for (PhysicsStructure structure : structures) {
+            if (snapshots.size() >= MAX_FORCE_DEBUG_STRUCTURES) {
+                break;
+            }
+            if (structure.closed()) {
+                continue;
+            }
+            final ForceTotals totals = structureActors.lastTotals(structure);
+            final StructureMassTracker tracker = StructureMassTracker.of(structure);
+            snapshots.add(new ForceDebugSnapshot(
+                    structure.body().id(),
+                    tracker.mass(),
+                    structure.pose().position(),
+                    tracker.centerOfMassWorld(),
+                    totals));
+        }
+        renderForceSnapshots = List.copyOf(snapshots);
     }
 
     /**
@@ -176,6 +229,7 @@ public final class LevelPhysics implements AutoCloseable {
             try {
                 sub.setAttachedEntities(attachedEntities);
                 sub.setEntityProjector(this::projectVoidEntity);
+                sub.setBoundaryBridge(boundary());
                 sub.addStructure(structure, definition.volume());
                 refreshStructureActors(structure);
             } catch (Throwable t) {
@@ -195,6 +249,15 @@ public final class LevelPhysics implements AutoCloseable {
     public void removeStructure(PhysicsStructure structure) {
         structure.invalidateBlockEntityActors();
         structureActors.forget(structure);
+        // Remove joints explicitly before the body/region disappears. The
+        // backend also does this on body removal, but doing it here keeps
+        // persistence/observation deterministic.
+        try {
+            structure.removeAllConstraints();
+        } catch (Throwable t) {
+            Crythst.LOGGER.debug("Could not remove constraints for structure body #{}",
+                    structure.body().id(), t);
+        }
         // Release decorations/seats as normal host entities at their last valid
         // pose before the body/region disappears.
         attachedEntities.releaseStructure(structure);
@@ -210,6 +273,9 @@ public final class LevelPhysics implements AutoCloseable {
                 Crythst.LOGGER.warn("Error removing structure body #{} from the auxiliary void level",
                         structure.body().id(), t);
             }
+        }
+        if (boundary != null) {
+            boundary.onStructureRemoved(structure);
         }
         structures.remove(structure);
         refreshRenderStructures();
@@ -324,10 +390,28 @@ public final class LevelPhysics implements AutoCloseable {
         } else {
             subLevel.setAttachedEntities(attachedEntities);
             subLevel.setEntityProjector(this::projectVoidEntity);
+            subLevel.setBoundaryBridge(boundary());
             Crythst.LOGGER.info("Created auxiliary void level for {} (block logic ticking enabled)",
                     level.dimension().identifier());
         }
         return subLevel;
+    }
+
+    /**
+     * The host &lt;-&gt; structure boundary bridge for this world.
+     *
+     * <p>Public so mixins and commands can route raw host events without
+     * allocating a second graph. The object is server-thread confined; render
+     * code must not call it.</p>
+     */
+    public StructureBoundaryBridge boundary() {
+        if (boundary == null) {
+            boundary = new StructureBoundaryBridge(this);
+            if (subLevel != null) {
+                subLevel.setBoundaryBridge(boundary);
+            }
+        }
+        return boundary;
     }
 
     /**
@@ -470,6 +554,9 @@ public final class LevelPhysics implements AutoCloseable {
                     subLevel.tick(config.subLevelRandomTickSpeed);
             lastVoidTick = result;
             applyAuxiliaryEdits(result.changedStructures());
+            // The boundary graph runs after mirroring so it sees the final
+            // structure states for this tick (lever/repeater/fluid changes).
+            boundary().tick();
             if (Boolean.getBoolean("crythst.void.logTicks")
                     && (++voidTickLogCounter % 100 == 0)) {
                 Crythst.LOGGER.info("Crythst void status: {}", voidTickStatus());
@@ -565,6 +652,9 @@ public final class LevelPhysics implements AutoCloseable {
         if (closed) {
             return;
         }
+        // `/crythst debug` (or config.debug) enables the F3+F6 contact layer.
+        // Bullet only records contacts while this flag is on.
+        world.setDebugContactCapture(config.debug);
         final long now = System.nanoTime();
         final double wallDelta = Math.max(0.0, (now - lastTickNanos) / 1_000_000_000.0);
         lastTickNanos = now;
@@ -612,6 +702,7 @@ public final class LevelPhysics implements AutoCloseable {
             maxPoseAngle = Math.max(maxPoseAngle, structure.renderPoseAngleDelta());
         }
         renderDebugSnapshot = world.debugSnapshot();
+        publishForceDebugSnapshots();
         maybeRebase();
         // Attached host mirrors (item frames, paintings, seats) and their
         // passengers follow the pose that was just published. This runs before
@@ -664,6 +755,7 @@ public final class LevelPhysics implements AutoCloseable {
             maxPoseAngle = Math.max(maxPoseAngle, structure.renderPoseAngleDelta());
         }
         renderDebugSnapshot = world.debugSnapshot();
+        publishForceDebugSnapshots();
         if (count > 0) {
             // A manual batch may advance many fixed steps at once. Tick the
             // void level once for the batch to avoid multiplying random ticks
@@ -714,6 +806,9 @@ public final class LevelPhysics implements AutoCloseable {
         // disappear, then clear the auxiliary regions exactly once before their
         // structures (and therefore their body ids) are closed.
         attachedEntities.clear();
+        if (boundary != null) {
+            boundary.clear();
+        }
         clearSubLevel();
         for (PhysicsStructure structure : structures) {
             structure.invalidateBlockEntityActors();
@@ -722,6 +817,7 @@ public final class LevelPhysics implements AutoCloseable {
         structures.clear();
         structureActors.clear();
         refreshRenderStructures();
+        renderForceSnapshots = List.of();
         terrain.invalidateAll();
         for (io.mikaple.crythst.physics.body.BodyHandle body
                 : java.util.List.copyOf(world.bodies())) {
@@ -891,6 +987,7 @@ public final class LevelPhysics implements AutoCloseable {
                 + " attachedAdopted=" + subLevel.totalAdoptedAttachedEntities()
                 + " ejectionFailures=" + subLevel.totalEjectionFailures()
                 + " attached=" + attachedEntities.summary()
+                + " " + boundary().status()
                 + " " + subLevel.tickDiagnostics()
                 + " last=" + lastVoidTick.summary();
     }
@@ -998,6 +1095,9 @@ public final class LevelPhysics implements AutoCloseable {
         }
         closed = true;
         attachedEntities.clear();
+        if (boundary != null) {
+            boundary.clear();
+        }
         if (subLevel != null) {
             try {
                 subLevel.close();
@@ -1015,6 +1115,7 @@ public final class LevelPhysics implements AutoCloseable {
         structureActors.clear();
         refreshRenderStructures();
         renderDebugSnapshot = null;
+        renderForceSnapshots = List.of();
         terrain.close();
         world.close();
         Crythst.LOGGER.info("Closed physics world for {}", level.dimension().identifier());

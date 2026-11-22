@@ -9,6 +9,7 @@ import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.StatefulVoxelVolume;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacementHandler;
+import io.mikaple.crythst.integration.minecraft.gameevent.StructurePlayerProgress;
 import io.mikaple.crythst.integration.minecraft.operation.StructureOperationRedirector;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
@@ -417,7 +418,7 @@ public final class StructureInteraction {
                 Block.popResource(level, dropPos, drop);
             }
             player.getMainHandItem().mineBlock(level, previousState, dropPos, player);
-            player.awardStat(net.minecraft.stats.Stats.BLOCK_MINED.get(previousState.getBlock()));
+            StructurePlayerProgress.onCustomBreak(player, structure, x, y, z, previousState);
             player.causeFoodExhaustion(0.005F);
         }
         // Removing a block can disconnect the remaining solid cells. The
@@ -602,12 +603,21 @@ public final class StructureInteraction {
             StructureBlockStates.remove(structure, x, y, z);
             return PlaceResult.FAILED;
         }
-        physics.refreshStructure(structure, targetVolume);
+        final List<PhysicsStructure> placedBodies =
+                physics.refreshStructure(structure, targetVolume);
 
         applyImpulse(player, structure, hit.worldHit(), -MINING_IMPULSE * PLACE_IMPULSE_FRACTION * scale(
                 MinecraftPhysics.config().miningImpulseScale));
         StructureFeedback.placeBlock(level, feedbackCenter, state, blockScale,
                 level.getRandom());
+        // The custom fallback never runs vanilla BlockItem.place/ItemStack.useOn,
+        // so award the same placement advancement trigger and item-used stat.
+        final PhysicsStructure progressTarget = structure.closed()
+                ? nearestStructure(placedBodies, feedbackCenter) : structure;
+        if (progressTarget != null) {
+            StructurePlayerProgress.onCustomPlace(player, progressTarget, x, y, z,
+                    player.getMainHandItem());
+        }
         notifyListeners(player, structure, x, y, z, null, state);
         return new PlaceResult(true, x, y, z);
     }
@@ -837,6 +847,7 @@ public final class StructureInteraction {
         final boolean projecting = physics.beginAuxiliaryAudioProjection(structure);
         try {
             final ItemStack stack = player.getMainHandItem();
+            final ItemStack usedStack = stack.copy();
             final InteractionResult signResult = StructureSignInteraction.tryUse(
                     player, structure, live, auxiliaryHit, stack,
                     InteractionHand.MAIN_HAND, x, y, z);
@@ -849,6 +860,7 @@ public final class StructureInteraction {
             }
 
             InteractionResult result;
+            boolean emptyHandUse = stack.isEmpty();
             if (stack.isEmpty()) {
                 result = state.useWithoutItem(auxiliaryLevel, player, auxiliaryHit);
             } else {
@@ -858,7 +870,12 @@ public final class StructureInteraction {
                     // Mirror vanilla ServerPlayerGameMode: a block that reports
                     // "try with an empty hand" gets its no-item use executed.
                     result = state.useWithoutItem(auxiliaryLevel, player, auxiliaryHit);
+                    emptyHandUse = true;
                 }
+            }
+            if (result != null && result.consumesAction()) {
+                StructurePlayerProgress.onCustomUse(player, structure, x, y, z,
+                        usedStack, emptyHandUse);
             }
             return result == null ? InteractionResult.PASS : result;
         } finally {

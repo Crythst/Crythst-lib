@@ -34,7 +34,7 @@ public abstract class DebugRendererMixin {
         if (minecraft.debugEntries.isCurrentlyEnabled(DebugScreenEntries.ENTITY_HITBOXES)) {
             this.renderers.add(new PlayerObbDebugRenderer());
         }
-        if (minecraft.debugEntries.isCurrentlyEnabled(CrythstDebugEntries.PHYSICS)) {
+        if (CrythstDebugEntries.anyRendererEnabled(minecraft.debugEntries)) {
             this.renderers.add(new CrythstPhysicsDebugRenderer());
         }
     }

@@ -180,6 +180,15 @@ void main() {
     // 注意必须在 color *= vertexColor 之前判断，否则顶点光照会把暗色像素也判成黑色
     bool isMask = isMaskTexel(color.rgb);
 
+    // STAR_MASK_ONLY: 这是真实模型之上的第二遍叠加（见 StarItemModelRenderer）。
+    // 非掩码像素属于真实模型本身，本 pass 必须完全不碰它们，否则会把模型重新
+    // 画一遍并覆盖附魔光效/半透明混合。
+#ifdef STAR_MASK_ONLY
+    if (!isMask) {
+        discard;
+    }
+#endif
+
     color *= vertexColor * ColorModulator;
 
     if (isMask) {
@@ -271,7 +280,13 @@ void main() {
                 vec3 wallColor = mix(vec3(0.18, 0.06, 0.34), vec3(0.76, 0.44, 1.00), faceLight);
                 // 阴影渐变更缓：smoothstep 两头平缓，最深处仍留 60% 亮度
                 wallColor *= mix(1.0, 0.60, smoothstep(0.0, 1.0, depthT));
+#ifndef OIT_ALPHA_ONLY
                 wallColor *= (vertexColor * ColorModulator).rgb * lightMapColor.rgb;  // 顶点光照 + 世界光照
+#else
+                // OIT alpha-only 阶段没有声明 lightMapColor；这里只保留顶点色，
+                // 颜色/光照由 accumulate 阶段负责。
+                wallColor *= (vertexColor * ColorModulator).rgb;
+#endif
                 color.rgb = wallColor;
             }
         }

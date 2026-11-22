@@ -5,6 +5,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.debug.DebugEntryCategory;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
 import net.minecraft.client.gui.components.debug.DebugScreenEntry;
+import net.minecraft.client.gui.components.debug.DebugScreenEntryList;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -49,6 +50,9 @@ public final class CrythstDebugEntries {
     /** Cached Minecraft terrain-collision sections. */
     public static final Identifier PHYSICS_TERRAIN =
             Identifier.fromNamespaceAndPath("crythst", "physics_terrain");
+    /** Per-structure force/torque totals and force-group arrows. */
+    public static final Identifier PHYSICS_FORCES =
+            Identifier.fromNamespaceAndPath("crythst", "physics_forces");
     /** F3 text entry for the structure voxel under the crosshair. */
     public static final Identifier STRUCTURE_TARGET =
             Identifier.fromNamespaceAndPath("crythst", "structure_target");
@@ -56,7 +60,7 @@ public final class CrythstDebugEntries {
     /** All renderer ids, in registration order. */
     public static final List<Identifier> ALL_RENDERERS = List.of(
             PHYSICS, PHYSICS_COLLIDERS, PHYSICS_BOUNDS, PHYSICS_DYNAMICS,
-            PHYSICS_CONTACTS, PHYSICS_BODIES, PHYSICS_TERRAIN);
+            PHYSICS_CONTACTS, PHYSICS_BODIES, PHYSICS_TERRAIN, PHYSICS_FORCES);
 
     /** Shared entry implementation; the debug options screen labels by id path. */
     public static final DebugScreenEntry ENTRY = new PhysicsEntry();
@@ -65,6 +69,23 @@ public final class CrythstDebugEntries {
     public static final DebugScreenEntry STRUCTURE_TARGET_ENTRY = new StructureTargetEntry();
 
     private CrythstDebugEntries() {
+    }
+
+    /**
+     * Whether any Crythst renderer entry is currently enabled. Used to decide
+     * whether the shared debug renderer needs to be added to vanilla's list;
+     * individual layers work without the {@link #PHYSICS} master entry.
+     */
+    public static boolean anyRendererEnabled(DebugScreenEntryList entries) {
+        if (entries == null) {
+            return false;
+        }
+        for (Identifier id : ALL_RENDERERS) {
+            if (entries.isCurrentlyEnabled(id)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static final class PhysicsEntry implements DebugScreenEntry {

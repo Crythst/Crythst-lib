@@ -29,14 +29,27 @@ import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * A {@link SpecialModelRenderer} that bakes an ordinary item model and renders
- * all of its quads with the custom star shader.
+ * A {@link SpecialModelRenderer} that renders a normal item model and then
+ * overlays the star effect on the model's opaque black "window" texels.
  *
- * <p>The item model's geometry, UVs and display transforms still come from the
- * referenced base model; only the {@link RenderType} stored on each quad is
- * swapped. The shader then interprets fully transparent pixels as an animated
- * rim and pure-black pixels as a recessed star field (see
- * {@code assets/crythst/shaders/core/star.fsh}).</p>
+ * <p>The renderer deliberately owns <b>two</b> submissions of the same baked
+ * geometry instead of replacing the model's render types:</p>
+ * <ol>
+ *     <li><b>Real model pass.</b> The quads keep their original
+ *     {@link BakedQuad.MaterialInfo#itemRenderType()} (cutout or translucent
+ *     item sheet), glint render types, tint, lightmap and depth state. This
+ *     pass is, pixel for pixel, an ordinary item model and writes the depth
+ *     that the second pass tests against.</li>
+ *     <li><b>Star mask pass.</b> The same quads are submitted with the star
+ *     shader. The shader discards every texel that is not part of the effect
+ *     mask, so it only replaces opaque near-black pixels. Its pipeline never
+ *     writes depth and uses {@link StarRenderPlan#STAR_DEPTH_TEST}; the real
+ *     model's depth buffer therefore acts as the silhouette mask and stars
+ *     cannot draw through the item, other items, or world geometry.</li>
+ * </ol>
+ *
+ * <p>See {@link StarRenderPlan} for the phase/order rules and
+ * {@link StarMaskMath} for the tested mask/projection math.</p>
  *
  * <p>Registered as the {@code crythst:star} special model type by
  * {@link CrythstItemSpecialRenderers#register()}.</p>
@@ -44,27 +57,50 @@ import java.util.function.Consumer;
 public class StarItemModelRenderer implements SpecialModelRenderer<Item> {
     private static final Logger LOGGER = LoggerFactory.getLogger(StarItemModelRenderer.class);
 
+    /** Original quads, used for extents and as the source of both passes. */
     private final List<BakedQuad> quads;
-    private final ItemQuads itemQuads;
+    /** Real-model quads grouped by whether their vanilla render type blends. */
+    private final ItemQuads realQuads;
+    /** The same geometry with the star overlay render types. */
+    private final ItemQuads starQuads;
 
     public StarItemModelRenderer(List<BakedQuad> quads) {
-        this.quads = quads;
-        this.itemQuads = ItemQuads.split(quads);
+        this.quads = List.copyOf(quads);
+        this.realQuads = ItemQuads.split(this.quads);
+        this.starQuads = ItemQuads.split(withStarShader(this.quads));
     }
 
     @Override
     public void submit(@Nullable Item argument, @NonNull PoseStack poseStack, @NonNull SubmitNodeCollector submitNodeCollector, int lightCoords, int overlayCoords, boolean hasFoil, int outlineColor) {
+        // Pass 1: the ordinary model. Keep its render types, glint and depth
+        // state untouched. `FoilType.STANDARD` selects the vanilla glint render
+        // types, so enchantment glint behaves exactly as on a non-star model.
         submitNodeCollector.submitItem(
                 poseStack,
-                // A special model does not know the current ItemDisplayContext; the
-                // geometry transform has already been applied by LayerRenderState.
+                // A special model does not know the current ItemDisplayContext;
+                // the geometry transform has already been applied by LayerRenderState.
                 ItemDisplayContext.NONE,
                 lightCoords,
                 overlayCoords,
                 outlineColor,
                 ItemStackRenderState.LayerRenderState.EMPTY_TINTS,
-                this.itemQuads,
+                this.realQuads,
                 hasFoil ? ItemStackRenderState.FoilType.STANDARD : ItemStackRenderState.FoilType.NONE
+        );
+
+        // Pass 2: the star mask overlay. It uses the very same geometry and
+        // pose, so its depth values match pass 1 exactly. No depth write: the
+        // real model's depth buffer is the silhouette mask. No outline and no
+        // foil: the real pass already contributed both.
+        submitNodeCollector.submitItem(
+                poseStack,
+                ItemDisplayContext.NONE,
+                lightCoords,
+                overlayCoords,
+                0,
+                ItemStackRenderState.LayerRenderState.EMPTY_TINTS,
+                this.starQuads,
+                ItemStackRenderState.FoilType.NONE
         );
     }
 
@@ -74,23 +110,28 @@ public class StarItemModelRenderer implements SpecialModelRenderer<Item> {
     }
 
     /**
-     * Rewrites the quads baked from a normal model so they render with the star
-     * shader.
+     * Rewrites the quads baked from a normal model so a second submission can
+     * render the star overlay.
      *
-     * <p>During item rendering the RenderType is chosen per quad from
-     * {@link BakedQuad.MaterialInfo#itemRenderType()}, so a fresh MaterialInfo is
-     * built with only that field replaced. The glint render types and every other
-     * material field are preserved.</p>
+     * <p>Only {@link BakedQuad.MaterialInfo#itemRenderType()} changes. The
+     * overlay type is chosen per quad from the original render type, so cutout
+     * quads stay in the solid phase and translucent quads stay in the
+     * translucent phase; the overlay therefore always runs after the real
+     * model. The glint render types are left untouched because the overlay is
+     * submitted with {@link ItemStackRenderState.FoilType#NONE}.</p>
      */
     private static List<BakedQuad> withStarShader(List<BakedQuad> quads) {
         if (quads.isEmpty()) {
             return quads;
         }
 
-        RenderType starType = StarRenderTypes.forAtlas(quads.getFirst().materialInfo().sprite().atlasLocation());
         return quads.stream()
                 .map(quad -> {
                     BakedQuad.MaterialInfo materialInfo = quad.materialInfo();
+                    boolean translucent = StarRenderPlan.star(
+                            materialInfo.itemRenderType().hasBlending()).blended();
+                    RenderType starType = StarRenderTypes.forAtlas(
+                            materialInfo.sprite().atlasLocation(), translucent);
                     BakedQuad.MaterialInfo starMaterialInfo = new BakedQuad.MaterialInfo(
                             materialInfo.sprite(),
                             materialInfo.layer(),
@@ -154,7 +195,7 @@ public class StarItemModelRenderer implements SpecialModelRenderer<Item> {
             ResolvedModel resolvedModel = baker.getModel(this.model);
             TextureSlots textureSlots = resolvedModel.getTopTextureSlots();
             QuadCollection quadCollection = resolvedModel.bakeTopGeometry(textureSlots, baker, BlockModelRotation.IDENTITY);
-            List<BakedQuad> quads = withStarShader(quadCollection.getAll());
+            List<BakedQuad> quads = quadCollection.getAll();
 
             if (quads.isEmpty()) {
                 LOGGER.warn("Star model {} baked zero quads, the item will be invisible", this.model);

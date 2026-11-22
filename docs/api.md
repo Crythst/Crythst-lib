@@ -109,12 +109,23 @@ StructureConstraintHandle hinge = pipeline.addConstraint(a, b,
 StructureConstraintHandle anchor = pipeline.addConstraint(a,
         FreeConstraintConfiguration.toWorld(new Vector3d(100.0, 70.0, 0.0)));
 
+// Full 6-DOF: per-axis limits, motors and springs.
+StructureConstraintHandle sixDof = pipeline.addConstraint(a, b,
+        SixDofConstraintConfiguration.between(frameA, frameB,
+                DofAxisConfiguration.limited(-1.0, 2.0).withMotor(0.75, 120.0),
+                DofAxisConfiguration.locked(),
+                DofAxisConfiguration.free(),
+                DofAxisConfiguration.limited(-0.5, 0.5),
+                DofAxisConfiguration.free(),
+                DofAxisConfiguration.free()));
+
 pipeline.removeConstraint(weld);
+pipeline.removeConstraints(a); // remove every joint involving a
 // Equivalent structure-side convenience methods:
 StructureConstraintHandle h = a.addConstraint(b, config);
 StructureConstraintHandle w = a.addConstraintToWorld(config);
 List<StructureConstraintHandle> mine = a.constraints();
-a.removeConstraint(h);
+int removed = a.removeAllConstraints();
 ```
 
 | Configuration | Backend joint | Degrees of freedom |
@@ -123,20 +134,47 @@ a.removeConstraint(h);
 | `FreeConstraintConfiguration` | point-to-point | 3 rotational |
 | `RotaryConstraintConfiguration` | hinge | 1 rotational + optional motor |
 | `GenericConstraintConfiguration` | slider | 1 translational (local X) + angular limit + optional linear motor |
+| `SixDofConstraintConfiguration` | `btGeneric6DofSpring2Constraint` (`New6Dof`) | all 6, independently limited/free/locked, with per-axis motors and springs |
 
 `StructureConstraintHandle` exposes `id()`, `type()`, `enabled()`,
 `setEnabled`, `isValid()`, `remove()`, `involves`, `structureA/B`,
-`bodyIdA/B`, `configuration()` and the hinge motor accessors
-(`supportsMotor`, `setMotorEnabled`, `motorTargetVelocity`, `maxMotorImpulse`).
+`bodyIdA/B`, `configuration()`, local/world frames and anchors
+(`localFrameA/B`, `worldFrameA/B`, `localAnchorA/B`, `worldAnchorA/B`,
+`axisQuaternionA/B`, `localAxisA/B`, `worldAxisA/B`) and total solver impulse
+feedback
+(`appliedImpulse`, `setFeedbackEnabled`). Hinge motors use
+`supportsMotor`, `setMotorEnabled`, `motorTargetVelocity`, `maxMotorImpulse`.
+6-DOF handles additionally expose `supportsDofControl`, `dofConfiguration`,
+`setLimits`, `setAxisFree`, `setDofMotor`, `setDofMotorEnabled`,
+`setDofMotorTargetVelocity`, `setDofMaxMotorForce`, `setDofSpring`,
+`setDofSpringEnabled`, `setDofStiffness` and `setDofDamping`.
 `constraints()` on a pipeline returns every joint in the world; on a structure
 it returns only joints involving that body.
 
-**Deferred:** a true full 6-DOF configuration with independent per-axis
-limits/motors is not exposed. `GenericConstraintConfiguration` is the existing
-prismatic subset (slide along frame X). Constraints are also not persisted:
-after a reload, recreate them from your own saved structure identities and
-configurations. The configuration object is available on handles created
-through the API to make that straightforward.
+**6-DOF semantics.** Axis order is X/Y/Z translation then X/Y/Z rotation.
+Linear limits/velocities/forces use metres, m/s and newtons; angular ones use
+radians, rad/s and newton-metres. `DofAxisConfiguration.disabled()` means the
+axis is free (unconstrained); `locked()` pins it at zero and
+`limited(lo, hi)` constrains it to a range. Bullet's spring2 joint is used, so
+spring stiffness/damping are supported per axis. Bullet exposes only a total
+joint impulse, not per-axis impulses; `appliedImpulse()` returns that scalar
+(zero unless feedback is available/enabled).
+
+**Persistence.** Constraints created through the API are captured in a
+per-dimension `ConstraintSavedData` (`crythst/constraints`). Each record stores
+a stable constraint UUID, the stable structure UUIDs from
+`StructureSavedData`, the enabled flag and the full structure-local
+configuration. On load, structures are restored first, then joints are
+recreated; records whose structures no longer exist are dropped. Raw backend
+joints without an API configuration are not persisted. Structure removal and
+body removal also remove the involved joints, so no live handle points at a
+dead body.
+
+**Limitations.** Bullet reports only the total applied joint impulse, not
+per-axis components. The rotation order is fixed to XYZ. Re-indexing blocks
+without closing the body (`PhysicsStructure.reindex`) keeps existing joints by
+body id; if the centre of mass moves, body-local anchors are not automatically
+rewritten, so remove and recreate the joint when exact re-anchoring matters.
 
 ### Loose boxes (`physics/box`)
 
@@ -952,8 +990,8 @@ Covered by the native API:
 
 - rigid-body impulse/velocity/teleport handle, centre-of-mass, mass tensor;
 - per-level physics pipeline with body-id operations and no raw stepping;
-- fixed/free/rotary/prismatic structure constraints, handles, add/remove,
-  world-space frame conversion and hinge motor control;
+- fixed/free/rotary/prismatic/6-DOF structure constraints, handles, add/remove,
+  world-space frame conversion, hinge motors and per-axis 6-DOF limits/motors/springs;
 - loose box bodies and a minimal substep-driven rope between structure/world
   anchors;
 - per-cell and total mass tracking, centre of mass, and last-substep force
@@ -979,11 +1017,11 @@ Covered by the native API:
 
 Not covered yet:
 
-- a true full 6-DOF constraint configuration with independent per-axis
-  limits/motors; the current `GenericConstraintConfiguration` is the prismatic
-  subset;
-- constraint persistence across world reloads (recreate from structure identity
-  and the retained configuration);
+- per-axis solver impulse readback for 6-DOF joints (Bullet exposes only the
+  total joint impulse);
+- constraint persistence for raw backend joints that have no API configuration
+  (only constraints created through `PhysicsPipeline`/`PhysicsStructure` carry
+  a serializable configuration);
 - rope solver constraints, rope collision/self-collision and non-impulse rope
   dynamics;
 - a `Level`-subclass `SubLevel` facade with plot/plot-yard allocation and

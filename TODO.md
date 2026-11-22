@@ -117,21 +117,21 @@
 - [x] F3+F6 分层调试条目 `crythst:physics*`，默认全部关闭；`crythst:structure_target` 默认显示在 F3 文本
 - [x] 渲染姿态统一为 timestamped `PoseTimeline`（本地与网络结构），不再用客户端 partial tick 采样
 - [x] 地形 section 碰撞随方块编辑失效，并按刚体运动范围预取
-- [~] 调试接触点层需要显式 `setDebugContactCapture(true)`；当前集成没有自动开启，所以该层通常只显示原点/重力轴
+- [x] 调试接触点层在 `config.debug` / `/crythst debug` 下自动开启 `setDebugContactCapture`
 - [~] 多人结构的渲染/选择使用延迟姿态，而客户端碰撞使用最新快照；快速移动的远端结构可能有一个同步间隔的碰撞/视觉差异
 - [~] `PlayerObbCollision` 仍是移动后校正；`Entity.move` 碰撞已覆盖普通实体移动，客户端查询仍有边界
 
 ### 当前真实缺口（来自 docs 审计）
 
-- [ ] **跨边界图**：structure↔host / structure↔structure 的 redstone、hopper、fluid、neighbour、game event、explosion。
-- [ ] **AI / pathfinding / minecart / boat**：原版查询仍看宿主世界，结构方块是空气。
+- [x] **跨边界图**：structure↔host / structure↔structure redstone、neighbour、hopper、fluid、game event；旋转/缩放面映射仍是主导轴近似。
+- [~] **AI / pathfinding**：结构感知 `PathNavigationRegion`/节点评估已实现；minecart/boat、任意模组直接 `Level` 查询仍缺。
 - [ ] **完整结构 `Level` 视图**：`StructureLevelView` 已有，但 Sable 式 plot/sub-level、chunk holder、光照/pathfinding 集成仍缺。
-- [ ] **完整 6-DOF 约束 + 约束持久化**：当前 fixed/free/rotary/prismatic 子集。
-- [ ] **多人结构 BE NBT / 动画 / 告示牌同步**：当前 BE 渲染、箱子动画、结构告示牌主要是单人。
-- [ ] **自定义 fallback 破坏的 drops/XP/stats**：redirect 路径已走 vanilla，扩体积 fallback 仍缺。
-- [ ] **force debug UI / 自动接触点采集**：API 有 totals，调试层仍要手动开 capture。
-- [ ] **移动传送门载体**、跨维度目标渲染、递归 >1：由 portal 重写处理。
-- [ ] **schematic 上下文 / 结构存储适配**。
+- [x] **完整 6-DOF 约束 + 约束持久化**：每轴限位/电机、Bullet 映射、按结构 UUID + 局部锚点保存。
+- [x] **多人结构 BE NBT / 动画 / 告示牌同步**：protocol v3 分片/dirty 更新；超限条目回退模型。
+- [x] **自定义 fallback 破坏的 drops/stats**：已生成 vanilla drops、工具耐久和挖掘统计；XP 仍由 redirect 路径负责。
+- [x] **force debug UI / 自动接触点采集**：`crythst:physics_forces` + `config.debug` 自动 capture。
+- [~] **传送门**：同帧 masked pass、递归 2、连续穿越已实现；移动载体/跨维度目标渲染/硬件 stencil 仍缺。
+- [x] **schematic 上下文**：vanilla structure NBT + Crythst volume NBT 载入/实例化；Sponge 未支持。
 
 ## Native API v2
 
@@ -143,10 +143,10 @@
 - [x] `api/math/StructureMath` 与 `EntityStructureUtil` 的 `projectOutOfStructure` / `distanceSquaredWithStructures` / `getEyePositionInterpolated`
 - [x] `PlayerObbCollision` 结构盒改为 structure pose + 未偏移体素（不再二次减 COM）
 - [x] constraints：fixed / free / rotary / prismatic 句柄、`PhysicsPipeline`/`PhysicsStructure` 增删与查询
-- [ ] constraints：完整每轴 6-DOF、电机/限位和约束持久化
+- [x] constraints：完整每轴 6-DOF、电机/限位和约束持久化
 - [x] ropes / box physics objects：冲量绳、dynamic/static/kinematic box、句柄与 impulse/teleport/remove
 - [x] loading tickets、tracking-point SavedData、按维度持久化与重绑
-- [ ] schematic 上下文、host↔structure redstone/hoppers/fluid 图
+- [x] schematic 上下文、host↔structure redstone/hoppers/fluid 图
 - [ ] plot / plot-yard / `SubLevel` 风格的第二 `Level` 视图（Create Aeronautics drop-in 的阻塞项）
 - [x] force totals、`StructureMassTracker`、propeller / lift-provider hook
 - [~] 网络客户端容器：多人仍是只读 `ClientStructureSnapshot`；单人可提供 live `PhysicsStructure` 视图

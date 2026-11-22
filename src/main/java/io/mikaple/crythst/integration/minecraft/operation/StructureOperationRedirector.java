@@ -7,6 +7,7 @@ import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
+import io.mikaple.crythst.integration.minecraft.gameevent.StructurePlayerProgress;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureInteraction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructurePlacementValidation;
@@ -213,6 +214,7 @@ public final class StructureOperationRedirector {
         final ServerLevel auxiliary = mapped.live().level();
         final BlockState state = mapped.live().state();
         final BlockHitResult auxiliaryHit = mapped.auxiliaryHit();
+        final ItemStack usedStack = stack.copy();
 
         // Vanilla ServerPlayerGameMode.useItemOn skips block use entirely while
         // sneaking with a non-empty hand, so Shift+right-click places a block
@@ -237,10 +239,16 @@ public final class StructureOperationRedirector {
                 final InteractionResult empty = state.useWithoutItem(
                         auxiliary, player, auxiliaryHit);
                 if (empty != null && empty.consumesAction()) {
+                    StructurePlayerProgress.triggerDefaultBlockUse(player,
+                            mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                            mapped.voxelZ());
                     return new Result(Status.HANDLED, empty);
                 }
             }
             if (result.consumesAction()) {
+                StructurePlayerProgress.triggerItemUsedOnBlock(player,
+                        mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                        mapped.voxelZ(), usedStack);
                 return new Result(Status.HANDLED, result);
             }
         }
@@ -269,7 +277,7 @@ public final class StructureOperationRedirector {
                         structure.pose(), structure.blockScale(), x, y, z)) {
                     return Result.of(Status.FAILED);
                 }
-                return useStack(player, stack, context, result);
+                return useStack(player, mapped, stack, usedStack, context, result);
             } finally {
                 look.restore(player);
             }
@@ -277,15 +285,20 @@ public final class StructureOperationRedirector {
         if (StructureEntityPlacement.handles(stack.getItem())) {
             return Result.of(Status.NOT_HANDLED);
         }
-        return useStack(player, stack, context, result);
+        return useStack(player, mapped, stack, usedStack, context, result);
     }
 
-    private static Result useStack(ServerPlayer player, ItemStack stack,
+    private static Result useStack(ServerPlayer player, Mapped mapped, ItemStack stack, ItemStack usedStack,
                                    AuxiliaryUseOnContext context, InteractionResult blockResult) {
         final int count = stack.getCount();
         final InteractionResult item = stack.useOn(context);
         if (player.hasInfiniteMaterials() && stack.getCount() != count) {
             stack.setCount(count);
+        }
+        if (item != null && item.consumesAction()) {
+            StructurePlayerProgress.triggerItemUsedOnBlock(player,
+                    mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                    mapped.voxelZ(), usedStack);
         }
         return new Result(Status.HANDLED, item == null ? blockResult : item);
     }
@@ -320,6 +333,11 @@ public final class StructureOperationRedirector {
         try {
             final InteractionResult interaction = mapped.live().state().useWithoutItem(
                     mapped.live().level(), player, mapped.auxiliaryHit());
+            if (interaction != null && interaction.consumesAction()) {
+                StructurePlayerProgress.triggerDefaultBlockUse(player,
+                        mapped.structure(), mapped.voxelX(), mapped.voxelY(),
+                        mapped.voxelZ());
+            }
             return new Result(Status.HANDLED, interaction);
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level useWithoutItem failed for structure body #{}",

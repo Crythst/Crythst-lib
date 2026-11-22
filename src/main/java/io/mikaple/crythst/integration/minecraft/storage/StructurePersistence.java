@@ -47,11 +47,22 @@ public final class StructurePersistence {
     public static void load(ServerLevel level) {
         try {
             final StructureSavedData data = level.getDataStorage().get(StructureSavedData.TYPE);
-            if (data == null || data.structureCount() == 0) {
+            final ConstraintSavedData constraints =
+                    level.getDataStorage().get(ConstraintSavedData.TYPE);
+            final boolean hasStructures = data != null && data.structureCount() > 0;
+            final boolean hasConstraints = constraints != null && constraints.constraintCount() > 0;
+            if (!hasStructures && !hasConstraints) {
                 return;
             }
             final LevelPhysics physics = MinecraftPhysics.get(level);
-            data.restore(level, physics);
+            if (hasStructures) {
+                data.restore(level, physics);
+            }
+            if (hasConstraints) {
+                // Constraints are resolved against the stable structure UUIDs,
+                // so structures must be live before this call.
+                constraints.restore(level, physics, data);
+            }
         } catch (Throwable t) {
             Crythst.LOGGER.error("Could not load Crythst structures for {}",
                     level.dimension().identifier(), t);
@@ -87,7 +98,20 @@ public final class StructurePersistence {
                 // existing records are not mistaken for removed structures.
                 data.restore(level, physics);
             }
+            // Capture structures first: new bodies get their stable UUIDs here,
+            // and constraints reference those UUIDs.
             data.capture(level, physics);
+
+            ConstraintSavedData constraints = level.getDataStorage().get(ConstraintSavedData.TYPE);
+            if (constraints == null && physics.world().constraintCount() > 0) {
+                constraints = level.getDataStorage().computeIfAbsent(ConstraintSavedData.TYPE);
+            }
+            if (constraints != null) {
+                if (!constraints.restored()) {
+                    constraints.restore(level, physics, data);
+                }
+                constraints.capture(level, physics, data);
+            }
         } catch (Throwable t) {
             Crythst.LOGGER.error("Could not save Crythst structures for {}",
                     level.dimension().identifier(), t);

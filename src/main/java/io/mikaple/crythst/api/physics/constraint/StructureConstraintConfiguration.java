@@ -1,5 +1,6 @@
 package io.mikaple.crythst.api.physics.constraint;
 
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.constraint.ConstraintDef;
 import io.mikaple.crythst.physics.constraint.ConstraintType;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -18,6 +19,8 @@ import org.jetbrains.annotations.Nullable;
  *       {@code HingeConstraintDef} / {@link ConstraintType#HINGE}</li>
  *   <li>{@link GenericConstraintConfiguration} -&gt;
  *       {@code SliderConstraintDef} / {@link ConstraintType#SLIDER}</li>
+ *   <li>{@link SixDofConstraintConfiguration} -&gt;
+ *       {@code SixDofConstraintDef} / {@link ConstraintType#SIX_DOF}</li>
  * </ul>
  *
  * <p><strong>Frames and units.</strong> Every frame, anchor and axis in this
@@ -43,12 +46,25 @@ public sealed interface StructureConstraintConfiguration
         permits FixedConstraintConfiguration,
         FreeConstraintConfiguration,
         RotaryConstraintConfiguration,
-        GenericConstraintConfiguration {
+        GenericConstraintConfiguration,
+        SixDofConstraintConfiguration {
 
     /**
      * Backend joint family this configuration produces.
      */
     ConstraintType type();
+
+    /**
+     * Attachment frame in structure-A-local metres. For anchor-based
+     * configurations the rotation is the identity.
+     */
+    Transform3d localFrameA();
+
+    /**
+     * Attachment frame in structure-B-local metres, or world-space metres for
+     * a world-anchored joint.
+     */
+    Transform3d localFrameB();
 
     /**
      * Converts this structure-local description into a backend joint

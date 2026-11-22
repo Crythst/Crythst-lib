@@ -58,7 +58,11 @@ intercepted and converted to the same pose-aware burst so there is no duplicate.
 
 ## Limitations
 
-- The block-entity snapshot bridge is currently singleplayer only; multiplayer
-  block-entity NBT/animation sync is not complete.
+- The block-entity snapshot bridge works in singleplayer and multiplayer.
+  Multiplayer NBT/animation uses the versioned
+  `crythst:structure_block_entities` payload; see
+  [`multiplayer-block-entities.md`](multiplayer-block-entities.md). Modded block
+  entities whose renderer needs live world state still cannot be reconstructed
+  from NBT alone.
 - Debris samples use the full voxel volume, not the block's per-state collision
   shape.

@@ -150,6 +150,16 @@ public record GenericConstraintConfiguration(
     }
 
     @Override
+    public Transform3d localFrameA() {
+        return frameA;
+    }
+
+    @Override
+    public Transform3d localFrameB() {
+        return frameB;
+    }
+
+    @Override
     public ConstraintDef toDefinition(PhysicsStructure structureA,
                                       @Nullable PhysicsStructure structureB) {
         final Transform3d bodyFrameA = ConstraintFrames.structureToBody(structureA, frameA);

@@ -1,6 +1,8 @@
 package io.mikaple.crythst.api.client;
 
 import io.mikaple.crythst.api.sublevel.StructureContainer;
+import io.mikaple.crythst.client.network.ClientBlockEntity;
+import io.mikaple.crythst.client.network.ClientBlockEntitySnapshot;
 import io.mikaple.crythst.client.network.ClientStructureCache;
 import io.mikaple.crythst.client.network.ClientStructureSnapshot;
 import io.mikaple.crythst.integration.fabric.client.ClientPhysicsView;
@@ -97,6 +99,34 @@ public final class ClientStructureContainer implements StructureContainer {
             return null;
         }
         return ClientStructureCache.get(bodyId);
+    }
+
+    /**
+     * Immutable block-entity NBT/animation state for a synced body, or
+     * {@code null} when the body has no block entities (or is not synced).
+     *
+     * <p>Coordinates in the returned snapshot are structure-local voxels,
+     * relative to {@link ClientStructureSnapshot#bounds()} minimum. The data is
+     * immutable and safe to read from the render thread.</p>
+     */
+    public @Nullable ClientBlockEntitySnapshot blockEntities(long bodyId) {
+        final Identifier active = ClientStructureCache.activeDimension();
+        if (active != null && !active.equals(level.dimension().identifier())) {
+            return null;
+        }
+        return ClientStructureCache.blockEntities(bodyId);
+    }
+
+    /**
+     * One synced block entity at a structure-local voxel, or {@code null}.
+     */
+    public @Nullable ClientBlockEntity blockEntityAt(
+            long bodyId, int x, int y, int z) {
+        final Identifier active = ClientStructureCache.activeDimension();
+        if (active != null && !active.equals(level.dimension().identifier())) {
+            return null;
+        }
+        return ClientStructureCache.blockEntityAt(bodyId, x, y, z);
     }
 
     /**

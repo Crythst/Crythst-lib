@@ -61,7 +61,7 @@ for some cases; **MISSING** = not implemented.
 | Player/entity collision | OK (terrain/structures) | Movement-integrated; exact partial block shapes are being added. |
 | Riding/carry on structures | PARTIAL | Velocity carry for players, position carry for other entities; no full Sable-style tracking/plot relation. |
 | Entity spawning on structures | PARTIAL | Spawn eggs/item frames surface placement being added. No natural mob spawning on structures. |
-| AI/pathfinding | MISSING | Mob navigation queries the host world, where structure blocks are air. Mobs cannot path on/around structures. |
+| AI/pathfinding | PARTIAL | A `PathNavigationRegion` bridge makes vanilla ground navigation see structure blocks, fluids and collision shapes, with cache invalidation and bounded queries. Modded navigators and AI that reads `Level` directly still see host air. See `docs/structure-pathfinding.md`. |
 | Entity block interactions | PARTIAL | Arrows/projectiles collide, but their `onHitBlock` sees the real world block, not the structure state. |
 | Minecarts/boats on structure rails/water | MISSING | Vehicle movement queries host blocks/fluids. |
 | Entity projection from void level | OK | Ordinary entities are ejected to the host with pose/velocity mapping; decorations/seats stay as host mirrors. |
@@ -117,8 +117,8 @@ for some cases; **MISSING** = not implemented.
 3. **No structure level view.** Most vanilla logic needs a `Level`/`BlockGetter`
    that maps structure-local coordinates; the void copy is hidden behind a
    region remap and is not a public level. A lightweight `StructureLevelView`
-   now exists (P2), but there is still no full `Level` facade or AI/pathfinding
-   bridge.
+   now exists (P2), and vanilla ground pathfinding has a region bridge; there is
+   still no full `Level` facade or coverage for modded navigators.
 4. **Interactions are redirected to the void copy**, so most vanilla use/break
    rules work. Entity items, signs, menus and custom fallback edits still need
    structure-aware bridges.
@@ -149,7 +149,7 @@ for some cases; **MISSING** = not implemented.
 ### P2 — structure level view — **implemented (lightweight view)**
 - Public `StructureLevelView` over the auxiliary void region, with
   `BlockGetter`/`CollisionGetter` adapters and exact block shapes. Used by
-  raycasts/outline now; AI/pathfinding integration is still deferred.
+  raycasts/outline and the vanilla ground-navigation region bridge.
 - Server views read through `EmptyPhysicsLevel.liveBlock`, write through the
   void block grid and rely on the P0 edit-propagation pass. `operationTarget`
   exposes the void `ServerLevel`/position for a future player-operation
@@ -164,6 +164,6 @@ for some cases; **MISSING** = not implemented.
 - Sable-style plot/assembly/tickets if a true drop-in ecosystem is required.
 
 The honest summary: **rendering, collision and block-world simulation inside a
-structure are broadly working. Cross-boundary world logic, AI/pathfinding,
+structure are broadly working. Cross-boundary world logic, modded/advanced AI,
 explosions, host light/weather and mods that require a full structure `Level`
 remain the real gaps.**

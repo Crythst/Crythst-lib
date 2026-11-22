@@ -168,17 +168,27 @@ There are two paths.
 
 If the block item's item model uses a `minecraft:special` model renderer, then
 `ItemModelBlockRenderer` automatically uses it. This is the intended wiring
-point for the star shader renderer that is being added as
+point for the star shader renderer in
 `io.mikaple.crythst.client.render.item.StarItemModelRenderer`:
 
 - The item model JSON points at a `minecraft:special` model whose renderer is
   the star special model.
-- The same model is used for GUI, hand, and the placed block. No extra block
-  renderer code is needed.
-- The block API intentionally does not reference that class, so it compiles
-  before the item renderer exists. Once the item renderer is registered, the
-  existing `ItemModelBlockRenderer.register(block)` wiring picks it up on the
-  next resource load.
+- The same model is used for GUI, hand, item frames, dropped items, and the
+  placed block. No extra block renderer code is needed.
+- The star renderer submits the real model first, then a depth-tested star
+  overlay with the same geometry. Because `ItemModelBlockRenderer` calls
+  `ItemStackRenderState#submit`, the block gets exactly the same two-pass
+  depth behaviour as an item in the hand. The overlay reads the depth written
+  by the real block model, so stars cannot leak through the block, through
+  adjacent blocks, or through terrain that is closer to the camera.
+- `ItemModelBlockRenderer` translates `+0.5` on all axes before submitting.
+  Both star passes receive that same pose, so their depth values match and no
+  per-block depth adjustment is necessary.
+
+The block API intentionally does not reference that class, so it compiles
+before the item renderer exists. Once the item renderer is registered, the
+existing `ItemModelBlockRenderer.register(block)` wiring picks it up on the
+next resource load.
 
 If you need block-specific geometry, use a separate item model for the block
 item or submit custom quads directly.
@@ -221,6 +231,16 @@ Keep the shader's light/overlay inputs consistent with the values passed to
 - **Static positions only:** the tracker keys on real `BlockPos`. It does not
   follow pistons, moving blocks, or a physics/sublevel rigid transform. For a
   moving structure, submit from that structure's own renderer.
+- **Star depth is item-path depth:** a star block inherits the item renderer's
+  two-pass design (real model pass + depth-tested, non-depth-writing overlay).
+  RenderPearl has no stencil, so the real model's depth buffer is the
+  silhouette mask. This is correct for standard cutout/translucent item
+  render types. A custom special model that uses a render type which does not
+  write depth loses that mask; see the limitations in
+  `docs/item-special-rendering.md`.
+- **Improved transparency:** translucent star quads need the item renderer's
+  OIT pipeline set. `ItemModelBlockRenderer` itself does not add OIT support;
+  it relies on the special model's render types being OIT-complete.
 - **Upper bound:** `MAX_TRACKED_BLOCKS` (8192) prevents unbounded growth. Once
   reached, further blocks are ignored until the cache shrinks.
 - **No block-entity data:** the context exposes only the block state. If a

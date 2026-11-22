@@ -1,12 +1,16 @@
 package io.mikaple.crythst.api.physics.constraint;
 
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.constraint.ConstraintHandle;
 import io.mikaple.crythst.physics.constraint.ConstraintType;
 import io.mikaple.crythst.physics.constraint.MotorConstraintHandle;
+import io.mikaple.crythst.physics.constraint.SixDofConstraintHandle;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.world.PhysicsWorld;
 import io.mikaple.crythst.util.Validate;
 import org.jetbrains.annotations.Nullable;
+import org.joml.Quaterniond;
+import org.joml.Vector3d;
 
 /**
  * Stable API view of one live constraint.
@@ -73,7 +77,16 @@ public final class StructureConstraintHandle {
         }
         this.structureA = structureA;
         this.structureB = structureB;
-        this.configuration = configuration;
+        final StructureConstraintConfiguration retained = configuration != null
+                ? configuration
+                : handle.metadata() instanceof StructureConstraintConfiguration metadata
+                        ? metadata : null;
+        this.configuration = retained;
+        if (configuration != null) {
+            // Keep the API configuration discoverable on later wrappers (for
+            // example PhysicsPipeline.constraints() and persistence).
+            handle.setMetadata(configuration);
+        }
     }
 
     /**
@@ -81,7 +94,7 @@ public final class StructureConstraintHandle {
      *         removed, and the involved structures still exist
      */
     public boolean isValid() {
-        if (removed || world.closed()) {
+        if (removed || world.closed() || handle.removed()) {
             return false;
         }
         if (structureA != null && (structureA.closed() || !structureA.body().inWorld())) {
@@ -125,6 +138,302 @@ public final class StructureConstraintHandle {
      */
     public @Nullable StructureConstraintConfiguration configuration() {
         return configuration;
+    }
+
+    /**
+     * Attachment frame in structure-A-local metres, when the handle retains an
+     * API configuration. Anchor-based joints return an identity rotation at
+     * their anchor.
+     */
+    public @Nullable Transform3d localFrameA() {
+        return configuration == null ? null : configuration.localFrameA();
+    }
+
+    /**
+     * Attachment frame in structure-B-local metres, or world-space metres for a
+     * world-anchored joint.
+     */
+    public @Nullable Transform3d localFrameB() {
+        return configuration == null ? null : configuration.localFrameB();
+    }
+
+    /** Structure-A-local anchor point, or {@code null} when unknown. */
+    public @Nullable Vector3d localAnchorA() {
+        final Transform3d frame = localFrameA();
+        return frame == null ? null : frame.position();
+    }
+
+    /**
+     * Structure-B-local anchor, or the world anchor for a world-anchored joint.
+     */
+    public @Nullable Vector3d localAnchorB() {
+        final Transform3d frame = localFrameB();
+        return frame == null ? null : frame.position();
+    }
+
+    /** Current world-space frame A, or {@code null} when unknown. */
+    public @Nullable Transform3d worldFrameA() {
+        final Transform3d frame = localFrameA();
+        if (frame == null || structureA == null) {
+            return null;
+        }
+        return ConstraintFrames.structureToWorld(structureA, frame);
+    }
+
+    /**
+     * Current world-space frame B. For a world-anchored joint this is the
+     * stored world frame unchanged.
+     */
+    public @Nullable Transform3d worldFrameB() {
+        final Transform3d frame = localFrameB();
+        if (frame == null) {
+            return null;
+        }
+        return structureB == null
+                ? frame
+                : ConstraintFrames.structureToWorld(structureB, frame);
+    }
+
+    /** Current world-space anchor A, or {@code null} when unknown. */
+    public @Nullable Vector3d worldAnchorA() {
+        final Transform3d frame = worldFrameA();
+        return frame == null ? null : frame.position();
+    }
+
+    /** Current world-space anchor B, or {@code null} when unknown. */
+    public @Nullable Vector3d worldAnchorB() {
+        final Transform3d frame = worldFrameB();
+        return frame == null ? null : frame.position();
+    }
+
+    /**
+     * Rotation of the structure-A-local axis frame, or {@code null} when the
+     * handle retains no configuration.
+     */
+    public @Nullable Quaterniond axisQuaternionA() {
+        final Transform3d frame = localFrameA();
+        return frame == null ? null : frame.rotation();
+    }
+
+    /** Rotation of the structure-B-local or world axis frame. */
+    public @Nullable Quaterniond axisQuaternionB() {
+        final Transform3d frame = localFrameB();
+        return frame == null ? null : frame.rotation();
+    }
+
+    /**
+     * Hinge axis in structure-A-local space for rotary joints, otherwise
+     * {@code null}. Use {@link #axisQuaternionA()} for frame-based joints.
+     */
+    public @Nullable Vector3d localAxisA() {
+        return configuration instanceof RotaryConstraintConfiguration rotary
+                ? rotary.axisA() : null;
+    }
+
+    /** Hinge axis in structure-B-local or world space for rotary joints. */
+    public @Nullable Vector3d localAxisB() {
+        return configuration instanceof RotaryConstraintConfiguration rotary
+                ? rotary.axisB() : null;
+    }
+
+    /** Current world-space hinge axis A, or {@code null}. */
+    public @Nullable Vector3d worldAxisA() {
+        final Vector3d axis = localAxisA();
+        if (axis == null || structureA == null) {
+            return null;
+        }
+        return ConstraintFrames.structureDirectionToWorld(structureA, axis);
+    }
+
+    /** Current world-space hinge axis B, or {@code null}. */
+    public @Nullable Vector3d worldAxisB() {
+        final Vector3d axis = localAxisB();
+        if (axis == null) {
+            return null;
+        }
+        return structureB == null
+                ? new Vector3d(axis)
+                : ConstraintFrames.structureDirectionToWorld(structureB, axis);
+    }
+
+    /**
+     * Solver impulse applied during the most recent step, in newton-seconds.
+     * Backends that do not expose feedback return zero.
+     */
+    public double appliedImpulse() {
+        ensureUsable();
+        return handle.appliedImpulse();
+    }
+
+    /** Whether solver impulse feedback is currently enabled. */
+    public boolean feedbackEnabled() {
+        ensureUsable();
+        return handle.feedbackEnabled();
+    }
+
+    /** Enables or disables solver impulse feedback. */
+    public void setFeedbackEnabled(boolean enabled) {
+        ensureUsable();
+        handle.setFeedbackEnabled(enabled);
+    }
+
+    /** Whether this joint supports per-axis 6-DOF control. */
+    public boolean supportsDofControl() {
+        return isValid() && handle instanceof SixDofConstraintHandle;
+    }
+
+    /**
+     * Current configuration of one axis, read from the live backend when
+     * possible and otherwise from the retained API configuration.
+     */
+    public DofAxisConfiguration dofConfiguration(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        final SixDofConstraintHandle sixDof = dof(axis, "dofConfiguration");
+        final int index = axis.index();
+        return new DofAxisConfiguration(
+                sixDof.isAxisFree(index),
+                sixDof.lowerLimit(index),
+                sixDof.upperLimit(index),
+                sixDof.isMotorEnabled(index),
+                sixDof.motorTargetVelocity(index),
+                sixDof.maxMotorForce(index),
+                sixDof.isSpringEnabled(index),
+                sixDof.stiffness(index),
+                sixDof.damping(index));
+    }
+
+    /** Whether the axis is unconstrained (free). */
+    public boolean isAxisFree(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "isAxisFree").isAxisFree(axis.index());
+    }
+
+    /** Makes an axis free or locks it at zero. */
+    public void setAxisFree(SixDofAxis axis, boolean free) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setAxisFree").setAxisFree(axis.index(), free);
+    }
+
+    /** Current lower limit (metres or radians). */
+    public double lowerLimit(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "lowerLimit").lowerLimit(axis.index());
+    }
+
+    /** Current upper limit (metres or radians). */
+    public double upperLimit(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "upperLimit").upperLimit(axis.index());
+    }
+
+    /** Sets a constrained axis range. Use {@link #setAxisFree} for no range. */
+    public void setLimits(SixDofAxis axis, double lowerLimit, double upperLimit) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setLimits").setLimits(axis.index(), lowerLimit, upperLimit);
+    }
+
+    /** Whether the axis motor is enabled. */
+    public boolean isDofMotorEnabled(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "isDofMotorEnabled").isMotorEnabled(axis.index());
+    }
+
+    /** Enables or disables the axis motor, preserving target and force. */
+    public void setDofMotorEnabled(SixDofAxis axis, boolean enabled) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofMotorEnabled").setMotorEnabled(axis.index(), enabled);
+    }
+
+    /** Axis motor target velocity (m/s or rad/s). */
+    public double dofMotorTargetVelocity(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "dofMotorTargetVelocity").motorTargetVelocity(axis.index());
+    }
+
+    /** Sets the axis motor target velocity (m/s or rad/s). */
+    public void setDofMotorTargetVelocity(SixDofAxis axis, double velocity) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofMotorTargetVelocity").setMotorTargetVelocity(axis.index(), velocity);
+    }
+
+    /** Axis motor maximum force (N or N·m). */
+    public double dofMaxMotorForce(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "dofMaxMotorForce").maxMotorForce(axis.index());
+    }
+
+    /** Sets the axis motor maximum force (N or N·m). */
+    public void setDofMaxMotorForce(SixDofAxis axis, double maxForce) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofMaxMotorForce").setMaxMotorForce(axis.index(), maxForce);
+    }
+
+    /** Enables or disables an axis motor in one call. */
+    public void setDofMotor(SixDofAxis axis, boolean enabled, double targetVelocity,
+                            double maxForce) {
+        Validate.notNull(axis, "axis");
+        final SixDofConstraintHandle sixDof = dof(axis, "setDofMotor");
+        final int index = axis.index();
+        sixDof.setMotorTargetVelocity(index, targetVelocity);
+        sixDof.setMaxMotorForce(index, maxForce);
+        sixDof.setMotorEnabled(index, enabled);
+    }
+
+    /** Whether the axis spring is enabled. */
+    public boolean isDofSpringEnabled(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "isDofSpringEnabled").isSpringEnabled(axis.index());
+    }
+
+    /** Enables or disables an axis spring. */
+    public void setDofSpringEnabled(SixDofAxis axis, boolean enabled) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofSpringEnabled").setSpringEnabled(axis.index(), enabled);
+    }
+
+    /** Axis spring stiffness. */
+    public double dofStiffness(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "dofStiffness").stiffness(axis.index());
+    }
+
+    /** Sets axis spring stiffness. */
+    public void setDofStiffness(SixDofAxis axis, double stiffness) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofStiffness").setStiffness(axis.index(), stiffness);
+    }
+
+    /** Axis spring damping ratio. */
+    public double dofDamping(SixDofAxis axis) {
+        Validate.notNull(axis, "axis");
+        return dof(axis, "dofDamping").damping(axis.index());
+    }
+
+    /** Sets axis spring damping ratio. */
+    public void setDofDamping(SixDofAxis axis, double damping) {
+        Validate.notNull(axis, "axis");
+        dof(axis, "setDofDamping").setDamping(axis.index(), damping);
+    }
+
+    /** Enables or disables an axis spring in one call. */
+    public void setDofSpring(SixDofAxis axis, boolean enabled, double stiffness,
+                             double damping) {
+        Validate.notNull(axis, "axis");
+        final SixDofConstraintHandle sixDof = dof(axis, "setDofSpring");
+        final int index = axis.index();
+        sixDof.setStiffness(index, stiffness);
+        sixDof.setDamping(index, damping);
+        sixDof.setSpringEnabled(index, enabled);
+    }
+
+    private SixDofConstraintHandle dof(SixDofAxis axis, String operation) {
+        ensureUsable();
+        if (handle.type() != ConstraintType.SIX_DOF
+                || !(handle instanceof SixDofConstraintHandle sixDof)) {
+            throw new UnsupportedOperationException(operation
+                    + " is only supported for 6-DOF joints; got " + handle.type());
+        }
+        return sixDof;
     }
 
     /**

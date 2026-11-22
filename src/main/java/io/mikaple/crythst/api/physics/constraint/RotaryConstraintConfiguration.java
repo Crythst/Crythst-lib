@@ -1,5 +1,6 @@
 package io.mikaple.crythst.api.physics.constraint;
 
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.constraint.ConstraintDef;
 import io.mikaple.crythst.physics.constraint.ConstraintType;
 import io.mikaple.crythst.physics.constraint.HingeConstraintDef;
@@ -169,6 +170,16 @@ public record RotaryConstraintConfiguration(
     @Override
     public ConstraintType type() {
         return ConstraintType.HINGE;
+    }
+
+    @Override
+    public Transform3d localFrameA() {
+        return Transform3d.of(anchorA);
+    }
+
+    @Override
+    public Transform3d localFrameB() {
+        return Transform3d.of(anchorB);
     }
 
     @Override

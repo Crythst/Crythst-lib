@@ -2,8 +2,10 @@ package io.mikaple.crythst.integration.minecraft;
 
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.api.block.BlockEntityStructureActor;
+import io.mikaple.crythst.integration.minecraft.boundary.StructureBoundaryBridge;
 import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
+import io.mikaple.crythst.integration.minecraft.gameevent.StructureGameEvents;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
@@ -18,6 +20,7 @@ import io.mikaple.crythst.physics.voxel.IntBounds3;
 import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
 import net.minecraft.core.HolderGetter;
 import net.minecraft.core.RegistryAccess;
@@ -58,6 +61,7 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.dimension.LevelStem;
+import net.minecraft.world.level.gameevent.GameEvent;
 import net.minecraft.world.level.levelgen.FlatLevelSource;
 import net.minecraft.world.level.levelgen.flat.FlatLevelGeneratorSettings;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
@@ -313,6 +317,21 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             }
             return new BlockPos(baseX + localX, baseY + localY, baseZ + localZ);
         }
+
+        /**
+         * Converts a continuous structure-local voxel point to an auxiliary
+         * world point. Local integer coordinates address voxel centres, which
+         * are at {@code +0.5} in the auxiliary block grid.
+         *
+         * <p>Used by the boundary bridge to translate a projected game-event
+         * point without leaking auxiliary coordinates into the public API.</p>
+         */
+        public Vec3 toAuxiliaryPoint(double localX, double localY, double localZ) {
+            return new Vec3(
+                    baseX + (localX - volumeMinX) + 0.5,
+                    baseY + (localY - volumeMinY) + 0.5,
+                    baseZ + (localZ - volumeMinZ) + 0.5);
+        }
     }
 
     /**
@@ -377,6 +396,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private boolean closed;
     private @Nullable StructureAttachedEntities attachedEntities;
     private @Nullable EntityProjector entityProjector;
+    /**
+     * Host-world boundary graph. {@code null} in standalone tests or when the
+     * physics world has not attached one yet; all boundary reads then degrade
+     * to the old void-copy behaviour.
+     */
+    private @Nullable StructureBoundaryBridge boundaryBridge;
 
     /**
      * Projects one entity out of the auxiliary level. Implemented by
@@ -626,6 +651,18 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
     public void setEntityProjector(@Nullable EntityProjector entityProjector) {
         this.entityProjector = entityProjector;
+    }
+
+    /**
+     * Installs the host &lt;-&gt; structure boundary graph used by the auxiliary
+     * level's block-state/entity/fluid/signal fallbacks.
+     */
+    public void setBoundaryBridge(@Nullable StructureBoundaryBridge boundaryBridge) {
+        this.boundaryBridge = boundaryBridge;
+    }
+
+    public @Nullable StructureBoundaryBridge boundaryBridge() {
+        return boundaryBridge;
     }
 
     /**
@@ -928,6 +965,119 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return null;
         }
         return region.view();
+    }
+
+    /**
+     * Whether an auxiliary block position is inside any copied region.
+     * Boundary fallbacks only apply outside every region; internal positions
+     * keep their normal void-copy state.
+     */
+    public boolean isInsideRegion(BlockPos auxiliaryPos) {
+        return auxiliaryPos != null && regionAt(auxiliaryPos) != null;
+    }
+
+    /** Host block state for an auxiliary position just outside a region. */
+    public @Nullable BlockState boundaryBlockState(BlockPos auxiliaryPos) {
+        return boundaryBridge == null ? null
+                : boundaryBridge.hostBlockStateForAuxiliary(auxiliaryPos);
+    }
+
+    /** Host block entity for an auxiliary position just outside a region. */
+    public @Nullable BlockEntity boundaryBlockEntity(BlockPos auxiliaryPos) {
+        return boundaryBridge == null ? null
+                : boundaryBridge.hostBlockEntityForAuxiliary(auxiliaryPos);
+    }
+
+    /** Host fluid state for an auxiliary position just outside a region. */
+    public @Nullable FluidState boundaryFluidState(BlockPos auxiliaryPos) {
+        return boundaryBridge == null ? null
+                : boundaryBridge.hostFluidStateForAuxiliary(auxiliaryPos);
+    }
+
+    /** Host/other-structure signal for an outside auxiliary position. */
+    public int boundarySignal(BlockPos auxiliaryPos, Direction localDirection) {
+        return boundaryBridge == null ? 0
+                : boundaryBridge.auxiliarySignal(auxiliaryPos, localDirection);
+    }
+
+    /** Host/other-structure direct signal for an outside auxiliary position. */
+    public int boundaryDirectSignal(BlockPos auxiliaryPos, Direction localDirection) {
+        return boundaryBridge == null ? 0
+                : boundaryBridge.auxiliaryDirectSignal(auxiliaryPos, localDirection);
+    }
+
+    /** Forwards an auxiliary neighbour update to the host/other structures. */
+    public void onAuxiliaryNeighborUpdate(BlockPos auxiliaryPos, Block changedBlock) {
+        if (boundaryBridge != null) {
+            boundaryBridge.onAuxNeighborUpdate(auxiliaryPos, changedBlock);
+        }
+    }
+
+    /**
+     * Forwards an auxiliary game event to the host world.
+     *
+     * <p>This deliberately uses {@link StructureGameEvents} rather than the
+     * general boundary bridge: game events need a per-level duplicate filter
+     * and a re-entrancy guard so a host listener that touches the auxiliary
+     * level cannot echo the event back. The boundary bridge's game-event
+     * method remains available for diagnostics and future explicit callers.</p>
+     */
+    public void onAuxiliaryGameEvent(Holder<GameEvent> event, Vec3 auxiliaryPosition,
+                                     GameEvent.Context context) {
+        StructureGameEvents.forwardFromAuxiliary(this, event, auxiliaryPosition, context);
+    }
+
+    /**
+     * Returns the region containing an auxiliary block position, or
+     * {@code null}. Used by the explosion bridge to map vanilla's destroyed
+     * block list back to structure-local voxels without exposing region bases
+     * to callers.
+     */
+    public @Nullable RegionView regionViewAt(@Nullable BlockPos auxiliaryPos) {
+        if (closed || auxiliaryPos == null) {
+            return null;
+        }
+        final Region region = regionAt(auxiliaryPos);
+        return region == null ? null : region.view();
+    }
+
+    /**
+     * Removes copied blocks selected by a host explosion from the live
+     * auxiliary level. The normal edit-flush pass then mirrors the new states
+     * into the structure volume, removes stale block-entity data, reindexes
+     * the body and performs split/massless removal.
+     *
+     * @param structure   structure that owns the voxels
+     * @param localVoxels absolute structure-local voxels to clear
+     * @return number of copied blocks actually changed
+     */
+    public int removeBlocksForExplosion(PhysicsStructure structure,
+                                        @Nullable List<BlockPos> localVoxels) {
+        if (closed || structure == null || structure.closed()
+                || localVoxels == null || localVoxels.isEmpty()) {
+            return 0;
+        }
+        final Region region = regions.get(structure.body().id());
+        if (region == null || region.structure != structure) {
+            return 0;
+        }
+        final BlockState air = Blocks.AIR.defaultBlockState();
+        int changed = 0;
+        for (BlockPos local : localVoxels) {
+            final BlockPos auxiliaryPos = region.view().toAuxiliaryVoxel(
+                    local.getX(), local.getY(), local.getZ());
+            if (auxiliaryPos == null || level.isOutsideBuildHeight(auxiliaryPos)) {
+                continue;
+            }
+            try {
+                if (level.setBlock(auxiliaryPos, air, 3)) {
+                    changed++;
+                }
+            } catch (Throwable t) {
+                reportTickFailure("explosion clear " + auxiliaryPos.toShortString(), t);
+            }
+        }
+        return changed;
     }
 
     /**
@@ -1390,6 +1540,42 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      */
     public @Nullable Vec3 projectAuxiliaryPoint(double x, double y, double z) {
         final Region region = regionAt(BlockPos.containing(x, y, z));
+        return projectRegionPoint(region, x, y, z);
+    }
+
+    /**
+     * Like {@link #projectAuxiliaryPoint(double, double, double)}, but also
+     * maps a point just outside a copied region when an explosion or event is
+     * close enough to belong to that structure. Used by the void-explosion
+     * bridge so a blast centred on the outer face still damages host entities
+     * at the transformed structure.
+     *
+     * @param maxDistance maximum auxiliary distance from a region's block
+     *                    bounds, in blocks
+     */
+    public @Nullable Vec3 projectAuxiliaryPointNear(double x, double y, double z,
+                                                     double maxDistance) {
+        final Vec3 direct = projectAuxiliaryPoint(x, y, z);
+        if (direct != null || closed || maxDistance < 0.0) {
+            return direct;
+        }
+        Region best = null;
+        double bestDistanceSquared = maxDistance * maxDistance;
+        for (Region region : regions.values()) {
+            if (region.structure == null || region.structure.closed()) {
+                continue;
+            }
+            final double distanceSquared = distanceSquaredToRegion(region, x, y, z);
+            if (distanceSquared <= bestDistanceSquared) {
+                bestDistanceSquared = distanceSquared;
+                best = region;
+            }
+        }
+        return projectRegionPoint(best, x, y, z);
+    }
+
+    private @Nullable Vec3 projectRegionPoint(@Nullable Region region,
+                                               double x, double y, double z) {
         if (region == null || region.structure == null || region.structure.closed()) {
             return null;
         }
@@ -1400,6 +1586,24 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                         region.baseZ - region.volumeMinZ);
         return StructureEntityProjection.projectPosition(region.structure.pose(),
                 region.structure.blockScale(), anchor, new Vec3(x, y, z));
+    }
+
+    private static double distanceSquaredToRegion(Region region,
+                                                   double x, double y, double z) {
+        final double dx = axisDistance(x, region.baseX, region.baseX + region.sizeX);
+        final double dy = axisDistance(y, region.baseY, region.baseY + region.sizeY);
+        final double dz = axisDistance(z, region.baseZ, region.baseZ + region.sizeZ);
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static double axisDistance(double value, double min, double max) {
+        if (value < min) {
+            return min - value;
+        }
+        if (value > max) {
+            return value - max;
+        }
+        return 0.0;
     }
 
     private void recordChangedBlock(BlockPos pos) {
@@ -2330,6 +2534,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 + " ejectionFailures=" + totalEjectionFailures
                 + " " + blockEntityDiagnostics()
                 + " " + tickDiagnostics()
+                + " " + (boundaryBridge == null ? "boundary=inactive" : boundaryBridge.status())
                 + " lastFailure=" + (lastFailureDescription.isEmpty()
                         ? "none" : lastFailureDescription);
     }
@@ -2476,6 +2681,33 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
     public ServerLevel level() {
         return level;
+    }
+
+    /**
+     * Host level that owns this auxiliary copy. Game-event and explosion
+     * bridges use it to map auxiliary coordinates back to the visible world.
+     */
+    public ServerLevel hostLevel() {
+        return hostLevel;
+    }
+
+    /** Whether this auxiliary level has been closed. */
+    public boolean closed() {
+        return closed;
+    }
+
+    /**
+     * Resolves the owner of an auxiliary {@link Level}, or {@code null} for a
+     * normal host level. This is the only public way bridge code needs to
+     * distinguish "explosion happened in a structure copy" from "explosion
+     * happened in the real world".
+     */
+    public static @Nullable EmptyPhysicsLevel ofLevel(@Nullable Level level) {
+        if (level instanceof AuxiliaryServerLevel auxiliary
+                && auxiliary.owner != null && !auxiliary.owner.closed) {
+            return auxiliary.owner;
+        }
+        return null;
     }
 
     public int activeChunkCount() {
@@ -2799,6 +3031,20 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         }
 
         @Override
+        public void gameEvent(Holder<GameEvent> gameEvent, Vec3 position,
+                              GameEvent.Context context) {
+            // Keep the event available to listeners inside the copy (a sculk
+            // sensor in a structure should still power structure redstone),
+            // then project it into the host world at the structure pose.
+            super.gameEvent(gameEvent, position, context);
+            if (owner != null && (owner.boundaryBridge() == null
+                    || !owner.boundaryBridge().guard()
+                    .isGameEventToStructureDispatch())) {
+                StructureGameEvents.forwardFromAuxiliary(owner, gameEvent, position, context);
+            }
+        }
+
+        @Override
         public void levelEvent(@Nullable Entity source, int type, BlockPos pos, int data) {
             if (type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK && owner != null) {
                 if (owner.suppressingBreakFeedback()) {
@@ -2871,9 +3117,73 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         }
 
         @Override
+        public BlockState getBlockState(BlockPos pos) {
+            final LevelChunk chunk = getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            final BlockState local = chunk == null
+                    ? Blocks.AIR.defaultBlockState() : chunk.getBlockState(pos);
+            if (!local.isAir() || owner == null || owner.isInsideRegion(pos)) {
+                return local;
+            }
+            final BlockState boundary = owner.boundaryBlockState(pos);
+            return boundary == null ? local : boundary;
+        }
+
+        @Override
+        public @Nullable BlockEntity getBlockEntity(BlockPos pos) {
+            final LevelChunk chunk = getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            final BlockEntity local = chunk == null ? null : chunk.getBlockEntity(pos);
+            if (local != null || owner == null || owner.isInsideRegion(pos)) {
+                return local;
+            }
+            return owner.boundaryBlockEntity(pos);
+        }
+
+        @Override
+        public FluidState getFluidState(BlockPos pos) {
+            final LevelChunk chunk = getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            final BlockState local = chunk == null
+                    ? Blocks.AIR.defaultBlockState() : chunk.getBlockState(pos);
+            final FluidState localFluid = local.getFluidState();
+            if (!local.isAir() || owner == null || owner.isInsideRegion(pos)) {
+                return localFluid;
+            }
+            final FluidState boundary = owner.boundaryFluidState(pos);
+            return boundary == null ? localFluid : boundary;
+        }
+
+        @Override
+        public int getSignal(BlockPos pos, Direction direction) {
+            if (owner != null && owner.boundaryBridge() != null
+                    && !owner.isInsideRegion(pos)) {
+                return owner.boundarySignal(pos, direction);
+            }
+            final BlockState state = getBlockState(pos);
+            int signal = state.getSignal(this, pos, direction);
+            if (state.isRedstoneConductor(this, pos)) {
+                signal = Math.max(signal, getDirectSignalTo(pos));
+            }
+            return signal;
+        }
+
+        @Override
+        public int getDirectSignal(BlockPos pos, Direction direction) {
+            if (owner != null && owner.boundaryBridge() != null
+                    && !owner.isInsideRegion(pos)) {
+                return owner.boundaryDirectSignal(pos, direction);
+            }
+            return getBlockState(pos).getDirectSignal(this, pos, direction);
+        }
+
+        @Override
         public void updateNeighborsAt(BlockPos pos, Block block, Orientation orientation) {
             if (owner == null || owner.consumeNeighborBudget()) {
                 super.updateNeighborsAt(pos, block, orientation);
+            }
+            if (owner != null) {
+                owner.onAuxiliaryNeighborUpdate(pos, block);
             }
         }
 
@@ -2883,6 +3193,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                                        Orientation orientation) {
             if (owner == null || owner.consumeNeighborBudget()) {
                 super.updateNeighborsAtExceptFromFacing(pos, block, direction, orientation);
+            }
+            if (owner != null) {
+                owner.onAuxiliaryNeighborUpdate(pos, block);
             }
         }
 
