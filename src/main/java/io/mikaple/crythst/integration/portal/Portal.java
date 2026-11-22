@@ -16,14 +16,16 @@ import java.util.UUID;
  * so there is no stale matrix to keep in sync.</p>
  *
  * <p>Instances are immutable apart from the volatile link field, which makes
- * snapshots cheap and safe to share with the client renderer. Persistence and
- * networking are intentionally outside this first milestone.</p>
+ * snapshots cheap and safe to share with the client renderer. Persistence is
+ * handled by {@link PortalSavedData}; multiplayer clients receive immutable
+ * snapshots through {@code PortalSyncPayload}.</p>
  */
 public final class Portal {
     private final UUID id;
     private final String name;
     private final ResourceKey<Level> dimension;
     private final PortalPlane plane;
+    private final PortalShape shape;
     private volatile UUID linkedPortalId;
 
     public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane) {
@@ -32,10 +34,21 @@ public final class Portal {
 
     public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane,
                   UUID linkedPortalId) {
+        this(id, name, dimension, plane, PortalShape.rectangle(plane), linkedPortalId);
+    }
+
+    public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalShape shape,
+                  UUID linkedPortalId) {
+        this(id, name, dimension, shape.plane(), shape, linkedPortalId);
+    }
+
+    public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane,
+                  PortalShape shape, UUID linkedPortalId) {
         this.id = Objects.requireNonNull(id, "id");
         this.name = validateName(name);
         this.dimension = Objects.requireNonNull(dimension, "dimension");
         this.plane = Objects.requireNonNull(plane, "plane");
+        this.shape = Objects.requireNonNull(shape, "shape");
         this.linkedPortalId = linkedPortalId;
     }
 
@@ -64,6 +77,11 @@ public final class Portal {
 
     public PortalPlane plane() {
         return plane;
+    }
+
+    /** Traversable opening (rectangle or polygon) on {@link #plane()}. */
+    public PortalShape shape() {
+        return shape;
     }
 
     /** Linked portal id, or {@code null} when unlinked. */

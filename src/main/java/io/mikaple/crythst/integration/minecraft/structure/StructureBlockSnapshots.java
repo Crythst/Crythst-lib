@@ -26,6 +26,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -52,7 +53,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Memory is bounded per structure and globally. Volumes larger than the
  * per-structure cap are not snapshotted. Snapshots are rebuilt at a throttled
  * interval so block edits appear quickly without re-reading every block every
- * tick.</p>
+ * tick. Transient animation state that is not stored in block-entity NBT
+ * (currently chest opener counts) is captured alongside the NBT and only
+ * triggers a rebuild when the value actually changes.</p>
  */
 public final class StructureBlockSnapshots {
     /** Maximum cells (including air) copied for one structure. */
@@ -135,19 +138,28 @@ public final class StructureBlockSnapshots {
                 seen.add(bodyId);
 
                 final Snapshot existing = snapshots.get(bodyId);
+                // Animation state (chest opener counts, ...) is transient and
+                // does not bump either revision. Capture only chest entries
+                // and rebuild when the target state actually changes.
+                final Map<net.minecraft.core.BlockPos, Integer> openCounts =
+                        physics.auxiliaryLevel() == null
+                                ? Map.of()
+                                : physics.auxiliaryLevel()
+                                        .captureBlockEntityOpenCounts(structure);
                 // Rebuild as soon as the structure content changed, including
                 // edits mirrored from the auxiliary void tick. Pose-only
                 // updates do not touch contentRevision and stay free.
                 if (existing != null
                         && existing.revision() == structure.contentRevision()
-                        && existing.blockEntityRevision() == structure.blockEntityRevision()) {
+                        && existing.blockEntityRevision() == structure.blockEntityRevision()
+                        && sameOpenCounts(existing, openCounts)) {
                     continue;
                 }
                 if (existing == null && size() >= MAX_STRUCTURES) {
                     continue;
                 }
 
-                final Snapshot replacement = build(structure);
+                final Snapshot replacement = build(structure, openCounts);
                 if (replacement == null) {
                     // Oversized or empty: make sure no stale snapshot survives.
                     final Snapshot removed = snapshots.remove(bodyId);
@@ -188,10 +200,20 @@ public final class StructureBlockSnapshots {
      * structure for one frame while the next tick's snapshot pass runs.
      */
     public static void captureNow(ResourceKey<Level> dimension, PhysicsStructure structure) {
+        captureNow(dimension, structure, Map.of());
+    }
+
+    /**
+     * Immediately captures one structure with transient animation state, for
+     * example chest opener counts. Used by callers that already have the
+     * auxiliary level at hand.
+     */
+    public static void captureNow(ResourceKey<Level> dimension, PhysicsStructure structure,
+                                  Map<net.minecraft.core.BlockPos, Integer> openCounts) {
         if (dimension == null || structure == null || structure.closed()) {
             return;
         }
-        final Snapshot snapshot = build(structure);
+        final Snapshot snapshot = build(structure, openCounts);
         if (snapshot == null) {
             return;
         }
@@ -265,10 +287,11 @@ public final class StructureBlockSnapshots {
         return new Snapshot(bodyId, bounds.minX(), bounds.minY(), bounds.minZ(),
                 bounds.sizeX(), bounds.sizeY(), bounds.sizeZ(),
                 copy, nonAir, NEXT_REVISION.incrementAndGet(), List.of(),
-                Map.of(), 0L);
+                Map.of(), 0L, Map.of());
     }
 
-    private static Snapshot build(PhysicsStructure structure) {
+    private static Snapshot build(PhysicsStructure structure,
+                                  Map<net.minecraft.core.BlockPos, Integer> openCounts) {
         final VoxelVolume volume = structure.volume();
         final IntBounds3 bounds = volume.bounds();
         final long cells = bounds.volume();
@@ -343,11 +366,62 @@ public final class StructureBlockSnapshots {
         if (nonAir == 0) {
             return null;
         }
+        Map<net.minecraft.core.BlockPos, Integer> animations = Map.of();
+        if (openCounts != null && !openCounts.isEmpty()) {
+            final Map<net.minecraft.core.BlockPos, Integer> converted = new LinkedHashMap<>();
+            for (Map.Entry<net.minecraft.core.BlockPos, Integer> entry : openCounts.entrySet()) {
+                final net.minecraft.core.BlockPos absolute = entry.getKey();
+                if (!bounds.contains(absolute.getX(), absolute.getY(), absolute.getZ())) {
+                    continue;
+                }
+                converted.put(new net.minecraft.core.BlockPos(
+                                absolute.getX() - bounds.minX(),
+                                absolute.getY() - bounds.minY(),
+                                absolute.getZ() - bounds.minZ()),
+                        entry.getValue());
+            }
+            animations = Map.copyOf(converted);
+        }
         return new Snapshot(structure.body().id(),
                 bounds.minX(), bounds.minY(), bounds.minZ(),
                 sizeX, bounds.sizeY(), sizeZ,
                 blocks, nonAir, structure.contentRevision(), movingBlocks,
-                blockEntities, structure.blockEntityRevision());
+                blockEntities, structure.blockEntityRevision(), animations);
+    }
+
+    /**
+     * Compares live absolute-voxel open counts with an existing snapshot's
+     * local animation map without allocating a converted copy.
+     */
+    private static boolean sameOpenCounts(Snapshot snapshot,
+                                          Map<net.minecraft.core.BlockPos, Integer> openCounts) {
+        final Map<net.minecraft.core.BlockPos, Integer> current = snapshot.blockEntityOpenCounts();
+        if (current.size() != (openCounts == null ? 0 : openCounts.size())) {
+            // The live map may contain entries outside the snapshot bounds;
+            // fall back to a precise comparison below if sizes merely differ
+            // because the structure grew/shrunk (that also changes revision).
+            if (current.isEmpty() && (openCounts == null || openCounts.isEmpty())) {
+                return true;
+            }
+        }
+        if (openCounts == null || openCounts.isEmpty()) {
+            return current.isEmpty();
+        }
+        for (Map.Entry<net.minecraft.core.BlockPos, Integer> entry : openCounts.entrySet()) {
+            final net.minecraft.core.BlockPos absolute = entry.getKey();
+            if (!snapshot.containsVoxel(absolute.getX(), absolute.getY(), absolute.getZ())) {
+                continue;
+            }
+            if (!java.util.Objects.equals(
+                    snapshot.openCountAt(absolute.getX(), absolute.getY(), absolute.getZ()),
+                    entry.getValue())) {
+                return false;
+            }
+        }
+        // Every snapshot entry must still be present in the live map; a removed
+        // chest changes blockEntityRevision via the block-state mirror, so the
+        // caller would rebuild anyway.
+        return current.size() == openCounts.size();
     }
 
     /**
@@ -369,13 +443,15 @@ public final class StructureBlockSnapshots {
         private final List<MovingBlock> movingBlocks;
         private final Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities;
         private final long blockEntityRevision;
+        private final Map<net.minecraft.core.BlockPos, Integer> blockEntityOpenCounts;
 
         private Snapshot(long bodyId, int minX, int minY, int minZ,
                          int sizeX, int sizeY, int sizeZ,
                          BlockState[] blocks, int nonAirBlocks, long revision,
                          List<MovingBlock> movingBlocks,
                          Map<net.minecraft.core.BlockPos, CompoundTag> blockEntities,
-                         long blockEntityRevision) {
+                         long blockEntityRevision,
+                         Map<net.minecraft.core.BlockPos, Integer> blockEntityOpenCounts) {
             this.bodyId = bodyId;
             this.minX = minX;
             this.minY = minY;
@@ -389,6 +465,8 @@ public final class StructureBlockSnapshots {
             this.movingBlocks = List.copyOf(movingBlocks);
             this.blockEntities = Map.copyOf(blockEntities);
             this.blockEntityRevision = blockEntityRevision;
+            this.blockEntityOpenCounts = blockEntityOpenCounts == null
+                    ? Map.of() : Map.copyOf(blockEntityOpenCounts);
         }
 
         public long bodyId() {
@@ -440,6 +518,30 @@ public final class StructureBlockSnapshots {
 
         public long blockEntityRevision() {
             return blockEntityRevision;
+        }
+
+        /** Structure-local (snapshot-grid) transient animation state. */
+        public Map<net.minecraft.core.BlockPos, Integer> blockEntityOpenCounts() {
+            return blockEntityOpenCounts;
+        }
+
+        /**
+         * Chest opener count at an absolute structure-local voxel, or
+         * {@code null} when that voxel is not a chest (or has no live state).
+         */
+        public @org.jetbrains.annotations.Nullable Integer openCountAt(int x, int y, int z) {
+            if (!containsVoxel(x, y, z)) {
+                return null;
+            }
+            return blockEntityOpenCounts.get(new net.minecraft.core.BlockPos(
+                    x - minX, y - minY, z - minZ));
+        }
+
+        /** Whether an absolute voxel lies inside the snapshot bounds. */
+        public boolean containsVoxel(int x, int y, int z) {
+            return x >= minX && x < minX + sizeX
+                    && y >= minY && y < minY + sizeY
+                    && z >= minZ && z < minZ + sizeZ;
         }
 
         /**

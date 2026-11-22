@@ -53,9 +53,16 @@ public final class StructureInteractionEvents {
         }
         PayloadTypeRegistry.serverboundPlay().register(StructureActionPayload.TYPE,
                 StructureActionPayload.STREAM_CODEC);
+        PayloadTypeRegistry.serverboundPlay().register(StructureSignUpdatePayload.TYPE,
+                StructureSignUpdatePayload.STREAM_CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(StructureSignOpenPayload.TYPE,
+                StructureSignOpenPayload.STREAM_CODEC);
         ServerPlayNetworking.registerGlobalReceiver(StructureActionPayload.TYPE,
                 (payload, context) -> context.server().execute(
                         () -> StructureInteraction.handleAction(context.player(), payload.action())));
+        ServerPlayNetworking.registerGlobalReceiver(StructureSignUpdatePayload.TYPE,
+                (payload, context) -> context.server().execute(
+                        () -> StructureSignInteraction.handleUpdate(context.player(), payload)));
 
         StructureMiningSessions.register();
         AttackBlockCallback.EVENT.register(StructureInteractionEvents::onAttackBlock);

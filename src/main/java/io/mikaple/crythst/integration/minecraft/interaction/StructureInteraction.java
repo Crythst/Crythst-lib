@@ -15,6 +15,7 @@ import io.mikaple.crythst.integration.minecraft.selection.StructureSelection;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
 import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.integration.minecraft.structure.split.StructureSplitter;
+import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.mixin.ServerGamePacketListenerImplInvoker;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -369,11 +370,11 @@ public final class StructureInteraction {
         final double previousMass = volume.blockMass(x, y, z);
         final PhysicsMaterial previousMaterial = volume.blockMaterial(x, y, z);
         final double blockScale = structure.blockScale();
-        // Capture the world centre before mutating or splitting the body. The
-        // last voxel closes its body below, and a split replaces the original
-        // structure with new components, so the feedback point must not be
-        // read from the body afterwards.
-        final Vector3d feedbackCenter = structure.blockCenter(x, y, z);
+        // Capture the pose before mutating or splitting the body. The last
+        // voxel closes its body below, and a split replaces the original
+        // structure with new components, so feedback must not read the body
+        // afterwards.
+        final Transform3d feedbackPose = structure.pose();
         StructureBlockStates.remove(structure, x, y, z);
         editable.setBlock(x, y, z, false, 0.0, PhysicsMaterial.DEFAULT, null);
 
@@ -382,8 +383,8 @@ public final class StructureInteraction {
             // simulated, so it is cleared instead of reindexed. Emit feedback
             // first: this is the last block and there is no later success
             // path for it.
-            StructureFeedback.breakBlock(level, feedbackCenter, previousState, blockScale,
-                    level.getRandom());
+            StructureFeedback.breakBlock(level, feedbackPose, x, y, z,
+                    previousState, blockScale, level.getRandom());
             StructureSplitter.removeIfMassless(physics, structure, volume);
             notifyListeners(player, structure, x, y, z, previousState, null);
             return new BreakResult(true, true, previousState);
@@ -399,11 +400,11 @@ public final class StructureInteraction {
             return BreakResult.FAILED;
         }
         // Emit feedback after the successful reindex but before the refresh
-        // pass, which may split or close this body. The stored centre is a
-        // world-space value, but playing the sound and particles while the body
-        // is still alive keeps the ordering obvious.
-        StructureFeedback.breakBlock(level, feedbackCenter, previousState, blockScale,
-                level.getRandom());
+        // pass, which may split or close this body. The pose was captured
+        // before the edit, so playing the sound and particles while the body is
+        // still alive keeps the ordering obvious.
+        StructureFeedback.breakBlock(level, feedbackPose, x, y, z,
+                previousState, blockScale, level.getRandom());
         // Removing a block can disconnect the remaining solid cells. The
         // refresh pass also performs that split and returns the bodies that now
         // represent the structure.
@@ -820,12 +821,18 @@ public final class StructureInteraction {
 
         final boolean projecting = physics.beginAuxiliaryAudioProjection(structure);
         try {
+            final ItemStack stack = player.getMainHandItem();
+            final InteractionResult signResult = StructureSignInteraction.tryUse(
+                    player, structure, live, auxiliaryHit, stack,
+                    InteractionHand.MAIN_HAND, x, y, z);
+            if (signResult != null && signResult.consumesAction()) {
+                return signResult;
+            }
             final MenuProvider menu = state.getMenuProvider(auxiliaryLevel, auxiliaryPos);
             if (menu != null && player.openMenu(menu).isPresent()) {
                 return InteractionResult.SUCCESS;
             }
 
-            final ItemStack stack = player.getMainHandItem();
             InteractionResult result;
             if (stack.isEmpty()) {
                 result = state.useWithoutItem(auxiliaryLevel, player, auxiliaryHit);

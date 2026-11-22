@@ -27,6 +27,10 @@ final class PortalViewRegistry {
         return targets.get(portalId);
     }
 
+    int size() {
+        return targets.size();
+    }
+
     PortalViewTarget getOrCreate(PortalSnapshot portal, RenderTarget mainTarget,
                                  int width, int height) {
         PortalViewTarget existing = targets.get(portal.id());

@@ -5,6 +5,7 @@ import io.mikaple.crythst.api.block.BlockEntityStructureActor;
 import io.mikaple.crythst.integration.minecraft.entity.attachment.StructureAttachedEntities;
 import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntityProjection;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureBlockStates;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.storage.RestoredStructureVolume;
 import io.mikaple.crythst.integration.minecraft.storage.StructureBlockEntityData;
 import io.mikaple.crythst.mixin.ChunkAccessBlockEntityAccessor;
@@ -50,6 +51,7 @@ import net.minecraft.world.level.block.LevelEvent;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityTicker;
 import net.minecraft.world.level.block.entity.BlockEntityType;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -74,6 +76,7 @@ import org.joml.Vector3d;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -341,6 +344,9 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private int neighborBudget;
     private long totalBlockTicks;
     private long totalScheduledPasses;
+    private long totalTickPasses;
+    /** Last game time for which the block-logic phases actually ran. */
+    private long lastProcessedGameTime = Long.MIN_VALUE;
     private long totalFluidTicks;
     private long totalBlockEvents;
     private long totalBlockEventsQueued;
@@ -402,8 +408,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     .withBiomeAndLayers(List.of(), Optional.empty(), plains);
             final LevelStem stem = new LevelStem(host.dimensionTypeRegistration(), new FlatLevelSource(settings));
 
-            final ServerLevelData data = new DerivedLevelData(server.getWorldData(),
-                    server.getWorldData().overworldData());
+            final ServerLevelData data = new HostClockLevelData(
+                    server.getWorldData(), server.getWorldData().overworldData(), host);
             final Identifier hostId = host.dimension().identifier();
             final ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION,
                     Identifier.fromNamespaceAndPath(Crythst.MOD_ID,
@@ -940,6 +946,51 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     }
 
     /**
+     * Captures transient block-entity animation state that is not part of NBT.
+     *
+     * <p>Chest lid progress is driven by the openers counter, not by saved
+     * data, so a client snapshot alone would always render a closed lid. This
+     * returns the current opener count for every chest in the region, keyed by
+     * <em>absolute structure-local voxel</em> coordinates. The snapshot
+     * producer converts the keys to its own local grid; renderers use them to
+     * drive the synthetic client-side chest animation.</p>
+     *
+     * <p>Only registered block-entity positions are inspected (never a whole
+     * chunk scan) and the method is non-loading. Non-chest block entities are
+     * omitted, so an ordinary structure pays nothing beyond this short list.</p>
+     *
+     * @return immutable map of structure voxel to chest opener count; empty
+     *         when the structure has no live chest block entities
+     */
+    public Map<BlockPos, Integer> captureBlockEntityOpenCounts(PhysicsStructure structure) {
+        if (closed || structure == null || structure.closed()) {
+            return Map.of();
+        }
+        final Region region = regions.get(structure.body().id());
+        if (region == null || region.blockEntityPositions.isEmpty()) {
+            return Map.of();
+        }
+        Map<BlockPos, Integer> data = null;
+        for (long packed : List.copyOf(region.blockEntityPositions)) {
+            final BlockPos pos = BlockPos.of(packed);
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            if (chunk == null || !(chunk.getBlockEntity(pos) instanceof ChestBlockEntity)) {
+                continue;
+            }
+            if (data == null) {
+                data = new LinkedHashMap<>();
+            }
+            final BlockPos local = new BlockPos(
+                    structure.volume().bounds().minX() + (pos.getX() - region.baseX),
+                    structure.volume().bounds().minY() + (pos.getY() - region.baseY),
+                    structure.volume().bounds().minZ() + (pos.getZ() - region.baseZ));
+            data.put(local, ChestBlockEntity.getOpenCount(level, pos));
+        }
+        return data == null ? Map.of() : Map.copyOf(data);
+    }
+
+    /**
      * Captures pending scheduled block/fluid ticks for a structure. The
      * auxiliary level is transient, so without this a repeater/observer/fluid
      * delay that was active when the world was saved is lost on re-entry.
@@ -965,6 +1016,10 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             if (chunk == null) {
                 continue;
             }
+            // A replacement chunk (or a structure copied in the same server
+            // tick as a save) can still hold unpacked pending ticks. getAll()
+            // only sees the live queue, so unpack first; this is idempotent.
+            chunk.unpackTicks(now);
             if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
@@ -980,6 +1035,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                         tick.triggerTick(), tick.priority(), tick.subTickOrder()));
             }
         }
+        // The sub-tick order is only meaningful relative to the other ticks in
+        // the same level and tick. Persist a deterministic priority/order
+        // sequence; restore assigns fresh monotonic orders, exactly like
+        // vanilla's SavedTick unpacking.
+        sortCapturedTickTags(blocks);
+        sortCapturedTickTags(fluids);
         if (!blocks.isEmpty()) {
             root.put("Block", blocks);
         }
@@ -987,6 +1048,23 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             root.put("Fluid", fluids);
         }
         return root;
+    }
+
+    /**
+     * Sorts persisted tick tags by the vanilla intra-tick order (priority,
+     * then sub-tick). Pure helper used by capture, restore and tests.
+     */
+    static void sortCapturedTickTags(ListTag ticks) {
+        ticks.sort(Comparator
+                .comparingInt(tag -> ((CompoundTag) tag)
+                        .getIntOr("Priority", TickPriority.NORMAL.getValue()))
+                .thenComparingLong(tag -> ((CompoundTag) tag).getLongOr("Order", 0L))
+                // Old pending ticks from separate chunks can share an order.
+                // Position/type keep the restored sequence deterministic.
+                .thenComparingInt(tag -> ((CompoundTag) tag).getIntOr("X", 0))
+                .thenComparingInt(tag -> ((CompoundTag) tag).getIntOr("Y", 0))
+                .thenComparingInt(tag -> ((CompoundTag) tag).getIntOr("Z", 0))
+                .thenComparing(tag -> ((CompoundTag) tag).getStringOr("Type", "")));
     }
 
     private static void addSavedTick(ListTag list, Region region, long now,
@@ -1010,8 +1088,13 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         entry.putInt("Y", region.volumeMinY + localY);
         entry.putInt("Z", region.volumeMinZ + localZ);
         entry.putString("Type", type);
+        // Delays are relative to the capture game time. This is what makes a
+        // round trip through the save file independent of how long the world
+        // was offline.
         entry.putLong("Delay", Math.max(0L, triggerTick - now));
         entry.putInt("Priority", priority.getValue());
+        // Kept for deterministic diagnostics and old saves. Restore does not
+        // reuse the value: it assigns a fresh order in the saved sequence.
         entry.putLong("Order", subTickOrder);
         list.add(entry);
     }
@@ -1020,6 +1103,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      * Restores pending scheduled ticks captured by
      * {@link #captureScheduledTicks}. Must run after {@link #addStructure}, so
      * the chunk tick containers exist.
+     *
+     * <p>Only ticks represented in the captured tag are replaced. Fresh ticks
+     * seeded by {@code onPlace}/fluid re-waking are left alone; clearing every
+     * tick in the region would silently delete water flow or a component that
+     * started ticking while the region was copied.</p>
      */
     public void applyScheduledTicks(PhysicsStructure structure, CompoundTag root) {
         if (closed || structure == null || root == null
@@ -1031,18 +1119,22 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             return;
         }
         final long now = level.getGameTime();
-        clearRegionTicks(region);
         restoreTickList(root.getListOrEmpty("Block"), true, region, now);
         restoreTickList(root.getListOrEmpty("Fluid"), false, region, now);
     }
 
     private void clearRegionTicks(Region region) {
+        final long now = level.getGameTime();
         for (long chunkKey : region.chunks) {
             final LevelChunk chunk = level.getChunkSource().getChunkNow(
                     ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
             if (chunk == null) {
                 continue;
             }
+            // removeIf only sees the live queue. Unpack pending ticks first so
+            // a discarded region cannot leave stale work that fires when the
+            // chunk container is reused.
+            chunk.unpackTicks(now);
             if (chunk.getBlockTicks() instanceof LevelChunkTicks<?> rawBlocks) {
                 @SuppressWarnings("unchecked")
                 final LevelChunkTicks<Block> ticks = (LevelChunkTicks<Block>) rawBlocks;
@@ -1066,8 +1158,13 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
     private void restoreTickList(ListTag list, boolean blockTicks, Region region,
                                  long now) {
-        for (int i = 0; i < list.size(); i++) {
-            final CompoundTag entry = list.getCompoundOrEmpty(i);
+        if (list.isEmpty()) {
+            return;
+        }
+        final ListTag ordered = list.copy();
+        sortCapturedTickTags(ordered);
+        for (int i = 0; i < ordered.size(); i++) {
+            final CompoundTag entry = ordered.getCompoundOrEmpty(i);
             if (entry.isEmpty()) {
                 continue;
             }
@@ -1080,22 +1177,43 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     region.baseY + entry.getIntOr("Y", 0) - region.volumeMinY,
                     region.baseZ + entry.getIntOr("Z", 0) - region.volumeMinZ);
             ensureChunk(pos);
+            final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                    pos.getX() >> 4, pos.getZ() >> 4);
+            if (chunk == null) {
+                continue;
+            }
             final long delay = Math.max(0L, entry.getLongOr("Delay", 0L));
             final TickPriority priority = TickPriority.byValue(
                     entry.getIntOr("Priority", TickPriority.NORMAL.getValue()));
-            final long order = entry.getLongOr("Order", 0L);
+            // Rebase instead of replaying the saved order. The auxiliary level
+            // counter restarts at zero after a reload; reusing an old high
+            // order would make a restored repeater run after ticks scheduled
+            // later in the same game tick.
+            final long order = level.nextSubTickCount();
             if (blockTicks) {
                 final Block block = BuiltInRegistries.BLOCK.getOptional(id).orElse(null);
-                if (block != null) {
-                    level.getBlockTicks().schedule(
-                            new ScheduledTick<>(block, pos, now + delay, priority, order));
+                if (block == null || !(chunk.getBlockTicks() instanceof LevelChunkTicks<?> raw)) {
+                    continue;
                 }
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Block> container = (LevelChunkTicks<Block>) raw;
+                // Replace only the captured position/type. Any other pending
+                // work seeded by re-waking the copied region is preserved.
+                container.removeIf(existing ->
+                        existing.pos().equals(pos) && existing.type() == block);
+                container.schedule(
+                        new ScheduledTick<>(block, pos, now + delay, priority, order));
             } else {
                 final Fluid fluid = BuiltInRegistries.FLUID.getOptional(id).orElse(null);
-                if (fluid != null) {
-                    level.getFluidTicks().schedule(
-                            new ScheduledTick<>(fluid, pos, now + delay, priority, order));
+                if (fluid == null || !(chunk.getFluidTicks() instanceof LevelChunkTicks<?> raw)) {
+                    continue;
                 }
+                @SuppressWarnings("unchecked")
+                final LevelChunkTicks<Fluid> container = (LevelChunkTicks<Fluid>) raw;
+                container.removeIf(existing ->
+                        existing.pos().equals(pos) && existing.type() == fluid);
+                container.schedule(
+                        new ScheduledTick<>(fluid, pos, now + delay, priority, order));
             }
         }
     }
@@ -1478,6 +1596,32 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         StructureBlockEntityData.put(structure, updated);
     }
 
+    /**
+     * Replaces an auxiliary-level destroy-block event with a pose-aware host
+     * burst. Returns {@code false} when the event does not belong to a live
+     * structure, so the caller can keep its generic projection path.
+     */
+    private boolean emitStructureBreakFeedback(BlockPos auxiliaryPos, BlockState state) {
+        if (closed || auxiliaryPos == null || state == null || state.isAir()) {
+            return false;
+        }
+        final Region region = regionAt(auxiliaryPos);
+        if (region == null || region.structure == null || region.structure.closed()) {
+            return false;
+        }
+        final PhysicsStructure structure = region.structure;
+        final IntBounds3 bounds = structure.volume().bounds();
+        final int x = bounds.minX() + (auxiliaryPos.getX() - region.baseX);
+        final int y = bounds.minY() + (auxiliaryPos.getY() - region.baseY);
+        final int z = bounds.minZ() + (auxiliaryPos.getZ() - region.baseZ);
+        if (!bounds.contains(x, y, z)) {
+            return false;
+        }
+        StructureFeedback.breakBlock(hostLevel, structure.pose(), x, y, z, state,
+                structure.blockScale(), hostLevel.getRandom());
+        return true;
+    }
+
     private @Nullable Region regionAt(BlockPos pos) {
         for (Region region : regions.values()) {
             final int localX = pos.getX() - region.baseX;
@@ -1572,6 +1716,16 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         if (closed) {
             return TickResult.EMPTY;
         }
+        final long gameTime = level.getGameTime();
+        // One block-logic pass per game time. A manual /crythst step or a
+        // second callback within the same server tick must not run scheduled
+        // ticks, random ticks or block entities twice; vanilla advances these
+        // exactly once per game time.
+        if (gameTime == lastProcessedGameTime) {
+            return TickResult.EMPTY;
+        }
+        lastProcessedGameTime = gameTime;
+        totalTickPasses++;
         final int beforeMirrored = (int) totalMirroredBlocks;
         final int beforeSkipped = (int) totalSkippedBlocks;
         final int beforeBlockTicks = (int) totalBlockTicks;
@@ -1628,12 +1782,10 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     private void runScheduledBlockTicks() {
         totalScheduledPasses++;
         final long gameTime = level.getGameTime();
-        int budget = MAX_BLOCK_TICKS_PER_TICK;
+        final TickBudget budget = new TickBudget(MAX_BLOCK_TICKS_PER_TICK);
+        final List<ScheduledTick<Block>> due = new ArrayList<>();
+        chunkLoop:
         for (long chunkKey : activeChunks.keySet()) {
-            if (budget <= 0) {
-                totalDroppedWork++;
-                break;
-            }
             final LevelChunk chunk = level.getChunkSource().getChunkNow(
                     ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
             if (chunk == null
@@ -1646,30 +1798,67 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             // consults DistanceManager#inBlockTickingRange and can silently
             // leave due ticks queued for an auxiliary level that is not part of
             // the host server's normal simulation graph.
-            while (budget > 0) {
+            while (true) {
                 final ScheduledTick<Block> tick = ticks.peek();
                 if (tick == null || tick.triggerTick() > gameTime) {
                     break;
                 }
-                ticks.poll();
-                budget--;
-                final BlockState state = level.getBlockState(tick.pos());
-                if (state.is(tick.type())) {
-                    state.tick(level, tick.pos(), level.getRandom());
-                    totalBlockTicks++;
+                if (!budget.tryConsume()) {
+                    totalDroppedWork++;
+                    break chunkLoop;
                 }
+                ticks.poll();
+                due.add(tick);
+            }
+        }
+        // Vanilla collects every due tick first and then runs the batch in
+        // intra-tick order (priority, then sub-tick). Draining chunk by chunk
+        // would let an arbitrary HashMap iteration order decide which repeater
+        // or observer updates first across a chunk boundary.
+        sortDueTicks(due);
+        for (ScheduledTick<Block> tick : due) {
+            final BlockState state = level.getBlockState(tick.pos());
+            if (state.is(tick.type())) {
+                state.tick(level, tick.pos(), level.getRandom());
+                totalBlockTicks++;
             }
         }
     }
 
+    /**
+     * Stable vanilla intra-tick order for a due-tick batch. Trigger time is
+     * deliberately ignored: every tick in the batch is already due, and
+     * vanilla orders them by priority and sub-tick, not by how overdue they
+     * were. Pure helper used by the tick pass and tests.
+     */
+    static <T> void sortDueTicks(List<ScheduledTick<T>> ticks) {
+        ticks.sort((left, right) -> {
+            final int priority = left.priority().compareTo(right.priority());
+            if (priority != 0) {
+                return priority;
+            }
+            final int order = Long.compare(left.subTickOrder(), right.subTickOrder());
+            if (order != 0) {
+                return order;
+            }
+            // Pending ticks unpacked into different chunks can share a
+            // sub-tick order. Position makes that tie deterministic instead
+            // of depending on activeChunks hash iteration.
+            final int x = Integer.compare(left.pos().getX(), right.pos().getX());
+            if (x != 0) {
+                return x;
+            }
+            final int y = Integer.compare(left.pos().getY(), right.pos().getY());
+            return y != 0 ? y : Integer.compare(left.pos().getZ(), right.pos().getZ());
+        });
+    }
+
     private void runScheduledFluidTicks() {
         final long gameTime = level.getGameTime();
-        int budget = MAX_FLUID_TICKS_PER_TICK;
+        final TickBudget budget = new TickBudget(MAX_FLUID_TICKS_PER_TICK);
+        final List<ScheduledTick<Fluid>> due = new ArrayList<>();
+        chunkLoop:
         for (long chunkKey : activeChunks.keySet()) {
-            if (budget <= 0) {
-                totalDroppedWork++;
-                break;
-            }
             final LevelChunk chunk = level.getChunkSource().getChunkNow(
                     ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
             if (chunk == null
@@ -1678,18 +1867,25 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             }
             @SuppressWarnings("unchecked")
             final LevelChunkTicks<Fluid> ticks = (LevelChunkTicks<Fluid>) rawTicks;
-            while (budget > 0) {
+            while (true) {
                 final ScheduledTick<Fluid> tick = ticks.peek();
                 if (tick == null || tick.triggerTick() > gameTime) {
                     break;
                 }
-                ticks.poll();
-                budget--;
-                final FluidState state = level.getFluidState(tick.pos());
-                if (state.getType().isSame(tick.type())) {
-                    state.tick(level, tick.pos(), level.getBlockState(tick.pos()));
-                    totalFluidTicks++;
+                if (!budget.tryConsume()) {
+                    totalDroppedWork++;
+                    break chunkLoop;
                 }
+                ticks.poll();
+                due.add(tick);
+            }
+        }
+        sortDueTicks(due);
+        for (ScheduledTick<Fluid> tick : due) {
+            final FluidState state = level.getFluidState(tick.pos());
+            if (state.getType().isSame(tick.type())) {
+                state.tick(level, tick.pos(), level.getBlockState(tick.pos()));
+                totalFluidTicks++;
             }
         }
     }
@@ -2075,6 +2271,7 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         return "levelCreated=true"
                 + " regions=" + regionCount()
                 + " activeChunks=" + activeChunkCount()
+                + " tickPasses=" + totalTickPasses
                 + " scheduledBlockTicks=" + totalBlockTicks
                 + " scheduledFluidTicks=" + totalFluidTicks
                 + " pendingBlockTicks=" + pendingBlockTicks()
@@ -2102,13 +2299,19 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      * a missing ticket from a frozen clock or lost scheduled ticks.
      */
     public String tickDiagnostics() {
+        final long now = level.getGameTime();
         if (activeChunks.isEmpty()) {
-            return "gameTime=" + level.getGameTime() + " tickChunk=no-chunks";
+            return "gameTime=" + now
+                    + " lastProcessedGameTime=" + formatGameTime(lastProcessedGameTime)
+                    + " tickPasses=" + totalTickPasses
+                    + " tickChunk=no-chunks";
         }
         int simulated = 0;
         int activePendingBlocks = 0;
         int activePendingFluids = 0;
         long firstTrigger = Long.MAX_VALUE;
+        TickPriority firstPriority = TickPriority.NORMAL;
+        long firstSubTick = Long.MAX_VALUE;
         String firstPos = "-";
         for (long key : activeChunks.keySet()) {
             if (level.getChunkSource().chunkMap.getDistanceManager()
@@ -2123,8 +2326,11 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                 if (chunk.getBlockTicks()
                         instanceof net.minecraft.world.ticks.LevelChunkTicks<?> ticks) {
                     final var peek = ticks.peek();
-                    if (peek != null && peek.triggerTick() < firstTrigger) {
+                    if (peek != null && isEarlier(peek.triggerTick(), peek.priority(),
+                            peek.subTickOrder(), firstTrigger, firstPriority, firstSubTick)) {
                         firstTrigger = peek.triggerTick();
+                        firstPriority = peek.priority();
+                        firstSubTick = peek.subTickOrder();
                         firstPos = peek.pos().toShortString();
                     }
                 }
@@ -2133,15 +2339,77 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         final long key = activeChunks.keySet().iterator().next();
         final LevelChunk chunk = level.getChunkSource().getChunkNow(
                 ChunkPos.getX(key), ChunkPos.getZ(key));
-        return "gameTime=" + level.getGameTime()
+        final long nextDelay = firstTrigger == Long.MAX_VALUE ? -1L : firstTrigger - now;
+        return "gameTime=" + now
+                + " lastProcessedGameTime=" + formatGameTime(lastProcessedGameTime)
+                + " tickPasses=" + totalTickPasses
                 + " scheduledPasses=" + totalScheduledPasses
                 + " simulated=" + simulated + "/" + activeChunks.size()
                 + " activePendingBlocks=" + activePendingBlocks
                 + " activePendingFluids=" + activePendingFluids
-                + " firstTrigger=" + (firstTrigger == Long.MAX_VALUE ? "-" : firstTrigger)
+                + " nextDue=" + (firstTrigger == Long.MAX_VALUE ? "-" : firstTrigger)
+                + " nextDelay=" + nextDelay
+                + " nextPriority=" + (firstTrigger == Long.MAX_VALUE ? "-" : firstPriority)
+                + " nextSubTick=" + (firstTrigger == Long.MAX_VALUE ? "-" : firstSubTick)
                 + " firstPos=" + firstPos
                 + " chunkStatus=" + (chunk == null ? "unloaded" : chunk.getFullStatus())
                 + " activeTickets=" + level.getChunkSource().hasActiveTickets();
+    }
+
+    /**
+     * Per-region scheduled-tick diagnostics for {@code /crythst voiddebug}.
+     * Reads only already-loaded chunks and never schedules or loads work.
+     */
+    public String tickScheduleDiagnostics() {
+        final long now = level.getGameTime();
+        return "gameTime=" + now
+                + " lastProcessedGameTime=" + formatGameTime(lastProcessedGameTime)
+                + " tickPasses=" + totalTickPasses
+                + " scheduledPasses=" + totalScheduledPasses
+                + " regionPending(block/fluid)=" + regionPendingDiagnostics();
+    }
+
+    private String regionPendingDiagnostics() {
+        if (regions.isEmpty()) {
+            return "-";
+        }
+        final StringBuilder result = new StringBuilder();
+        for (Region region : regions.values()) {
+            int blocks = 0;
+            int fluids = 0;
+            for (long chunkKey : region.chunks) {
+                final LevelChunk chunk = level.getChunkSource().getChunkNow(
+                        ChunkPos.getX(chunkKey), ChunkPos.getZ(chunkKey));
+                if (chunk == null) {
+                    continue;
+                }
+                blocks += chunk.getBlockTicks().count();
+                fluids += chunk.getFluidTicks().count();
+            }
+            if (!result.isEmpty()) {
+                result.append(',');
+            }
+            result.append(region.structureId)
+                    .append(':').append(blocks)
+                    .append('/').append(fluids);
+        }
+        return result.toString();
+    }
+
+    private static boolean isEarlier(long trigger, TickPriority priority, long subTick,
+                                     long bestTrigger, TickPriority bestPriority, long bestSubTick) {
+        if (bestTrigger == Long.MAX_VALUE) {
+            return true;
+        }
+        if (trigger != bestTrigger) {
+            return trigger < bestTrigger;
+        }
+        final int byPriority = priority.compareTo(bestPriority);
+        return byPriority != 0 ? byPriority < 0 : subTick < bestSubTick;
+    }
+
+    private static String formatGameTime(long gameTime) {
+        return gameTime == Long.MIN_VALUE ? "-" : Long.toString(gameTime);
     }
 
     /**
@@ -2362,6 +2630,27 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
     }
 
     /**
+     * Level data that follows the host level's clock exactly, including modded
+     * dimensions or a level whose data is not the shared overworld data. The
+     * auxiliary level does not tick time itself ({@code tickTime=false}); this
+     * wrapper is the single source of its {@code getGameTime()}.
+     */
+    private static final class HostClockLevelData extends DerivedLevelData {
+        private final ServerLevel host;
+
+        private HostClockLevelData(net.minecraft.world.level.storage.WorldData worldData,
+                                   ServerLevelData fallback, ServerLevel host) {
+            super(worldData, fallback);
+            this.host = host;
+        }
+
+        @Override
+        public long getGameTime() {
+            return host.getGameTime();
+        }
+    }
+
+    /**
      * A {@link ServerLevel} whose audio/particle broadcasts are projected to
      * the host level while an interaction is running. The auxiliary level has
      * no players, so {@code ServerLevel#playSeededSound} and
@@ -2453,10 +2742,16 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
         @Override
         public void levelEvent(@Nullable Entity source, int type, BlockPos pos, int data) {
-            if (type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK
-                    && owner != null && owner.suppressingBreakFeedback()) {
-                // The redirect break path emits one host-side destroy event.
-                return;
+            if (type == LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK && owner != null) {
+                if (owner.suppressingBreakFeedback()) {
+                    // The redirect break path emits the host-side burst itself.
+                    return;
+                }
+                if (owner.emitStructureBreakFeedback(pos, Block.stateById(data))) {
+                    // The client-side 2001 handler works in BlockPos space and
+                    // would duplicate this exact, pose-aware burst.
+                    return;
+                }
             }
             final BlockPos mapped = projectBlockPos(pos.getX() + 0.5, pos.getY() + 0.5,
                     pos.getZ() + 0.5);

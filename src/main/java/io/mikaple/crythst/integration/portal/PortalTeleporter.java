@@ -3,7 +3,6 @@ package io.mikaple.crythst.integration.portal;
 import io.mikaple.crythst.Crythst;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
-import io.mikaple.crythst.math.OrientedBox;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.body.BodyHandle;
 import io.mikaple.crythst.physics.body.BodyType;
@@ -14,7 +13,6 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragonPart;
@@ -68,6 +66,7 @@ public final class PortalTeleporter {
 
     private static final Map<UUID, Integer> ENTITY_READY = new ConcurrentHashMap<>();
     private static final Map<String, Integer> BODY_READY = new ConcurrentHashMap<>();
+    private static final Map<String, BodySample> BODY_PREVIOUS = new ConcurrentHashMap<>();
     private static final Map<UUID, Long> PLAYER_ATTEMPT_LOG = new ConcurrentHashMap<>();
     private static final long CROSSING_LOG_INTERVAL_NANOS = 1_000_000_000L;
     private static final double NEAR_PLAYER_LOG_DISTANCE_SQUARED = 16.0;
@@ -79,6 +78,7 @@ public final class PortalTeleporter {
     public static void clearCooldowns() {
         ENTITY_READY.clear();
         BODY_READY.clear();
+        BODY_PREVIOUS.clear();
         PLAYER_ATTEMPT_LOG.clear();
     }
 
@@ -92,6 +92,7 @@ public final class PortalTeleporter {
         final int tick = server.getTickCount();
         ENTITY_READY.entrySet().removeIf(entry -> entry.getValue() <= tick);
         BODY_READY.entrySet().removeIf(entry -> entry.getValue() <= tick);
+        BODY_PREVIOUS.entrySet().removeIf(entry -> tick - entry.getValue().tick() > 100);
 
         final Set<UUID> teleportedEntities = new HashSet<>();
         final Set<String> teleportedBodies = new HashSet<>();
@@ -129,7 +130,7 @@ public final class PortalTeleporter {
                     final Vector3d beforePoint = previousTraversalPoint(entity);
                     final Vector3d afterPoint = traversalPoint(entity);
                     final PortalCrossing.Crossing crossing =
-                            PortalCrossing.findCrossing(portal.plane(), beforePoint, afterPoint);
+                            PortalCrossing.findCrossing(portal.shape(), beforePoint, afterPoint);
                     final Integer ready = ENTITY_READY.get(entity.getUUID());
                     final boolean cooldown = ready != null && tick < ready;
                     final boolean nearPlayer = entity instanceof ServerPlayer
@@ -139,7 +140,7 @@ public final class PortalTeleporter {
                     String result = "no crossing";
                     boolean teleported = false;
                     if (crossing != null && !crossing.inside()) {
-                        result = "outside rectangle";
+                        result = "outside opening";
                     } else if (crossing != null && cooldown) {
                         result = "cooldown";
                     } else if (crossing != null) {
@@ -269,7 +270,12 @@ public final class PortalTeleporter {
                 PortalTransform.viewDirection(entity.getYRot(), entity.getXRot())));
 
         final Vector3d base = entity instanceof ServerPlayer player
-                ? transformedPlayerFeet(player, transform)
+                ? PortalTeleportMath.playerFeetForTransformedEye(
+                        transform, new Vector3d(
+                                player.getEyePosition().x,
+                                player.getEyePosition().y,
+                                player.getEyePosition().z),
+                        player.getEyeHeight())
                 : transform.transformPoint(new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
         final Vector3d target = new Vector3d(base);
         if (!(entity instanceof ServerPlayer)) {
@@ -277,19 +283,24 @@ public final class PortalTeleporter {
             // instant the new camera position equals the transformed view
             // through the portal, so the transition is geometrically
             // continuous. Other entities get a tiny bias on the exit side the
-            // transformed motion actually leaves through (front for a
-            // front-to-back crossing, back for a back-to-front crossing).
+            // transformed motion actually leaves through.
             final Vector3d entryLocal = transform.entry().local(
                     new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
-            target.add(pushDirection(destination.plane(), transformedVelocity, entryLocal)
+            target.add(PortalTeleportMath.exitBias(
+                    destination.shape().plane(), transformedVelocity, entryLocal)
                     .mul(ENTITY_EXIT_OFFSET));
         }
 
         final double fallDistance = entity.fallDistance;
         final boolean onGround = entity.onGround();
+        final Vector3d oldPosition = new Vector3d(entity.getX(), entity.getY(), entity.getZ());
 
         if (destination.dimension().equals(level.dimension())) {
             applyLocalTeleport(entity, target, rotation[0], rotation[1], transformedVelocity);
+            // A locally teleported vehicle carries its passengers with the same
+            // rigid offset; vanilla's position packet path does this itself for
+            // players with passengers, but not for setPos on other entities.
+            movePassengers(entity, oldPosition, target, transform);
         } else {
             final TeleportTransition transition = new TeleportTransition(
                     destinationLevel,
@@ -315,17 +326,32 @@ public final class PortalTeleporter {
         return true;
     }
 
-    /**
-     * Places the player's feet so the vanilla camera (feet + eye height along
-     * world up) ends up at the transformed eye position. This keeps the view
-     * continuous through the portal; tilted portals still do not rotate the
-     * player's gravity/up vector, which is a later milestone.
-     */
-    private static Vector3d transformedPlayerFeet(ServerPlayer player, PortalTransform transform) {
-        final Vec3 eye = player.getEyePosition();
-        final Vector3d transformedEye = transform.transformPoint(
-                new Vector3d(eye.x, eye.y, eye.z));
-        return transformedEye.sub(0.0, player.getEyeHeight(), 0.0);
+    private static void movePassengers(Entity vehicle, Vector3d oldVehiclePosition,
+                                       Vector3d newVehiclePosition, PortalTransform transform) {
+        if (!vehicle.isVehicle()) {
+            return;
+        }
+        for (Entity passenger : vehicle.getPassengers()) {
+            final Vector3d relative = new Vector3d(
+                    passenger.getX() - oldVehiclePosition.x,
+                    passenger.getY() - oldVehiclePosition.y,
+                    passenger.getZ() - oldVehiclePosition.z);
+            transform.transformDirection(relative);
+            final Vector3d destination = new Vector3d(newVehiclePosition).add(relative);
+            final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
+                    PortalTransform.viewDirection(passenger.getYRot(), passenger.getXRot())));
+            if (passenger instanceof ServerPlayer player && player.connection != null) {
+                player.connection.teleport(new PositionMoveRotation(
+                        new Vec3(destination.x, destination.y, destination.z),
+                        Vec3.ZERO, rotation[0], rotation[1]),
+                        Set.<Relative>of());
+            } else {
+                passenger.setPos(destination.x, destination.y, destination.z);
+                passenger.setYRot(rotation[0]);
+                passenger.setXRot(rotation[1]);
+                passenger.setOldPosAndRot();
+            }
+        }
     }
 
     private static void applyLocalTeleport(Entity entity, Vector3d target,
@@ -369,13 +395,26 @@ public final class PortalTeleporter {
                 continue;
             }
 
-            final OrientedBox obb = body.obb();
-            final Vector3d centre = obb.center();
-            if (!portal.plane().contains(centre, PLANE_THICKNESS)) {
+            final String key = level.dimension().identifier() + "#" + body.id();
+            final Vector3d centre = body.transform().position();
+            final BodySample previous = BODY_PREVIOUS.get(key);
+            BODY_PREVIOUS.put(key, new BodySample(new Vector3d(centre), tick));
+
+            final boolean crossed;
+            final boolean inside;
+            if (previous != null && tick - previous.tick() <= 2) {
+                final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(
+                        portal.shape(), previous.centre(), centre);
+                crossed = crossing != null;
+                inside = crossing != null && crossing.inside();
+            } else {
+                crossed = portal.shape().contains(centre, PLANE_THICKNESS);
+                inside = crossed;
+            }
+            if (!crossed || !inside) {
                 continue;
             }
 
-            final String key = level.dimension().identifier() + "#" + body.id();
             if (!teleportedBodies.add(key)) {
                 continue;
             }
@@ -387,8 +426,8 @@ public final class PortalTeleporter {
 
             final Vector3d linear = transform.transformDirection(new Vector3d(body.linearVelocity()));
             final Vector3d angular = transform.transformDirection(new Vector3d(body.angularVelocity()));
-            final Vector3d push = pushDirection(destination.plane(), linear,
-                    portal.plane().local(centre));
+            final Vector3d push = PortalTeleportMath.exitBias(
+                    destination.shape().plane(), linear, portal.plane().local(centre));
 
             final PhysicsStructure structure = body.userData() instanceof PhysicsStructure s ? s : null;
 
@@ -401,6 +440,8 @@ public final class PortalTeleporter {
                 structure.body().setLinearVelocity(linear);
                 structure.body().setAngularVelocity(angular);
                 structure.body().activate();
+                BODY_PREVIOUS.put(key, new BodySample(
+                        new Vector3d(structure.body().transform().position()), tick));
             } else {
                 final Transform3d pose = body.transform();
                 final Vector3d position = transform.transformPoint(pose.position())
@@ -410,28 +451,16 @@ public final class PortalTeleporter {
                 body.setLinearVelocity(linear);
                 body.setAngularVelocity(angular);
                 body.activate();
+                BODY_PREVIOUS.put(key, new BodySample(
+                        new Vector3d(body.transform().position()), tick));
             }
 
             BODY_READY.put(key, tick + COOLDOWN_TICKS);
         }
     }
 
-    /**
-     * Unit vector along the destination normal in the direction the object is
-     * already travelling (or, for a nearly stationary object, the side of the
-     * entry slab it came from).
-     */
-    private static Vector3d pushDirection(PortalPlane destination, Vector3d transformedVelocity,
-                                          Vector3d entryLocal) {
-        final Vector3d normal = destination.normal();
-        double side = Math.signum(transformedVelocity.dot(normal));
-        if (side == 0.0) {
-            side = -Math.signum(entryLocal.z);
-        }
-        if (side == 0.0) {
-            side = 1.0;
-        }
-        return normal.mul(side);
+    private record BodySample(Vector3d centre, int tick) {
     }
+
 
 }

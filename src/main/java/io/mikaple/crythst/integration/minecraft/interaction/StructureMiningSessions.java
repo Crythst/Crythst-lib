@@ -293,7 +293,8 @@ public final class StructureMiningSessions {
         final StructureOperationRedirector.Mapped mapped =
                 new StructureOperationRedirector.Mapped(
                         active.structure, live,
-                        StructureOperationRedirector.auxiliaryHit(active.hit, live.pos()));
+                        StructureOperationRedirector.auxiliaryHit(active.hit, live.pos()),
+                        active.hit.voxelX(), active.hit.voxelY(), active.hit.voxelZ());
         // breakMapped runs vanilla destroyBlock in the auxiliary level (drops,
         // XP, statistics, durability and tool rules) and then mirrors/projects
         // the consequences back to the host world.

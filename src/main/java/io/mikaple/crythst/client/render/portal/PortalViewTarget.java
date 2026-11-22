@@ -32,6 +32,7 @@ final class PortalViewTarget {
     private float lastCameraPitch;
     private final Matrix4f captureViewProjection = new Matrix4f();
     private Vec3 captureCameraPos;
+    private PortalSnapshot capturedPortal;
     private SkyRenderer skyRenderer;
 
     PortalViewTarget(UUID portalId, Identifier textureId,
@@ -100,10 +101,11 @@ final class PortalViewTarget {
         return skyRenderer;
     }
 
-    void markReady(CameraRenderState mainCamera, long now, Matrix4f viewProjection,
-                   Vec3 captureCameraPosition) {
+    void markReady(PortalSnapshot portal, CameraRenderState mainCamera, long now,
+                   Matrix4f viewProjection, Vec3 captureCameraPosition) {
         ready = true;
         lastCaptureNanos = now;
+        capturedPortal = portal;
         if (viewProjection != null) {
             captureViewProjection.set(viewProjection);
         }
@@ -115,6 +117,10 @@ final class PortalViewTarget {
         }
     }
 
+    long ageNanos(long now) {
+        return lastCaptureNanos == 0L ? Long.MAX_VALUE : Math.max(0L, now - lastCaptureNanos);
+    }
+
     Matrix4f captureViewProjection() {
         return new Matrix4f(captureViewProjection);
     }
@@ -124,15 +130,21 @@ final class PortalViewTarget {
     }
 
     void markFailed() {
-        ready = false;
+        // Keep the last valid image across a transient extract/render failure;
+        // ready is already false if this target was never captured or was
+        // resized. This avoids flashing the procedural fallback when one frame
+        // is skipped.
     }
 
-    boolean isReusable(CameraRenderState mainCamera, long now) {
+    boolean isReusable(PortalSnapshot portal, CameraRenderState mainCamera, long now) {
         if (!ready || lastCaptureNanos == 0L || lastCameraPos == null
                 || mainCamera == null || mainCamera.pos == null) {
             return false;
         }
         if (now - lastCaptureNanos > PortalCaptureSettings.REUSE_MAX_AGE_NANOS) {
+            return false;
+        }
+        if (!samePose(capturedPortal, portal)) {
             return false;
         }
         if (mainCamera.pos.distanceToSqr(lastCameraPos)
@@ -143,6 +155,28 @@ final class PortalViewTarget {
         final float pitchDelta = Math.abs(mainCamera.xRot - lastCameraPitch);
         return yawDelta <= PortalCaptureSettings.REUSE_ANGLE_DEGREES
                 && pitchDelta <= PortalCaptureSettings.REUSE_ANGLE_DEGREES;
+    }
+
+    private static boolean samePose(PortalSnapshot a, PortalSnapshot b) {
+        if (a == null || b == null || !a.id().equals(b.id())) {
+            return false;
+        }
+        return samePlane(a.plane(), b.plane())
+                && samePlane(a.destinationPlane(), b.destinationPlane())
+                && a.linkedPortalId() != null
+                && a.linkedPortalId().equals(b.linkedPortalId());
+    }
+
+    private static boolean samePlane(io.mikaple.crythst.integration.portal.PortalPlane a,
+                                     io.mikaple.crythst.integration.portal.PortalPlane b) {
+        if (a == null || b == null) {
+            return a == b;
+        }
+        return a.origin().equals(b.origin(), 1.0e-9)
+                && a.normal().equals(b.normal(), 1.0e-9)
+                && a.right().equals(b.right(), 1.0e-9)
+                && Math.abs(a.width() - b.width()) <= 1.0e-9
+                && Math.abs(a.height() - b.height()) <= 1.0e-9;
     }
 
     void close() {

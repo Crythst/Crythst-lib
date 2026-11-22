@@ -10,6 +10,7 @@ import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import io.mikaple.crythst.physics.voxel.VoxelColliderOptions;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtOps;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
@@ -81,6 +82,59 @@ class StructureSavedDataTest {
         assertEquals(before.centerOfMass().x, after.centerOfMass().x, 1.0e-12);
         assertEquals(before.centerOfMass().y, after.centerOfMass().y, 1.0e-12);
         assertEquals(before.centerOfMass().z, after.centerOfMass().z, 1.0e-12);
+    }
+
+    @Test
+    void scheduledTicksSurviveNbtRoundTripWithRelativeDelays() {
+        final CompoundTag scheduledTicks = new CompoundTag();
+        final ListTag blocks = new ListTag();
+        final CompoundTag blockTick = new CompoundTag();
+        blockTick.putInt("X", 1);
+        blockTick.putInt("Y", 2);
+        blockTick.putInt("Z", 3);
+        blockTick.putString("Type", "minecraft:repeater");
+        blockTick.putLong("Delay", 7L);
+        blockTick.putInt("Priority", -1);
+        blockTick.putLong("Order", 42L);
+        blocks.add(blockTick);
+        scheduledTicks.put("Block", blocks);
+
+        final ListTag fluids = new ListTag();
+        final CompoundTag fluidTick = new CompoundTag();
+        fluidTick.putInt("X", -2);
+        fluidTick.putInt("Y", 0);
+        fluidTick.putInt("Z", 5);
+        fluidTick.putString("Type", "minecraft:water");
+        fluidTick.putLong("Delay", 3L);
+        fluidTick.putInt("Priority", 0);
+        fluidTick.putLong("Order", 9L);
+        fluids.add(fluidTick);
+        scheduledTicks.put("Fluid", fluids);
+
+        final SavedStructure saved = new SavedStructure(
+                UUID.randomUUID(),
+                Transform3d.IDENTITY,
+                SavedStructureVolume.fromVolume(TestVolumes.asymmetric()),
+                Map.of(),
+                StructureParameters.defaults(),
+                scheduledTicks);
+        final StructureSavedData data = new StructureSavedData();
+        data.add(saved);
+
+        final CompoundTag encoded = (CompoundTag) StructureSavedData.TYPE.codec()
+                .encodeStart(NbtOps.INSTANCE, data)
+                .getOrThrow();
+        final StructureSavedData decoded = StructureSavedData.TYPE.codec()
+                .parse(NbtOps.INSTANCE, encoded)
+                .getOrThrow();
+        final SavedStructure round = SavedStructure.fromTag(decoded.records().get(0), null);
+
+        assertEquals(scheduledTicks, round.scheduledTicks());
+        final CompoundTag roundBlock = round.scheduledTicks()
+                .getListOrEmpty("Block").getCompoundOrEmpty(0);
+        // Delays stay relative to the capture time, not absolute world times.
+        assertEquals(7L, roundBlock.getLongOr("Delay", -1L));
+        assertEquals(42L, roundBlock.getLongOr("Order", -1L));
     }
 
     @Test

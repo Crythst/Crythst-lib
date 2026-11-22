@@ -15,10 +15,11 @@ layout(location = 4) in vec3 localPosition;
 layout(location = 0) out vec4 fragColor;
 
 void main() {
-    // The texture was rendered from the linked portal's camera with the same
-    // projection as the main camera, so the portal's screen-space UV is the
-    // correct sample position (classic projective portal mapping).
-    vec2 uv = clamp(texCoord0, vec2(0.0), vec2(1.0));
+    // The texture was rendered from the linked portal's virtual camera with the
+    // same projection as the main camera. The quad's clip-space position is
+    // therefore the correct destination sample; the sampler is clamp-to-edge,
+    // so partially off-screen portals do not wrap or smear.
+    vec2 uv = texCoord0;
     vec4 color = texture(Sampler0, uv);
 
     // The captured scene is already lit/fogged; keep the surface opaque so it

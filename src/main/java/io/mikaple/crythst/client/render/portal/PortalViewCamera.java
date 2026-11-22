@@ -13,8 +13,14 @@ import org.joml.Vector3d;
 import org.joml.Vector3f;
 
 /**
- * The virtual destination camera and the exact projection used by the main
- * pass for this frame.
+ * The virtual destination camera and the exact projections used for one frame.
+ *
+ * <p>{@link #projection()} is the destination render projection with the exit
+ * portal plane as its oblique near plane. {@link #mainViewProjection()} is the
+ * unmodified main-camera screen projection stored with the texture; the portal
+ * quad samples the texture at its own main-camera screen position, which is
+ * mathematically identical to projecting {@code T(q)} through the destination
+ * camera.</p>
  */
 record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
                         Quaternionf orientation, Matrix4f viewRotation,
@@ -34,26 +40,37 @@ record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
                 || main.orientation == null) {
             return Result.failure("missing main camera matrix");
         }
+        if (portal.destinationPlane() == null) {
+            return Result.failure("portal has no destination plane");
+        }
 
         final PortalTransform transform = PortalTransform.between(
                 portal.plane(), portal.destinationPlane());
-        final Vector3d position = transform.transformPoint(
-                new Vector3d(main.pos.x, main.pos.y, main.pos.z));
+        final Matrix4f mainProjection = PortalProjection.worldProjection(
+                main, levelState.playerRenderState, options);
+        final PortalCameraMath.Pose camera = PortalCameraMath.portalCamera(
+                transform,
+                new Vector3d(main.pos.x, main.pos.y, main.pos.z),
+                new org.joml.Quaterniond(main.orientation),
+                mainProjection);
+        final Vector3d position = camera.position();
         if (!PortalCameraSanity.isFinitePosition(position.x, position.y, position.z)) {
             return Result.failure("non-finite camera position");
         }
 
-        final Quaternionf orientation = new Quaternionf(main.orientation)
-                .premul(new Quaternionf(transform.rotation()));
+        final Quaternionf orientation = new Quaternionf(camera.orientation());
         if (!PortalCameraSanity.isSaneOrientation(orientation)) {
             return Result.failure("non-finite orientation");
         }
         orientation.normalize();
 
-        final Matrix4f viewRotation = new Matrix4f().rotation(
-                new Quaternionf(orientation).conjugate());
-        final Matrix4f projection = PortalProjection.worldProjection(
-                main, levelState.playerRenderState, options);
+        final Matrix4f viewRotation = camera.viewRotation();
+        final Matrix4f projection = PortalClip.obliqueNearPlane(
+                mainProjection, viewRotation,
+                position,
+                portal.destinationPlane().origin(),
+                portal.destinationPlane().normal(),
+                PortalClip.DepthConvention.ZERO_TO_ONE_REVERSED);
         if (!PortalCameraSanity.isUsable(projection, viewRotation, orientation,
                 position.x, position.y, position.z)) {
             return Result.failure("degenerate projection or view rotation");
@@ -65,11 +82,9 @@ record PortalViewCamera(Vec3 position, Vec3 mainCapturePosition,
                 new Vector3d(forward.x, forward.y, forward.z));
         final Frustum frustum = new Frustum(viewRotation, projection);
         frustum.prepare(position.x, position.y, position.z);
-        // The same bobbed projection with the MAIN camera view: the captured
-        // image stays fixed to the portal plane between refreshes instead of
-        // sliding as the player moves.
-        final Matrix4f mainViewProjection = new Matrix4f(projection)
-                .mul(main.viewRotationMatrix);
+
+        final Matrix4f mainViewProjection = PortalCameraMath.mainViewProjection(
+                mainProjection, main.viewRotationMatrix);
 
         return new Result(new PortalViewCamera(portalPos, main.pos, orientation,
                 viewRotation, projection, mainViewProjection, frustum,

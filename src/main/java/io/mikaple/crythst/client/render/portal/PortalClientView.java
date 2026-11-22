@@ -38,6 +38,11 @@ public final class PortalClientView {
             PortalClientCache.clear();
             return;
         }
+        if (PortalClientCache.networkActive()) {
+            // The authoritative S2C snapshot is in use (singleplayer and
+            // multiplayer). Do not race it with a direct server query.
+            return;
+        }
         if (!minecraft.hasSingleplayerServer()) {
             PortalClientCache.clear();
             return;

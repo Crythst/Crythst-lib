@@ -9,6 +9,7 @@ import io.mikaple.crythst.integration.minecraft.PlayerGravity;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureInteraction;
 import io.mikaple.crythst.integration.minecraft.interaction.StructurePlacementValidation;
+import io.mikaple.crythst.integration.minecraft.interaction.StructureSignInteraction;
 import io.mikaple.crythst.integration.minecraft.selection.StructureBlockHitResult;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
@@ -86,7 +87,8 @@ public final class StructureOperationRedirector {
      *                     space (same local face/fraction as the world hit)
      */
     public record Mapped(PhysicsStructure structure, EmptyPhysicsLevel.LiveBlock live,
-                         BlockHitResult auxiliaryHit) {
+                         BlockHitResult auxiliaryHit,
+                         int voxelX, int voxelY, int voxelZ) {
     }
 
     /**
@@ -156,7 +158,8 @@ public final class StructureOperationRedirector {
             return null;
         }
         return new Mapped(structure, live,
-                auxiliaryHit(hit, live.pos()));
+                auxiliaryHit(hit, live.pos()),
+                hit.voxelX(), hit.voxelY(), hit.voxelZ());
     }
 
     /**
@@ -251,6 +254,12 @@ public final class StructureOperationRedirector {
                         || !player.getOffhandItem().isEmpty());
         InteractionResult result = InteractionResult.PASS;
         if (!secondaryUse) {
+            final InteractionResult signResult = StructureSignInteraction.tryUse(
+                    player, mapped.structure(), mapped.live(), auxiliaryHit,
+                    stack, hand, mapped.voxelX(), mapped.voxelY(), mapped.voxelZ());
+            if (signResult != null && signResult.consumesAction()) {
+                return signResult;
+            }
             result = state.useItemOn(stack, auxiliary, player, hand, auxiliaryHit);
             if (result == null) {
                 result = InteractionResult.PASS;
@@ -353,13 +362,11 @@ public final class StructureOperationRedirector {
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
         final EmptyPhysicsLevel auxiliary = physics == null ? null : physics.auxiliaryLevel();
         final BlockState previous = mapped.live().state();
-        // Resolve the feedback point before the break. A split/reindex may
+        // Capture the pose and voxel before the break. A split/reindex may
         // remove the original auxiliary region in finish(), which used to make
         // the projected break sound/particles disappear exactly on fractures.
         final BlockPos breakPos = mapped.live().pos();
-        final Vec3 feedbackCenter = auxiliary == null ? null
-                : auxiliary.projectAuxiliaryPoint(
-                        breakPos.getX() + 0.5, breakPos.getY() + 0.5, breakPos.getZ() + 0.5);
+        final Transform3d feedbackPose = mapped.structure().pose();
         final boolean projecting = physics != null
                 && physics.beginAuxiliaryAudioProjection(mapped.structure());
         boolean destroyed = false;
@@ -373,9 +380,9 @@ public final class StructureOperationRedirector {
                 auxiliary.beginSuppressBreakFeedback();
             }
             destroyed = gameMode.destroyBlock(breakPos);
-            if (destroyed && feedbackCenter != null) {
-                StructureFeedback.breakBlock(hostLevel,
-                        new Vector3d(feedbackCenter.x, feedbackCenter.y, feedbackCenter.z),
+            if (destroyed) {
+                StructureFeedback.breakBlock(hostLevel, feedbackPose,
+                        mapped.voxelX(), mapped.voxelY(), mapped.voxelZ(),
                         previous, mapped.structure().blockScale(), hostLevel.getRandom());
             }
         } catch (Throwable t) {

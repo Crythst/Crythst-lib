@@ -30,6 +30,7 @@ public final class StructureConstraintHandle {
     private final ConstraintHandle handle;
     private final @Nullable PhysicsStructure structureA;
     private final @Nullable PhysicsStructure structureB;
+    private final @Nullable StructureConstraintConfiguration configuration;
     private boolean removed;
 
     /**
@@ -49,6 +50,19 @@ public final class StructureConstraintHandle {
     public StructureConstraintHandle(PhysicsWorld world, ConstraintHandle handle,
                                      @Nullable PhysicsStructure structureA,
                                      @Nullable PhysicsStructure structureB) {
+        this(world, handle, structureA, structureB, null);
+    }
+
+    /**
+     * Wraps a live constraint while retaining its immutable configuration.
+     *
+     * @param configuration originating configuration, or {@code null} when the
+     *                      joint was created directly through the physics world
+     */
+    public StructureConstraintHandle(PhysicsWorld world, ConstraintHandle handle,
+                                     @Nullable PhysicsStructure structureA,
+                                     @Nullable PhysicsStructure structureB,
+                                     @Nullable StructureConstraintConfiguration configuration) {
         this.world = Validate.notNull(world, "world");
         this.handle = Validate.notNull(handle, "handle");
         if (structureA != null && structureA.world() != world) {
@@ -59,6 +73,7 @@ public final class StructureConstraintHandle {
         }
         this.structureA = structureA;
         this.structureB = structureB;
+        this.configuration = configuration;
     }
 
     /**
@@ -83,6 +98,49 @@ public final class StructureConstraintHandle {
     /** Backend joint family. */
     public ConstraintType type() {
         return handle.type();
+    }
+
+    /** Structure owning body A, or {@code null} when the handle was wrapped without one. */
+    public @Nullable PhysicsStructure structureA() {
+        return structureA;
+    }
+
+    /** Structure owning body B, or {@code null} for a world-anchored joint. */
+    public @Nullable PhysicsStructure structureB() {
+        return structureB;
+    }
+
+    /** Whether the second endpoint is the static world. */
+    public boolean isWorldAnchored() {
+        return structureB == null;
+    }
+
+    /**
+     * The immutable configuration used to create this joint, when known.
+     *
+     * <p>This is the value the caller passed to
+     * {@code PhysicsPipeline#addConstraint}. Constraints wrapped from the raw
+     * physics world report {@code null}. The configuration is not a live
+     * snapshot of limits or motor state; use the handle accessors for those.</p>
+     */
+    public @Nullable StructureConstraintConfiguration configuration() {
+        return configuration;
+    }
+
+    /**
+     * Body id of side A, or {@code -1} when the handle has no resolved
+     * structure.
+     */
+    public long bodyIdA() {
+        return structureA == null ? -1L : structureA.body().id();
+    }
+
+    /**
+     * Body id of side B, or {@code -1} for a world-anchored joint or an
+     * unresolved structure.
+     */
+    public long bodyIdB() {
+        return structureB == null ? -1L : structureB.body().id();
     }
 
     /** Whether the joint currently participates in simulation. */

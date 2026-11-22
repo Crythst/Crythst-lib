@@ -291,9 +291,49 @@ public final class StructureSplitter {
         final VoxelColliderOptions colliderOptions =
                 VoxelColliderOptions.DEFAULT.withBlockScale(original.blockScale());
         final int componentCount = components.size();
-        final List<MutableVoxelVolume> volumes = new ArrayList<>(componentCount);
-        for (Component component : components) {
-            volumes.add(copyComponent(volume, bounds, component));
+
+        // Build ownership for every non-air state, not just colliding cells.
+        // Repeaters, observers, torches, wire and fluids have no solid voxel of
+        // their own; dropping their ticks here made a split structure lose all
+        // pending redstone work.
+        final Map<Cell, Integer> owners = new HashMap<>();
+        final List<Map<Cell, BlockState>> componentStates = new ArrayList<>(componentCount);
+        for (int i = 0; i < componentCount; i++) {
+            componentStates.add(new HashMap<>());
+            for (Cell cell : components.get(i).cells()) {
+                owners.put(cell, i);
+            }
+        }
+        for (int i = 0; i < componentCount; i++) {
+            for (Cell cell : components.get(i).cells()) {
+                final BlockState state = stateAt(original, volume, cell);
+                if (state != null && !state.isAir()) {
+                    componentStates.get(i).put(cell, state);
+                }
+            }
+        }
+        for (int y = bounds.minY(); y < bounds.maxY(); y++) {
+            for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
+                for (int x = bounds.minX(); x < bounds.maxX(); x++) {
+                    if (volume.isSolid(x, y, z)) {
+                        continue;
+                    }
+                    final Cell cell = new Cell(x, y, z);
+                    final BlockState state = stateAt(original, volume, cell);
+                    if (state == null || state.isAir()) {
+                        continue;
+                    }
+                    final int owner = ownerOf(cell, components);
+                    owners.put(cell, owner);
+                    componentStates.get(owner).put(cell, state);
+                }
+            }
+        }
+
+        final List<ComponentVolume> volumes = new ArrayList<>(componentCount);
+        for (int i = 0; i < componentCount; i++) {
+            volumes.add(copyComponent(volume, bounds, components.get(i),
+                    componentStates.get(i)));
         }
 
         final List<PhysicsStructure> created = new ArrayList<>(componentCount);
@@ -305,7 +345,7 @@ public final class StructureSplitter {
             final PhysicsMaterial material = original.body().material();
             final double massScale = original.massScale();
             final boolean ccd = original.body().ccd();
-            for (MutableVoxelVolume componentVolume : volumes) {
+            for (ComponentVolume componentVolume : volumes) {
                 final StructureDef definition = StructureDef.builder(componentVolume)
                         .pose(pose)
                         .type(type)
@@ -327,21 +367,14 @@ public final class StructureSplitter {
             return List.of(original);
         }
 
-        final Map<Cell, Integer> owners = new HashMap<>();
-        for (int i = 0; i < componentCount; i++) {
-            for (Cell cell : components.get(i).cells()) {
-                owners.put(cell, i);
-            }
-        }
-
         final List<ListTag> splitBlockTicks = new ArrayList<>(componentCount);
         final List<ListTag> splitFluidTicks = new ArrayList<>(componentCount);
         for (int i = 0; i < componentCount; i++) {
             splitBlockTicks.add(new ListTag());
             splitFluidTicks.add(new ListTag());
         }
-        distributeTicks(originalTicks.getListOrEmpty("Block"), owners, splitBlockTicks);
-        distributeTicks(originalTicks.getListOrEmpty("Fluid"), owners, splitFluidTicks);
+        distributeTicks(originalTicks.getListOrEmpty("Block"), owners, components, splitBlockTicks);
+        distributeTicks(originalTicks.getListOrEmpty("Fluid"), owners, components, splitFluidTicks);
 
         final List<Map<BlockPos, CompoundTag>> splitBlockEntities = new ArrayList<>(componentCount);
         for (int i = 0; i < componentCount; i++) {
@@ -354,17 +387,16 @@ public final class StructureSplitter {
             final int absoluteX = bounds.minX() + pos.getX();
             final int absoluteY = bounds.minY() + pos.getY();
             final int absoluteZ = bounds.minZ() + pos.getZ();
-            final Integer owner = owners.get(new Cell(absoluteX, absoluteY, absoluteZ));
-            if (owner != null) {
-                // Split components have their own bounds minimum. Convert the
-                // original-relative key to the component-relative key instead
-                // of carrying the old origin into applyBlockEntities.
-                final IntBounds3 componentBounds = components.get(owner).bounds();
-                splitBlockEntities.get(owner).put(new BlockPos(
-                        absoluteX - componentBounds.minX(),
-                        absoluteY - componentBounds.minY(),
-                        absoluteZ - componentBounds.minZ()), entry.getValue());
-            }
+            final Cell cell = new Cell(absoluteX, absoluteY, absoluteZ);
+            final Integer owner = owners.containsKey(cell)
+                    ? owners.get(cell) : ownerOf(cell, components);
+            // Split volumes deliberately keep the original bounds (see
+            // copyComponent), so side-table keys stay relative to the original
+            // volume minimum, not the tight component bounds.
+            splitBlockEntities.get(owner).put(new BlockPos(
+                    absoluteX - bounds.minX(),
+                    absoluteY - bounds.minY(),
+                    absoluteZ - bounds.minZ()), entry.getValue());
         }
 
         final Vector3d linearVelocity = original.body().linearVelocity();
@@ -374,13 +406,13 @@ public final class StructureSplitter {
 
         for (int i = 0; i < componentCount; i++) {
             final PhysicsStructure split = created.get(i);
-            final Component component = components.get(i);
 
-            for (Cell cell : component.cells()) {
-                final BlockState state = stateAt(original, volume, cell);
-                if (state != null && !state.isAir()) {
-                    StructureBlockStates.set(split, cell.x(), cell.y(), cell.z(), state);
-                }
+            // Include non-colliding states (wire, torch, fluid, repeater, ...)
+            // so renderers, interaction and block logic see real blocks after
+            // the split instead of a stone fallback.
+            for (Map.Entry<Cell, BlockState> state : componentStates.get(i).entrySet()) {
+                final Cell cell = state.getKey();
+                StructureBlockStates.set(split, cell.x(), cell.y(), cell.z(), state.getValue());
             }
 
             split.body().setLinearVelocity(linearVelocity);
@@ -428,15 +460,76 @@ public final class StructureSplitter {
         return tail + 1;
     }
 
-    private static MutableVoxelVolume copyComponent(VoxelVolume source, IntBounds3 bounds,
-                                                     Component component) {
-        final MutableVoxelVolume target = new MutableVoxelVolume(bounds);
+    private static ComponentVolume copyComponent(VoxelVolume source, IntBounds3 bounds,
+                                                 Component component,
+                                                 Map<Cell, BlockState> states) {
+        final ComponentVolume target = new ComponentVolume(bounds);
         for (Cell cell : component.cells()) {
             target.setBlock(cell.x(), cell.y(), cell.z(), true,
                     source.blockMass(cell.x(), cell.y(), cell.z()),
-                    source.blockMaterial(cell.x(), cell.y(), cell.z()));
+                    source.blockMaterial(cell.x(), cell.y(), cell.z()),
+                    states.get(cell));
+        }
+        for (Map.Entry<Cell, BlockState> state : states.entrySet()) {
+            final Cell cell = state.getKey();
+            if (!target.isSolid(cell.x(), cell.y(), cell.z())) {
+                target.setBlock(cell.x(), cell.y(), cell.z(), false, 0.0,
+                        PhysicsMaterial.DEFAULT, state.getValue());
+            }
         }
         return target;
+    }
+
+    /**
+     * Editable component volume that also carries the original block states.
+     *
+     * <p>{@code MutableVoxelVolume} only stores collision data. A split body is
+     * created before its state side table can be keyed by the new structure, so
+     * without this wrapper the auxiliary ticking level copies stone and drops
+     * every non-colliding logic block (repeater, observer, torch, wire, fluid,
+     * ...). The sparse state map keeps the cost proportional to the number of
+     * blocks in this component instead of the full original bounds.</p>
+     */
+    private static final class ComponentVolume implements StatefulVoxelVolume {
+        private final MutableVoxelVolume grid;
+        private final Map<Cell, BlockState> states = new HashMap<>();
+
+        private ComponentVolume(IntBounds3 bounds) {
+            this.grid = new MutableVoxelVolume(bounds);
+        }
+
+        private void setBlock(int x, int y, int z, boolean solid, double mass,
+                              PhysicsMaterial material, BlockState state) {
+            grid.setBlock(x, y, z, solid, mass, material);
+            if (state != null && !state.isAir()) {
+                states.put(new Cell(x, y, z), state);
+            }
+        }
+
+        @Override
+        public IntBounds3 bounds() {
+            return grid.bounds();
+        }
+
+        @Override
+        public boolean isSolid(int x, int y, int z) {
+            return grid.isSolid(x, y, z);
+        }
+
+        @Override
+        public double blockMass(int x, int y, int z) {
+            return grid.blockMass(x, y, z);
+        }
+
+        @Override
+        public PhysicsMaterial blockMaterial(int x, int y, int z) {
+            return grid.blockMaterial(x, y, z);
+        }
+
+        @Override
+        public BlockState blockState(int x, int y, int z) {
+            return states.get(new Cell(x, y, z));
+        }
     }
 
     private static List<VoxelBox> mergeBoxes(IntBounds3 bounds, List<Cell> cells) {
@@ -473,8 +566,9 @@ public final class StructureSplitter {
         return total;
     }
 
-    private static void distributeTicks(ListTag source, Map<Cell, Integer> owners,
-                                        List<ListTag> destinations) {
+    static void distributeTicks(ListTag source, Map<Cell, Integer> owners,
+                                List<Component> components,
+                                List<ListTag> destinations) {
         for (int i = 0; i < source.size(); i++) {
             final CompoundTag entry = source.getCompoundOrEmpty(i);
             if (entry.isEmpty()) {
@@ -482,11 +576,55 @@ public final class StructureSplitter {
             }
             final Cell cell = new Cell(entry.getIntOr("X", 0),
                     entry.getIntOr("Y", 0), entry.getIntOr("Z", 0));
-            final Integer owner = owners.get(cell);
-            if (owner != null) {
-                destinations.get(owner).add(entry.copy());
+            Integer owner = owners.get(cell);
+            if (owner == null) {
+                // A tick can target an air cell (for example a fluid tick whose
+                // source was just replaced). Never drop it merely because the
+                // cell has no solid component of its own; attach it to the
+                // nearest body instead.
+                owner = ownerOf(cell, components);
+            }
+            // Keep the original delay/priority/order tags. applyScheduledTicks
+            // rebases the order when the tick is reinserted.
+            destinations.get(owner).add(entry.copy());
+        }
+    }
+
+    /**
+     * Deterministic owner for a cell that is not itself one of the component's
+     * solid cells. Uses the nearest component bounding box; ties go to the
+     * lowest component index (the same order returned by
+     * {@link #findComponents(VoxelVolume)}). Pure helper used by the splitter
+     * and tests.
+     */
+    static int ownerOf(Cell cell, List<Component> components) {
+        int best = 0;
+        long bestDistance = Long.MAX_VALUE;
+        for (int i = 0; i < components.size(); i++) {
+            final long distance = distanceSquared(cell, components.get(i).bounds());
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
             }
         }
+        return best;
+    }
+
+    private static long distanceSquared(Cell cell, IntBounds3 bounds) {
+        final long dx = axisDistance(cell.x(), bounds.minX(), bounds.maxX());
+        final long dy = axisDistance(cell.y(), bounds.minY(), bounds.maxY());
+        final long dz = axisDistance(cell.z(), bounds.minZ(), bounds.maxZ());
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static long axisDistance(int value, int min, int maxExclusive) {
+        if (value < min) {
+            return min - (long) value;
+        }
+        if (value >= maxExclusive) {
+            return (long) value - (maxExclusive - 1L);
+        }
+        return 0L;
     }
 
     private static void removeStructure(LevelPhysics physics, PhysicsStructure structure) {

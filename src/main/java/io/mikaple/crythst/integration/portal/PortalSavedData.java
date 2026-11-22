@@ -10,6 +10,7 @@ import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraft.world.level.saveddata.SavedDataType;
+import org.joml.Vector2d;
 import org.joml.Vector3d;
 
 import java.util.ArrayList;
@@ -20,10 +21,10 @@ import java.util.UUID;
  * Persistent storage for the static portal registry.
  *
  * <p>Data is stored once per world in the overworld's {@code SavedDataStorage}
- * (normally {@code world/data/crythst_portals.dat}). The file contains a stable
- * UUID, name, dimension, plane (origin/normal/right/width/height) and linked
- * UUID for every portal. Target data is resolved from the linked portal's own
- * persisted record; a link to a missing portal is discarded on load.</p>
+ * (normally {@code world/data/crythst_portals.dat}). Version 2 adds an optional
+ * polygon outline; version-1 files without an outline load as the plane
+ * rectangle. Target data is resolved from the linked portal's own persisted
+ * record; a link to a missing portal is discarded on load.</p>
  *
  * <p>Client capture textures are never persisted: they are recreated from the
  * loaded portal planes on demand.</p>
@@ -39,9 +40,11 @@ public final class PortalSavedData extends SavedData {
             CompoundTag.CODEC.xmap(PortalSavedData::new, PortalSavedData::tag),
             DataFixTypes.LEVEL);
 
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
     private static final String KEY_VERSION = "version";
     private static final String KEY_PORTALS = "portals";
+    private static final String KEY_OUTLINE = "outline";
+    private static final int MAX_OUTLINE_POINTS = 64;
 
     private CompoundTag data;
 
@@ -110,8 +113,30 @@ public final class PortalSavedData extends SavedData {
         }
 
         final PortalPlane plane = new PortalPlane(origin, normal, right, width, height);
+        final List<Vector2d> outline = readOutline(entry);
         final UUID linked = parseUuid(entry.getStringOr("linked", ""));
-        return new StoredPortal(id, name, dimension, plane, linked);
+        return new StoredPortal(id, name, dimension, plane, linked, outline);
+    }
+
+    private static List<Vector2d> readOutline(CompoundTag entry) {
+        final ListTag list = entry.getListOrEmpty(KEY_OUTLINE);
+        if (list.isEmpty()) {
+            return List.of();
+        }
+        if (list.size() < 3 || list.size() > MAX_OUTLINE_POINTS) {
+            return List.of();
+        }
+        final List<Vector2d> outline = new ArrayList<>(list.size());
+        for (int i = 0; i < list.size(); i++) {
+            final CompoundTag point = list.getCompoundOrEmpty(i);
+            final double x = point.getDoubleOr("x", Double.NaN);
+            final double y = point.getDoubleOr("y", Double.NaN);
+            if (!Double.isFinite(x) || !Double.isFinite(y)) {
+                return List.of();
+            }
+            outline.add(new Vector2d(x, y));
+        }
+        return List.copyOf(outline);
     }
 
     private static Vector3d readVector(CompoundTag entry, String prefix) {
@@ -151,6 +176,16 @@ public final class PortalSavedData extends SavedData {
             writeVector(entry, "r", portal.plane().right());
             entry.putDouble("width", portal.plane().width());
             entry.putDouble("height", portal.plane().height());
+            if (!portal.outline().isEmpty()) {
+                final ListTag outline = new ListTag();
+                for (Vector2d point : portal.outline()) {
+                    final CompoundTag pointTag = new CompoundTag();
+                    pointTag.putDouble("x", point.x);
+                    pointTag.putDouble("y", point.y);
+                    outline.add(pointTag);
+                }
+                entry.put(KEY_OUTLINE, outline);
+            }
             if (portal.linkedId() != null) {
                 entry.putString("linked", portal.linkedId().toString());
             }
@@ -170,6 +205,21 @@ public final class PortalSavedData extends SavedData {
      * One persisted portal definition.
      */
     public record StoredPortal(UUID id, String name, ResourceKey<Level> dimension,
-                               PortalPlane plane, UUID linkedId) {
+                               PortalPlane plane, UUID linkedId, List<Vector2d> outline) {
+        public StoredPortal {
+            outline = outline == null ? List.of() : List.copyOf(outline);
+        }
+
+        /** Version-1 compatible constructor: rectangular opening. */
+        public StoredPortal(UUID id, String name, ResourceKey<Level> dimension,
+                            PortalPlane plane, UUID linkedId) {
+            this(id, name, dimension, plane, linkedId, List.of());
+        }
+
+        /** Applies the persisted outline when one exists. */
+        public PortalShape shape() {
+            return outline.isEmpty() ? PortalShape.rectangle(plane)
+                    : PortalShape.polygon(plane, outline);
+        }
     }
 }

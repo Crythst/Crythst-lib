@@ -3,6 +3,8 @@ package io.mikaple.crythst.physics.structure;
 import io.mikaple.crythst.api.block.BlockEntityStructureActor;
 import io.mikaple.crythst.api.block.StructureBlockHooks;
 import io.mikaple.crythst.api.block.StructureBlockStateSnapshot;
+import io.mikaple.crythst.api.physics.constraint.StructureConstraintConfiguration;
+import io.mikaple.crythst.api.physics.constraint.StructureConstraintHandle;
 import io.mikaple.crythst.math.Aabb;
 import io.mikaple.crythst.math.InterpolatedPose;
 import io.mikaple.crythst.math.OrientedBox;
@@ -10,6 +12,8 @@ import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.body.BodyDef;
 import io.mikaple.crythst.physics.body.BodyHandle;
 import io.mikaple.crythst.physics.body.BodyType;
+import io.mikaple.crythst.physics.constraint.ConstraintDef;
+import io.mikaple.crythst.physics.constraint.ConstraintHandle;
 import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.tick.PoseTimeline;
 import io.mikaple.crythst.physics.voxel.VoxelColliderBuilder;
@@ -402,6 +406,104 @@ public final class PhysicsStructure implements AutoCloseable {
 
     public void applyImpulseAt(Vector3dc impulse, Vector3dc worldPoint) {
         body.applyImpulseAtPoint(impulse, worldPoint);
+    }
+
+    /**
+     * Creates a joint between this structure and another structure in the same
+     * physics world.
+     *
+     * <p>Frames, anchors and axes are structure-local metres and are converted
+     * to body-local space using the live poses and centre of mass. This is the
+     * same operation as
+     * {@link io.mikaple.crythst.api.physics.PhysicsPipeline#addConstraint(PhysicsStructure, PhysicsStructure, StructureConstraintConfiguration)}
+     * with this structure as side A. Server thread only.</p>
+     *
+     * @param other  structure B; must belong to the same physics world and be
+     *               distinct from this structure
+     * @param config joint description
+     * @return a live constraint handle
+     */
+    public StructureConstraintHandle addConstraint(PhysicsStructure other,
+                                                   StructureConstraintConfiguration config) {
+        if (other == null) {
+            throw new NullPointerException("other");
+        }
+        if (config == null) {
+            throw new NullPointerException("config");
+        }
+        if (other == this || other.body().id() == body.id()) {
+            throw new IllegalArgumentException("A constraint needs two distinct structures");
+        }
+        if (other.world() != world) {
+            throw new IllegalArgumentException("Structures belong to different physics worlds");
+        }
+        if (closed || other.closed()) {
+            throw new IllegalArgumentException("Structure is closed");
+        }
+        final ConstraintDef definition = config.toDefinition(this, other);
+        final ConstraintHandle handle = world.addConstraint(definition);
+        return new StructureConstraintHandle(world, handle, this, other, config);
+    }
+
+    /**
+     * Creates a joint between this structure and the static world.
+     *
+     * <p>Structure-A frames/anchors/axes are structure-local metres;
+     * structure-B values in the configuration are world-space. Server thread
+     * only.</p>
+     *
+     * @param config joint description
+     * @return a live constraint handle
+     */
+    public StructureConstraintHandle addConstraintToWorld(
+            StructureConstraintConfiguration config) {
+        if (config == null) {
+            throw new NullPointerException("config");
+        }
+        if (closed) {
+            throw new IllegalArgumentException("Structure is closed");
+        }
+        final ConstraintDef definition = config.toDefinition(this, null);
+        final ConstraintHandle handle = world.addConstraint(definition);
+        return new StructureConstraintHandle(world, handle, this, null, config);
+    }
+
+    /**
+     * Constraints currently involving this structure, as an immutable snapshot.
+     *
+     * <p>Joints created through the raw physics world are included. The
+     * opposite structure is resolved only when the backend handle exposes it;
+     * otherwise {@link StructureConstraintHandle#isValid()} and
+     * {@link StructureConstraintHandle#involves(PhysicsStructure)} still work.</p>
+     */
+    public List<StructureConstraintHandle> constraints() {
+        final List<StructureConstraintHandle> result = new java.util.ArrayList<>();
+        for (ConstraintHandle handle : world.constraints()) {
+            if (handle.involves(body)) {
+                result.add(new StructureConstraintHandle(world, handle, this, null));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    /**
+     * Removes a joint involving this structure.
+     *
+     * @param constraint handle to remove
+     * @return {@code true} when the joint was still live and removed
+     */
+    public boolean removeConstraint(StructureConstraintHandle constraint) {
+        if (constraint == null) {
+            throw new NullPointerException("constraint");
+        }
+        if (!constraint.belongsTo(world) || !constraint.involves(this)) {
+            return false;
+        }
+        if (!constraint.isValid()) {
+            return false;
+        }
+        constraint.remove();
+        return true;
     }
 
     public void close() {

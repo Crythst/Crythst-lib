@@ -231,6 +231,31 @@ public final class ServerStructureLevelView implements StructureLevelView {
         return live == null ? null : live.blockEntity();
     }
 
+    @Override
+    public @Nullable LevelChunk getChunkIfLoaded(int chunkX, int chunkZ) {
+        if (stale || structure.closed() || auxiliary == null) {
+            return null;
+        }
+        final EmptyPhysicsLevel.RegionView region = auxiliary.regionView(structure);
+        if (region == null) {
+            return null;
+        }
+        final IntBounds3 bounds = bounds();
+        final int localX = chunkX * 16 + 8;
+        final int localZ = chunkZ * 16 + 8;
+        if (localX < bounds.minX() || localX >= bounds.maxX()
+                || localZ < bounds.minZ() || localZ >= bounds.maxZ()) {
+            return null;
+        }
+        final int localY = bounds.minY();
+        final BlockPos auxiliaryPos = region.toAuxiliaryVoxel(localX, localY, localZ);
+        if (auxiliaryPos == null) {
+            return null;
+        }
+        return auxiliary.level().getChunkSource().getChunkNow(
+                auxiliaryPos.getX() >> 4, auxiliaryPos.getZ() >> 4);
+    }
+
     private BlockState storedState(int x, int y, int z) {
         final VoxelVolume volume = structure.volume();
         if (!volume.bounds().contains(x, y, z)) {

@@ -129,6 +129,45 @@ public final class StructureSavedData extends SavedData {
     }
 
     /**
+     * Stable identity of one live structure, or {@code null} when the data
+     * object has not captured it yet.
+     *
+     * <p>Read-only. The identity survives save/load even though the physics
+     * body id does not; tracking points and other integrations can use it to
+     * re-bind after a reload. Call {@link #capture(ServerLevel, LevelPhysics)}
+     * first when a brand-new structure needs an identity immediately.</p>
+     *
+     * @param structure live structure; may be {@code null}
+     * @return the stable UUID, or {@code null}
+     */
+    public @org.jetbrains.annotations.Nullable UUID identityOf(PhysicsStructure structure) {
+        if (structure == null) {
+            return null;
+        }
+        final UUID identity = identities.get(structure);
+        if (identity != null) {
+            return identity;
+        }
+        for (Map.Entry<UUID, PhysicsStructure> entry : live.entrySet()) {
+            if (entry.getValue() == structure) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Live structure restored for a stable identity, or {@code null}.
+     */
+    public @org.jetbrains.annotations.Nullable PhysicsStructure liveStructure(UUID identity) {
+        if (identity == null) {
+            return null;
+        }
+        final PhysicsStructure structure = live.get(identity);
+        return structure == null || structure.closed() ? null : structure;
+    }
+
+    /**
      * Recreates every saved structure in the given physics world.
      *
      * <p>Safe to call more than once; only the first call does work. A record is

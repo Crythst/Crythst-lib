@@ -7,14 +7,19 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.particles.ParticleOptions;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
@@ -192,6 +197,177 @@ public interface StructureLevelView {
 
     /** Registries used by this view; never {@code null}. */
     RegistryAccess registryAccess();
+
+    // ------------------------------------------------------------------
+    // Level metadata, entities, chunks and random source.
+    // ------------------------------------------------------------------
+
+    /**
+     * Dimension key of the host level, or {@code null} when the view has no
+     * host level.
+     */
+    default @Nullable ResourceKey<Level> dimension() {
+        final Level host = level();
+        return host == null ? null : host.dimension();
+    }
+
+    /** Identifier of {@link #dimension()}, or {@code null}. */
+    default @Nullable Identifier dimensionId() {
+        final ResourceKey<Level> dimension = dimension();
+        return dimension == null ? null : dimension.identifier();
+    }
+
+    /** Game time of the host level, or {@code 0} for a view without a host. */
+    default long gameTime() {
+        final Level host = level();
+        return host == null ? 0L : host.getGameTime();
+    }
+
+    /** Day time of the host level, or {@code 0} for a view without a host. */
+    default long dayTime() {
+        final Level host = level();
+        return host == null ? 0L : host.getOverworldClockTime();
+    }
+
+    /**
+     * Random source of the host level.
+     *
+     * <p>A view without a host returns a fresh unseeded source; block logic on a
+     * real structure always has a host level.</p>
+     */
+    default RandomSource random() {
+        final Level host = level();
+        return host == null ? RandomSource.create() : host.getRandom();
+    }
+
+    /**
+     * Spawns a host-world entity. The entity must already have a world-space
+     * position and, on a server, an appropriate entity type.
+     *
+     * <p>Crythst structures have no entity container; entities live in the host
+     * world. This method is therefore a host-level spawn, not a structure-local
+     * insertion.</p>
+     *
+     * @return {@code true} when the entity was added
+     */
+    default boolean addFreshEntity(Entity entity) {
+        if (entity == null) {
+            throw new NullPointerException("entity");
+        }
+        return level() instanceof ServerLevel server && server.addFreshEntity(entity);
+    }
+
+    /**
+     * Moves an entity to a structure-local metre position, then spawns it in
+     * the host world.
+     *
+     * <p>No structure velocity or rotation is applied to the entity; callers
+     * that want a moving entity to inherit the structure frame should set its
+     * velocity explicitly.</p>
+     *
+     * @return {@code true} when the entity was added
+     */
+    default boolean addFreshEntityAtLocal(Entity entity, Vector3dc localMetres) {
+        if (entity == null) {
+            throw new NullPointerException("entity");
+        }
+        if (localMetres == null) {
+            throw new NullPointerException("localMetres");
+        }
+        final Vector3d world = localToWorld(localMetres, new Vector3d());
+        entity.snapTo(world.x, world.y, world.z, entity.getYRot(), entity.getXRot());
+        return addFreshEntity(entity);
+    }
+
+    /**
+     * Host-world entities whose bounding boxes overlap the projection of a
+     * local voxel box.
+     *
+     * <p>The projection uses the world AABB of the eight transformed corners;
+     * the result is therefore a coarse superset for a rotated structure, not an
+     * exact OBB test. Entities are ordinary host entities.</p>
+     *
+     * @param localVoxelBox local voxel coordinates (not metres)
+     * @param filter        optional predicate, or {@code null}
+     */
+    default List<Entity> getEntitiesInLocalBox(AABB localVoxelBox,
+                                               @Nullable java.util.function.Predicate<? super Entity> filter) {
+        final Level host = level();
+        if (host == null || localVoxelBox == null) {
+            return List.of();
+        }
+        final AABB worldBox = localVoxelBoxToWorldAabb(localVoxelBox);
+        if (filter == null) {
+            return List.copyOf(host.getEntitiesOfClass(Entity.class, worldBox));
+        }
+        return List.copyOf(host.getEntitiesOfClass(Entity.class, worldBox, filter));
+    }
+
+    /**
+     * World AABB enclosing the projection of a local voxel box.
+     */
+    default AABB localVoxelBoxToWorldAabb(AABB localVoxelBox) {
+        if (localVoxelBox == null) {
+            throw new NullPointerException("localVoxelBox");
+        }
+        final double scale = blockScale();
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < 8; i++) {
+            final double x = ((i & 1) == 0 ? localVoxelBox.minX : localVoxelBox.maxX) * scale;
+            final double y = ((i & 2) == 0 ? localVoxelBox.minY : localVoxelBox.maxY) * scale;
+            final double z = ((i & 4) == 0 ? localVoxelBox.minZ : localVoxelBox.maxZ) * scale;
+            final Vector3d world = localToWorld(new Vector3d(x, y, z), new Vector3d());
+            minX = Math.min(minX, world.x);
+            minY = Math.min(minY, world.y);
+            minZ = Math.min(minZ, world.z);
+            maxX = Math.max(maxX, world.x);
+            maxY = Math.max(maxY, world.y);
+            maxZ = Math.max(maxZ, world.z);
+        }
+        return new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+
+    /**
+     * Loaded chunk for a local chunk coordinate, without loading one.
+     *
+     * <p>The default implementation projects the local chunk centre into the
+     * host world. Server views override this to read the auxiliary ticking
+     * region; client views return {@code null} because they have no writable
+     * chunk storage.</p>
+     */
+    default @Nullable LevelChunk getChunkIfLoaded(int chunkX, int chunkZ) {
+        final Level host = level();
+        if (host == null || isClientSide()) {
+            return null;
+        }
+        final BlockPos local = new BlockPos(chunkX * 16 + 8, minBuildHeight(), chunkZ * 16 + 8);
+        final BlockPos world = localBlockToWorld(local);
+        return host.getChunkSource().getChunkNow(world.getX() >> 4, world.getZ() >> 4);
+    }
+
+    /** Whether a local chunk is currently loaded; never loads one. */
+    default boolean isChunkLoaded(int chunkX, int chunkZ) {
+        return getChunkIfLoaded(chunkX, chunkZ) != null;
+    }
+
+    /**
+     * Whether an explicit
+     * {@link io.mikaple.crythst.api.sublevel.ticket.StructureLoadingTickets.StructureLoadingTicket}
+     * currently pins the host chunks of this structure.
+     */
+    default boolean isKeptLoaded() {
+        final PhysicsStructure structure = structure();
+        if (structure == null || !(level() instanceof ServerLevel server)) {
+            return false;
+        }
+        return !io.mikaple.crythst.api.sublevel.ticket.StructureLoadingTickets
+                .tickets(server, bodyId()).isEmpty();
+    }
 
     // ------------------------------------------------------------------
     // Block writes (authoritative server views only).

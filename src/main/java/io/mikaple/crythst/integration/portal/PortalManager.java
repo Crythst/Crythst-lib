@@ -43,6 +43,7 @@ public final class PortalManager {
     private static volatile boolean registered;
     private static MinecraftServer activeServer;
     private static PortalSavedData savedData;
+    private static volatile long revision;
 
     private PortalManager() {
     }
@@ -63,6 +64,7 @@ public final class PortalManager {
 
         CommandRegistrationCallback.EVENT.register(PortalCommand::register);
         ServerTickEvents.END_SERVER_TICK.register(PortalTeleporter::tick);
+        io.mikaple.crythst.integration.fabric.portal.PortalSyncServer.register();
         ServerLifecycleEvents.SERVER_STARTED.register(PortalManager::onServerStarted);
         ServerLifecycleEvents.BEFORE_SAVE.register((server, flush, force) -> markDirty());
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> markDirty());
@@ -105,7 +107,7 @@ public final class PortalManager {
                 }
                 try {
                     final Portal portal = new Portal(record.id(), record.name(),
-                            record.dimension(), record.plane(), record.linkedId());
+                            record.dimension(), record.shape(), record.linkedId());
                     BY_NAME.put(portal.name(), portal);
                     BY_ID.put(portal.id(), portal);
                     count++;
@@ -116,6 +118,7 @@ public final class PortalManager {
             }
             repairLinks();
             loaded = count;
+            revision++;
         }
         io.mikaple.crythst.Crythst.LOGGER.info("Loaded {} persisted Crythst portal(s)", loaded);
     }
@@ -150,7 +153,7 @@ public final class PortalManager {
             for (Portal portal : BY_NAME.values()) {
                 records.add(new PortalSavedData.StoredPortal(
                         portal.id(), portal.name(), portal.dimension(),
-                        portal.plane(), portal.linkedPortalId()));
+                        portal.plane(), portal.linkedPortalId(), portal.shape().outline()));
             }
             return records;
         }
@@ -171,14 +174,24 @@ public final class PortalManager {
      * @throws IllegalArgumentException when the name is already in use
      */
     public static Portal create(ResourceKey<Level> dimension, String name, PortalPlane plane) {
+        return create(dimension, name, PortalShape.rectangle(plane));
+    }
+
+    /**
+     * Creates and registers an unlinked portal with an arbitrary shape.
+     *
+     * @throws IllegalArgumentException when the name is already in use
+     */
+    public static Portal create(ResourceKey<Level> dimension, String name, PortalShape shape) {
         final Portal portal;
         synchronized (LOCK) {
             if (BY_NAME.containsKey(name)) {
                 throw new IllegalArgumentException("A portal named '" + name + "' already exists");
             }
-            portal = new Portal(UUID.randomUUID(), name, dimension, plane);
+            portal = new Portal(UUID.randomUUID(), name, dimension, shape, null);
             BY_NAME.put(portal.name(), portal);
             BY_ID.put(portal.id(), portal);
+            revision++;
         }
         markDirty();
         return portal;
@@ -210,14 +223,57 @@ public final class PortalManager {
             first.linkTo(second.id());
             second.linkTo(first.id());
             transform = PortalTransform.between(first.plane(), second.plane());
+            revision++;
         }
         markDirty();
         return transform;
     }
 
+    /**
+     * Moves/reorients an existing portal without changing its UUID, name,
+     * dimension or link. The shape outline is kept and re-expressed on the new
+     * plane; use {@link #reshape} to replace the opening as well.
+     *
+     * <p>Intended for a moving portal carrier (a physics structure or a script)
+     * to publish a new pose. The server sync revision changes, so clients
+     * recapture their view texture on the next frame.</p>
+     */
+    public static Portal move(String name, PortalPlane newPlane) {
+        synchronized (LOCK) {
+            final Portal existing = BY_NAME.get(name);
+            if (existing == null) {
+                return null;
+            }
+            final Portal moved = new Portal(existing.id(), existing.name(),
+                    existing.dimension(), existing.shape().withPlane(newPlane),
+                    existing.linkedPortalId());
+            BY_NAME.put(moved.name(), moved);
+            BY_ID.put(moved.id(), moved);
+            revision++;
+            markDirty();
+            return moved;
+        }
+    }
+
+    /** Moves a portal and replaces its opening shape. */
+    public static Portal reshape(String name, PortalShape newShape) {
+        synchronized (LOCK) {
+            final Portal existing = BY_NAME.get(name);
+            if (existing == null) {
+                return null;
+            }
+            final Portal moved = new Portal(existing.id(), existing.name(),
+                    existing.dimension(), newShape, existing.linkedPortalId());
+            BY_NAME.put(moved.name(), moved);
+            BY_ID.put(moved.id(), moved);
+            revision++;
+            markDirty();
+            return moved;
+        }
+    }
+
     /** Removes a portal and clears any link pointing at it. */
-    public static Portal remove(String name) {
-        final Portal removed;
+    public static Portal remove(String name) {        final Portal removed;
         synchronized (LOCK) {
             removed = BY_NAME.remove(name);
             if (removed == null) {
@@ -225,6 +281,7 @@ public final class PortalManager {
             }
             BY_ID.remove(removed.id());
             unlinkBackReferences(removed);
+            revision++;
         }
         markDirty();
         return removed;
@@ -305,7 +362,13 @@ public final class PortalManager {
         synchronized (LOCK) {
             BY_NAME.clear();
             BY_ID.clear();
+            revision++;
         }
+    }
+
+    /** Monotonic registry revision; used by the server sync broadcaster. */
+    public static long revision() {
+        return revision;
     }
 
     private static void unlinkBackReferences(Portal target) {

@@ -8,8 +8,11 @@ import com.mojang.blaze3d.systems.ScissorState;
 import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import io.mikaple.crythst.mixin.client.PortalLevelRendererAccessor;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.TextureFilteringMethod;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GlobalSettingsUniform;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.ProjectionMatrixBuffer;
@@ -25,14 +28,22 @@ import net.minecraft.world.phys.Vec3;
 import org.joml.Vector4f;
 
 /**
- * One isolated offscreen world render into a portal view target.
+ * One isolated RenderPearl destination render into a portal view target.
  *
- * <p>Uses the normal RenderPearl framegraph and the shared {@link LevelRenderer}
- * with a temporary {@code GameRenderer.mainRenderTarget()} redirect. No raw GL,
- * no stencil, no mode toggles. All frame-global state (model-view, scissor,
- * projection, fog, global camera uniform) is saved and restored.</p>
+ * <p>No raw OpenGL and no stencil: the normal {@link LevelRenderer} framegraph
+ * is imported into the portal target, with a temporary
+ * {@code GameRenderer.mainRenderTarget()} redirect. The destination camera uses
+ * an oblique projection whose near plane is the exit portal plane, so geometry
+ * behind the portal is clipped and cannot leak through the opening. Fog is
+ * computed at the destination camera rather than copied from the main camera.</p>
+ *
+ * <p>All frame-global state (model-view, scissor, projection, fog, global
+ * camera uniform) is saved and restored. The pass is synchronous on the render
+ * thread and never re-enters itself; the surface renderer skips portal quads
+ * while {@link #capturing()} is true, which also prevents recursive capture
+ * explosions.</p>
  */
-final class PortalOffscreenPass {
+final class PortalRenderPass {
     private CrossFrameResourcePool resourcePool;
     private FogRenderer fogRenderer;
     private GlobalSettingsUniform globalSettings;
@@ -74,25 +85,30 @@ final class PortalOffscreenPass {
         if (fogRenderer != null) {
             fogRenderer.endFrame();
         }
-        if (resourcePool != null) {
-            resourcePool.endFrame();
-        }
     }
 
     double render(Minecraft minecraft, LevelRenderer levelRenderer,
                   LevelRenderState levelState, CameraRenderState mainCamera,
                   PortalViewCamera view, CameraRenderState portalCamera,
-                  PortalViewTarget target) {
+                  PortalViewTarget target, Camera camera, ClientLevel level,
+                  DeltaTracker deltaTracker) {
         ensureResources();
         if (resourcePool == null || fogRenderer == null || globalSettings == null
                 || projectionBuffer == null || target.target() == null) {
             return 0.0;
         }
 
-        final FogData fog = copyFog(mainCamera.fogData);
+        final int renderDistance = Math.max(2,
+                minecraft.options.getEffectiveRenderDistance());
+        final FogData fog = fogRenderer.setupFog(
+                camera, renderDistance, deltaTracker, 0.0f, level);
         fogRenderer.updateBuffer(fog);
         final GpuBufferSlice fogSlice = fogRenderer.getBuffer(FogRenderer.FogMode.WORLD);
-        final Vector4f fogColor = new Vector4f(fog.color);
+        final Vector4f fogColor = fog.color == null
+                ? new Vector4f(0.0f, 0.0f, 0.0f, 1.0f) : new Vector4f(fog.color);
+        if (portalCamera != null) {
+            portalCamera.fogData = fog;
+        }
 
         final org.joml.Matrix4fStack modelViewStack = RenderSystem.getModelViewStack();
         final ScissorState savedScissor =
@@ -108,7 +124,7 @@ final class PortalOffscreenPass {
         RenderSystem.setProjectionMatrix(
                 projectionBuffer.getBuffer(view.projection()), ProjectionType.PERSPECTIVE);
         RenderSystem.setShaderFog(fogSlice);
-        updateGlobalSettings(minecraft, levelState, view.position());
+        updateGlobalSettings(minecraft, levelState, view.position(), target);
 
         RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(
                 target.target().getColorTexture(),
@@ -123,7 +139,7 @@ final class PortalOffscreenPass {
             portalSkyRenderer = target.skyRenderer(
                     minecraft.getTextureManager(), minecraft.getAtlasManager());
         } catch (Throwable ignored) {
-            // Sky is non-critical; fog colour remains.
+            // Sky is non-critical; the destination fog colour remains.
         }
         if (portalSkyRenderer != null) {
             levelRendererAccess.crythst$setSkyRenderer(portalSkyRenderer);
@@ -148,13 +164,16 @@ final class PortalOffscreenPass {
         return (System.nanoTime() - start) / 1.0e6;
     }
 
-    private void updateGlobalSettings(Minecraft minecraft, LevelRenderState levelState, Vec3 cameraPos) {
+    private void updateGlobalSettings(Minecraft minecraft, LevelRenderState levelState,
+                                      Vec3 cameraPos, PortalViewTarget target) {
         final GameRenderState game = minecraft.gameRenderer.gameRenderState();
         final OptionsRenderState options = game.optionsRenderState;
         final WindowRenderState window = game.windowRenderState;
+        final int width = target.width() > 0 ? target.width() : window.width;
+        final int height = target.height() > 0 ? target.height() : window.height;
         globalSettings.update(
-                window.width,
-                window.height,
+                width,
+                height,
                 options.glintStrength,
                 levelState.gameTime,
                 levelState.worldPartialTicks,
@@ -170,29 +189,6 @@ final class PortalOffscreenPass {
         } else {
             RenderSystem.disableScissorForRenderTypeDraws();
         }
-    }
-
-    private static FogData copyFog(FogData source) {
-        final FogData copy = new FogData();
-        if (source == null) {
-            copy.color = new Vector4f(0.0f, 0.0f, 0.0f, 1.0f);
-            copy.environmentalStart = 0.0f;
-            copy.environmentalEnd = 256.0f;
-            copy.renderDistanceStart = 0.0f;
-            copy.renderDistanceEnd = 256.0f;
-            copy.skyEnd = 256.0f;
-            copy.cloudEnd = 256.0f;
-            return copy;
-        }
-        copy.environmentalStart = source.environmentalStart;
-        copy.environmentalEnd = source.environmentalEnd;
-        copy.renderDistanceStart = source.renderDistanceStart;
-        copy.renderDistanceEnd = source.renderDistanceEnd;
-        copy.skyEnd = source.skyEnd;
-        copy.cloudEnd = source.cloudEnd;
-        copy.color = source.color == null ? new Vector4f(0.0f, 0.0f, 0.0f, 1.0f)
-                : new Vector4f(source.color);
-        return copy;
     }
 
     void close() {

@@ -4,6 +4,7 @@
   "package": "io.mikaple.crythst.mixin.client",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "AbstractSignEditScreenAccessor",
     "AvatarRendererGravityMixin",
     "AvatarNameTagGravityMixin",
     "CameraGravityMixin",

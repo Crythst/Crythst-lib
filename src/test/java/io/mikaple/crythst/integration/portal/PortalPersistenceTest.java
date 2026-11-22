@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -75,6 +76,50 @@ class PortalPersistenceTest {
     }
 
     @Test
+    void roundTripsPolygonOutlineAndLoadsVersionOneAsRectangle() {
+        final PortalPlane plane = planeAt(2.0);
+        final PortalShape diamond = PortalShape.polygon(plane, List.of(
+                new org.joml.Vector2d(0.0, 1.5),
+                new org.joml.Vector2d(1.0, 0.0),
+                new org.joml.Vector2d(0.0, -1.5),
+                new org.joml.Vector2d(-1.0, 0.0)));
+        final UUID id = UUID.randomUUID();
+        final CompoundTag tag = PortalSavedData.write(List.of(
+                new PortalSavedData.StoredPortal(id, "diamond",
+                        ResourceKey.create(Registries.DIMENSION,
+                                Identifier.parse("minecraft:overworld")),
+                        plane, null, diamond.outline())));
+        final PortalSavedData.StoredPortal loaded = new PortalSavedData(tag).readPortals().getFirst();
+        assertEquals(4, loaded.outline().size());
+        assertFalse(loaded.shape().rectangular());
+        assertTrue(loaded.shape().containsLocal(0.0, 0.0));
+
+        // A version-1 entry has no outline tag; it must remain a rectangle.
+        final CompoundTag legacy = new CompoundTag();
+        legacy.putInt("version", 1);
+        final CompoundTag entry = new CompoundTag();
+        entry.putString("id", id.toString());
+        entry.putString("name", "legacy");
+        entry.putString("dimension", "minecraft:overworld");
+        entry.putDouble("ox", 0.0);
+        entry.putDouble("oy", 64.0);
+        entry.putDouble("oz", 0.0);
+        entry.putDouble("nx", 0.0);
+        entry.putDouble("ny", 0.0);
+        entry.putDouble("nz", 1.0);
+        entry.putDouble("rx", 1.0);
+        entry.putDouble("ry", 0.0);
+        entry.putDouble("rz", 0.0);
+        entry.putDouble("width", 2.0);
+        entry.putDouble("height", 3.0);
+        final net.minecraft.nbt.ListTag list = new net.minecraft.nbt.ListTag();
+        list.add(entry);
+        legacy.put("portals", list);
+        final PortalSavedData.StoredPortal old = new PortalSavedData(legacy).readPortals().getFirst();
+        assertTrue(old.shape().rectangular());
+    }
+
+    @Test
     void transformMapsNormalsAndRoundTrips() {
         final PortalPlane entry = new PortalPlane(
                 new Vector3d(0.0, 0.0, 0.0),
@@ -121,6 +166,30 @@ class PortalPersistenceTest {
             assertNull(loadedA.linkedPortalId());
             assertEquals(c, loadedB.linkedPortalId());
             assertEquals(b, loadedC.linkedPortalId());
+        } finally {
+            PortalManager.clearAll();
+        }
+    }
+
+    @Test
+    void moveKeepsIdLinkAndUpdatesPlane() {
+        final UUID a = UUID.randomUUID();
+        final UUID b = UUID.randomUUID();
+        final ResourceKey<Level> dimension = ResourceKey.create(
+                Registries.DIMENSION, Identifier.parse("minecraft:overworld"));
+        PortalManager.loadFromSaved(List.of(
+                new PortalSavedData.StoredPortal(a, "a", dimension, planeAt(0.0), b),
+                new PortalSavedData.StoredPortal(b, "b", dimension, planeAt(4.0), a)));
+        try {
+            final PortalPlane movedPlane = planeAt(12.0);
+            final Portal moved = PortalManager.move("a", movedPlane);
+            assertNotNull(moved);
+            assertEquals(a, moved.id());
+            assertEquals(b, moved.linkedPortalId());
+            assertEquals(12.0, moved.plane().origin().x, EPS);
+            final Portal reloaded = PortalManager.findById(a);
+            assertNotNull(reloaded);
+            assertEquals(12.0, reloaded.plane().origin().x, EPS);
         } finally {
             PortalManager.clearAll();
         }

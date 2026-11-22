@@ -22,9 +22,6 @@ import org.jspecify.annotations.Nullable;
  * <p>Pure JOML so it can be unit tested without bootstrapping Minecraft.</p>
  */
 public final class PortalCrossing {
-    /** Numerical slack when testing the rectangle border. */
-    private static final double EDGE_EPSILON = 1.0e-7;
-
     private PortalCrossing() {
     }
 
@@ -48,6 +45,29 @@ public final class PortalCrossing {
         if (plane == null || previous == null || current == null) {
             return null;
         }
+        return findCrossing(plane, PortalShape.rectangle(plane), previous, current);
+    }
+
+    /**
+     * Shape-aware crossing. The rectangle/plane overload is kept for existing
+     * callers; polygon openings use the same segment/plane intersection and
+     * only replace the final containment test.
+     */
+    public static @Nullable Crossing findCrossing(PortalShape shape,
+                                                  Vector3dc previous,
+                                                  Vector3dc current) {
+        if (shape == null) {
+            return null;
+        }
+        return findCrossing(shape.plane(), shape, previous, current);
+    }
+
+    private static @Nullable Crossing findCrossing(PortalPlane plane, PortalShape shape,
+                                                   Vector3dc previous,
+                                                   Vector3dc current) {
+        if (plane == null || previous == null || current == null) {
+            return null;
+        }
         final double before = plane.signedDistance(previous);
         final double after = plane.signedDistance(current);
         if (before == 0.0 && after == 0.0) {
@@ -68,8 +88,7 @@ public final class PortalCrossing {
 
         final Vector3d point = new Vector3d(previous).lerp(current, t);
         final Vector3d local = plane.local(point);
-        final boolean inside = Math.abs(local.x()) <= plane.width() * 0.5 + EDGE_EPSILON
-                && Math.abs(local.y()) <= plane.height() * 0.5 + EDGE_EPSILON;
+        final boolean inside = shape.containsLocal(local.x(), local.y());
         final boolean frontToBack = before >= 0.0 && after <= 0.0;
         return new Crossing(before, after, point, inside, frontToBack);
     }
@@ -99,6 +118,14 @@ public final class PortalCrossing {
                                   Vector3dc previous,
                                   Vector3dc current) {
         final Crossing crossing = findCrossing(plane, previous, current);
+        return crossing != null && crossing.inside();
+    }
+
+    /** Shape-aware convenience form. */
+    public static boolean crosses(PortalShape shape,
+                                  Vector3dc previous,
+                                  Vector3dc current) {
+        final Crossing crossing = findCrossing(shape, previous, current);
         return crossing != null && crossing.inside();
     }
 }

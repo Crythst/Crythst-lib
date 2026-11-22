@@ -1,16 +1,16 @@
 package io.mikaple.crythst.integration.minecraft.interaction;
 
-import net.minecraft.core.BlockPos;
+import io.mikaple.crythst.math.Transform3d;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.protocol.game.ClientboundLevelParticlesPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.RandomSource;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.LevelEvent;
 import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.block.state.BlockState;
+import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 /**
@@ -19,31 +19,32 @@ import org.joml.Vector3dc;
  * <p>Vanilla only emits block particles and positional sounds for blocks in
  * the real block grid. Structure voxels are simulated separately, so the
  * interaction layer has to emit the same feedback explicitly. Everything here
- * runs on the server: {@link ServerLevel#levelEvent} and
- * {@link ServerLevel#sendParticles} broadcast to tracking clients, and
- * {@link ServerLevel#playSound} broadcasts a positional sound packet. Nothing
- * is played through a client-local code path.</p>
+ * runs on the server: {@link ServerLevel#sendParticles} and
+ * {@link ServerLevel#playSound} broadcast to tracking clients. Nothing is
+ * played through a client-local code path.</p>
  *
- * <p>Breaking keeps the full vanilla destroy-block effect. Placement emits the
- * block's place sound once but deliberately emits no particles: structure
- * placement already has an authoritative impulse and outline, and the small
- * puff made the edit look noisy or like a failed break.</p>
+ * <p>Break particles use an explicit {@link BlockParticleOption} so the block
+ * state texture is preserved, but each particle is emitted at the exact
+ * world-space point produced by the structure pose and the voxel-local
+ * fraction. The vanilla {@code LevelEvent} path (id 2001) is deliberately not
+ * used: it works in integer {@code BlockPos} space, so it loses rotation and
+ * scale and would duplicate a custom burst. Callers that run vanilla block
+ * logic in the auxiliary level suppress its 2001 event and route it through
+ * {@link #breakBlock} instead.</p>
+ *
+ * <p>Placement emits the block's place sound once but deliberately emits no
+ * particles: structure placement already has an authoritative impulse and
+ * outline, and the small puff made the edit look noisy or like a failed
+ * break.</p>
  *
  * <p>Particle counts and spreads are pure functions of the structure's
  * {@code blockScale} so they can be unit tested without a live level.</p>
  */
 public final class StructureFeedback {
-    /**
-     * Vanilla destroy-block event (id 2001). The client handles it by playing
-     * the state's break sound and running the same 4x4x4 destroy-block particle
-     * burst as a real block break. Using the level event instead of a hand-built
-     * burst keeps the particle count and block shape identical to vanilla.
-     */
-    public static final int BREAK_LEVEL_EVENT = LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK;
     /** Slightly quieter than a break, matching the vanilla place sound. */
     public static final float PLACE_VOLUME = 0.9f;
-    /** Outward velocity for the fallback break debris. */
-    public static final double BREAK_PARTICLE_SPEED = 0.12;
+    /** Outward debris speed fraction at scale 1 (see {@link StructureParticleMath}). */
+    public static final double BREAK_PARTICLE_SPEED = StructureParticleMath.DEBRIS_SPEED_FRACTION;
 
     private static final int BREAK_BASE_PARTICLES = 8;
     private static final int BREAK_PARTICLES_PER_SCALE = 4;
@@ -76,41 +77,51 @@ public final class StructureFeedback {
     }
 
     /**
-     * Emits the vanilla destroy-block event at a world-space point (normally
-     * the centre of the removed voxel).
+     * Emits a block-textured debris burst at exact world positions derived
+     * from the structure pose and the broken voxel.
      *
-     * <p>Event 2001 makes every tracking client play the state's break sound
-     * and run the vanilla destroy-block particle burst (4x4x4 for a full cube).
-     * This is the same path vanilla uses for a real block, so the burst is not
-     * reduced by our own particle budget. The event already contains the
-     * positional sound, so no separate {@code playSound} call is made.</p>
+     * <p>Each sample gets its own zero-count particle packet: in vanilla's
+     * packet format {@code count == 0} means "spawn exactly one particle here
+     * with these velocity components". This is what lets rotated and scaled
+     * structures keep the debris attached to the voxel instead of rounding to
+     * a {@code BlockPos} centre.</p>
      *
-     * <p>Must be called on the server thread, before a structure body is
-     * closed, although the point is passed by value so the order only matters
-     * for readability.</p>
+     * @param level      host level that owns the players
+     * @param pose       structure pose at the time of the break
+     * @param voxelX     broken structure-local voxel X
+     * @param voxelY     broken structure-local voxel Y
+     * @param voxelZ     broken structure-local voxel Z
+     * @param state      previous block state (supplies the particle texture)
+     * @param blockScale metres per voxel
+     * @param random     level random for sample positions/pitch
      */
-    public static void breakBlock(ServerLevel level, Vector3dc center, BlockState state,
-                                  double blockScale, RandomSource random) {
-        if (level == null || center == null || state == null || state.isAir()) {
+    public static void breakBlock(ServerLevel level, Transform3d pose,
+                                  int voxelX, int voxelY, int voxelZ,
+                                  BlockState state, double blockScale,
+                                  RandomSource random) {
+        if (level == null || pose == null || state == null || state.isAir()) {
             return;
         }
-        final BlockPos pos = BlockPos.containing(center.x(), center.y(), center.z());
-        if (state.shouldSpawnTerrainParticles()) {
-            // 2001 broadcasts one ClientboundLevelEventPacket; the client
-            // resolves the state id and runs addDestroyBlockEffect plus the
-            // break sound at pos. Sent to all players within 64 blocks.
-            level.levelEvent(null, BREAK_LEVEL_EVENT, pos, Block.getId(state));
-            return;
+        final double scale = StructureParticleMath.safeScale(blockScale);
+        final BlockParticleOption particle =
+                new BlockParticleOption(ParticleTypes.BLOCK, state);
+        final int count = breakParticleCount(scale);
+        for (int i = 0; i < count; i++) {
+            final double localX = random.nextDouble();
+            final double localY = random.nextDouble();
+            final double localZ = random.nextDouble();
+            final Vector3d point = StructureParticleMath.worldPosition(
+                    pose, voxelX, voxelY, voxelZ, scale, localX, localY, localZ);
+            final Vector3d velocity = StructureParticleMath.debrisVelocity(
+                    pose, localX, localY, localZ, scale);
+            level.sendParticles(particle, true, false,
+                    point.x, point.y, point.z,
+                    0, 1.0, 1.0, 1.0,
+                    velocity.x, velocity.y, velocity.z,
+                    ClientboundLevelParticlesPacket.RandomizationType.DEFAULT);
         }
-        // Fallback for states that opt out of vanilla terrain particles: still
-        // show a small state-coloured burst and play the positional break sound
-        // so the edit has visible/audible feedback.
-        final double spread = particleSpread(blockScale);
-        level.sendParticles(new BlockParticleOption(ParticleTypes.BLOCK, state),
-                center.x(), center.y(), center.z(),
-                breakParticleCount(blockScale),
-                spread, spread, spread,
-                BREAK_PARTICLE_SPEED);
+        final Vector3d center = StructureParticleMath.voxelCenter(
+                pose, voxelX, voxelY, voxelZ, scale);
         play(level, center, state, true, 1.0f, random);
     }
 

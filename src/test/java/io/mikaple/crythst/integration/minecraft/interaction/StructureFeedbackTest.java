@@ -40,10 +40,12 @@ class StructureFeedbackTest {
     }
 
     @Test
-    void breakUsesVanillaDestroyBlockLevelEvent() {
-        // LevelEvent.PARTICLES_AND_SOUND_DESTROY_BLOCK; the client expands
-        // this into the full vanilla particle burst and break sound.
-        assertEquals(2001, StructureFeedback.BREAK_LEVEL_EVENT);
+    void breakDoesNotExposeTheRoundedVanillaLevelEvent() {
+        // Break feedback now uses exact pose-derived positions. Keeping the
+        // 2001 event constant would invite a duplicate, BlockPos-rounded burst.
+        assertFalse(Arrays.stream(StructureFeedback.class.getFields())
+                        .anyMatch(field -> field.getName().equals("BREAK_LEVEL_EVENT")),
+                "break feedback must not advertise the BlockPos level-event path");
     }
 
     @Test

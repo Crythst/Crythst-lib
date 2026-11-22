@@ -26,13 +26,19 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Draws portal surfaces with a projective screen-space UV mapping.
+ * Draws portal openings by sampling the destination view texture with the
+ * classic projective mapping.
  *
- * <p>The captured destination texture is sampled by the portal quad itself, so
- * the quad is both the visible geometry and the clipping mask. Polygons are
- * clipped in homogeneous space against {@code w > epsilon}, which keeps the
- * portal visible when the camera reaches the plane instead of dropping it
- * (the old implementation returned null as soon as one corner crossed).</p>
+ * <p>The polygon is clipped in homogeneous clip space against the camera's near
+ * plane ({@code w > 0}) and then triangulated as a fan. Texture coordinates are
+ * the portal quad's own main-camera NDC position, so a captured destination
+ * render with the transformed virtual camera has correct per-pixel parallax.
+ * There is no UV clamping in the shader; the sampler is clamp-to-edge, which
+ * keeps off-screen portions stable instead of smearing the whole surface.</p>
+ *
+ * <p>The surface is skipped while a destination capture is running, so captures
+ * never contain portal quads and recursion cannot explode. Recursive layers are
+ * a documented limitation of this texture-based approach.</p>
  */
 final class PortalSurfaceRenderer {
     private static final double MAX_RENDER_DISTANCE = 512.0;
@@ -43,7 +49,6 @@ final class PortalSurfaceRenderer {
     private static final float FALLBACK_GREEN = 0.16f;
     private static final float FALLBACK_BLUE = 0.86f;
     private static final float FALLBACK_ALPHA = 0.72f;
-    private static final boolean FLIP_V = Boolean.getBoolean("crythst.portal.flipV");
     private static final boolean DEBUG_BLIT = Boolean.getBoolean("crythst.portal.debugBlit");
     private static volatile boolean viewFailureLogged;
 
@@ -51,9 +56,7 @@ final class PortalSurfaceRenderer {
     }
 
     static void render(LevelRenderContext context) {
-        if (PortalRenderManager.isCapturing()) {
-            // Capture must contain the world behind the portal, never another
-            // portal surface (texture, procedural or coloured fallback).
+        if (!PortalCaptureSettings.RENDER_ENABLED || PortalRenderManager.isCapturing()) {
             return;
         }
         final Minecraft minecraft = Minecraft.getInstance();
@@ -76,8 +79,8 @@ final class PortalSurfaceRenderer {
         final Matrix4f worldProjection = PortalProjection.worldProjection(
                 camera, levelState.playerRenderState,
                 context.gameRenderer().gameRenderState().optionsRenderState);
-        final Matrix4f viewProjection = new Matrix4f(worldProjection)
-                .mul(camera.viewRotationMatrix);
+        final Matrix4f viewProjection = PortalCameraMath.mainViewProjection(
+                worldProjection, camera.viewRotationMatrix);
 
         if (DEBUG_BLIT) {
             renderDebugBlit(snapshots, dimension, viewProjection, collector);
@@ -116,7 +119,7 @@ final class PortalSurfaceRenderer {
                 loggedVertices = polygon.vertices().length;
                 loggedUv = uvRange(polygon.vertices());
             }
-            if (!shaderAvailable) {
+            if (!shaderAvailable || PortalCaptureSettings.FORCE_PROCEDURAL) {
                 colored.add(polygon);
                 continue;
             }
@@ -154,11 +157,18 @@ final class PortalSurfaceRenderer {
             collector.submitCustomGeometry(new PoseStack(), RenderTypes.debugFilledBox(),
                     (pose, consumer) -> emitFallback(colored, pose, consumer));
         }
+        if (PortalCaptureSettings.DEBUG_MASK) {
+            final List<Polygon> all = new ArrayList<>();
+            groups.values().forEach(all::addAll);
+            all.addAll(colored);
+            collector.submitCustomGeometry(new PoseStack(), RenderTypes.lines(),
+                    (pose, consumer) -> emitOutline(all, pose, consumer));
+        }
 
         if (loggedPortal != null) {
             PortalRenderDiagnostics.surface(loggedPortal, loggedTexture, loggedType,
                     loggedVertices, loggedUv[0], loggedUv[1], loggedUv[2], loggedUv[3],
-                    true, loggedType == null ? "coloured fallback" : "portal quad");
+                    true, loggedTexture == null ? "procedural/coloured fallback" : "portal view texture");
         } else {
             PortalRenderDiagnostics.surface(null, null, null, 0, 0, 0, 0, 0,
                     false, "no visible portal (dimension/frustum/near-clip)");
@@ -275,7 +285,7 @@ final class PortalSurfaceRenderer {
             return null;
         }
         if (camera.cullFrustum != null && camera.initialized) {
-            final var bounds = plane.bounds();
+            final io.mikaple.crythst.math.Aabb bounds = snapshot.shape().bounds();
             if (!camera.cullFrustum.isVisible(new AABB(
                     bounds.min().x, bounds.min().y, bounds.min().z,
                     bounds.max().x, bounds.max().y, bounds.max().z))) {
@@ -285,10 +295,14 @@ final class PortalSurfaceRenderer {
 
         final Vector3d normal = plane.normal();
         final boolean front = dx * normal.x + dy * normal.y + dz * normal.z >= 0.0;
-        final Vector3d[] corners = plane.corners();
-        final ClipVertex[] vertices = new ClipVertex[4];
-        for (int i = 0; i < 4; i++) {
-            final Vector3d corner = corners[i];
+        final List<Vector3d> worldOutline = snapshot.shape().worldOutline();
+        final int size = worldOutline.size();
+        if (size < 3) {
+            return null;
+        }
+        ClipVertex[] ordered = new ClipVertex[size];
+        for (int i = 0; i < size; i++) {
+            final Vector3d corner = worldOutline.get(i);
             final float x = (float) (corner.x - camera.pos.x);
             final float y = (float) (corner.y - camera.pos.y);
             final float z = (float) (corner.z - camera.pos.z);
@@ -304,11 +318,15 @@ final class PortalSurfaceRenderer {
             final Vertex vertex = clip.w > CLIP_EPSILON
                     ? vertexFromClip(x, y, z, textureClip)
                     : new Vertex(x, y, z, 0.0f, 0.0f);
-            vertices[i] = new ClipVertex(vertex, clip, textureClip);
+            ordered[i] = new ClipVertex(vertex, clip, textureClip);
         }
-        final ClipVertex[] ordered = front
-                ? vertices
-                : new ClipVertex[]{vertices[1], vertices[0], vertices[3], vertices[2]};
+        if (!front) {
+            final ClipVertex[] reversed = new ClipVertex[size];
+            for (int i = 0; i < size; i++) {
+                reversed[i] = ordered[size - 1 - i];
+            }
+            ordered = reversed;
+        }
 
         final List<ClipVertex> clipped = clipNearPlane(ordered);
         if (clipped.size() < 3) {
@@ -318,8 +336,8 @@ final class PortalSurfaceRenderer {
         for (int i = 0; i < clipped.size(); i++) {
             clippedVertices[i] = clipped.get(i).vertex();
         }
-        final Vertex[] original = new Vertex[4];
-        for (int i = 0; i < 4; i++) {
+        final Vertex[] original = new Vertex[ordered.length];
+        for (int i = 0; i < ordered.length; i++) {
             original[i] = ordered[i].vertex();
         }
         return new Polygon(clippedVertices, original, dx * dx + dy * dy + dz * dz);
@@ -328,13 +346,12 @@ final class PortalSurfaceRenderer {
     private static Vertex vertexFromClip(float x, float y, float z, Vector4f clip) {
         final float w = Math.max(clip.w, CLIP_EPSILON);
         final float u = clip.x / w * 0.5f + 0.5f;
-        final float ndcV = clip.y / w * 0.5f + 0.5f;
-        final float v = FLIP_V ? 1.0f - ndcV : ndcV;
+        final float v = clip.y / w * 0.5f + 0.5f;
         return new Vertex(x, y, z, u, v);
     }
 
     private static List<ClipVertex> clipNearPlane(ClipVertex[] vertices) {
-        final List<ClipVertex> output = new ArrayList<>(5);
+        final List<ClipVertex> output = new ArrayList<>(vertices.length + 2);
         for (int i = 0; i < vertices.length; i++) {
             final ClipVertex current = vertices[i];
             final ClipVertex next = vertices[(i + 1) % vertices.length];
@@ -387,11 +404,40 @@ final class PortalSurfaceRenderer {
     private static void emitFallback(List<Polygon> polygons, PoseStack.Pose pose,
                                      VertexConsumer consumer) {
         for (Polygon polygon : polygons) {
-            for (Vertex vertex : polygon.original()) {
-                consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
-                        .setColor(FALLBACK_RED, FALLBACK_GREEN, FALLBACK_BLUE, FALLBACK_ALPHA);
+            final Vertex[] vertices = polygon.original();
+            for (int i = 1; i < vertices.length - 1; i++) {
+                addFallbackVertex(consumer, pose, vertices[0]);
+                addFallbackVertex(consumer, pose, vertices[i]);
+                addFallbackVertex(consumer, pose, vertices[i + 1]);
             }
         }
+    }
+
+    private static void addFallbackVertex(VertexConsumer consumer, PoseStack.Pose pose,
+                                          Vertex vertex) {
+        consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
+                .setColor(FALLBACK_RED, FALLBACK_GREEN, FALLBACK_BLUE, FALLBACK_ALPHA);
+    }
+
+    private static void emitOutline(List<Polygon> polygons, PoseStack.Pose pose,
+                                    VertexConsumer consumer) {
+        for (Polygon polygon : polygons) {
+            final Vertex[] vertices = polygon.original();
+            for (int i = 0; i < vertices.length; i++) {
+                final Vertex a = vertices[i];
+                final Vertex b = vertices[(i + 1) % vertices.length];
+                addOutlineVertex(consumer, pose, a);
+                addOutlineVertex(consumer, pose, b);
+            }
+        }
+    }
+
+    private static void addOutlineVertex(VertexConsumer consumer, PoseStack.Pose pose,
+                                         Vertex vertex) {
+        consumer.addVertex(pose, vertex.x(), vertex.y(), vertex.z())
+                .setColor(0.2f, 1.0f, 0.9f, 1.0f)
+                .setNormal(0.0f, 1.0f, 0.0f)
+                .setLineWidth(2.0f);
     }
 
     private record Vertex(float x, float y, float z, float u, float v) {

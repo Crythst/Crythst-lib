@@ -157,7 +157,9 @@ public final class LevelPhysics implements AutoCloseable {
      * exists and they flash/disappear.
      */
     public void captureSnapshotNow(PhysicsStructure structure) {
-        StructureBlockSnapshots.captureNow(level.dimension(), structure);
+        StructureBlockSnapshots.captureNow(level.dimension(), structure,
+                subLevel == null ? java.util.Map.of()
+                        : subLevel.captureBlockEntityOpenCounts(structure));
     }
 
     public PhysicsStructure createStructure(StructureDef definition) {
@@ -902,6 +904,33 @@ public final class LevelPhysics implements AutoCloseable {
             }
         }
         return count;
+    }
+
+    /**
+     * Force/torque totals contributed by block-entity actors during the most
+     * recent fixed substep.
+     *
+     * <p>Read-only and cheap: it returns an immutable snapshot cached by the
+     * actor runtime. A structure without actors, or before the first substep,
+     * reports an empty snapshot. Values are in newtons and {@code N·m}; they are
+     * recorded before conversion to impulses.</p>
+     *
+     * @param structure structure to query; may be {@code null}
+     * @return the last substep totals, never {@code null}
+     */
+    public io.mikaple.crythst.api.physics.force.ForceTotals forceTotals(
+            PhysicsStructure structure) {
+        return structureActors.lastTotals(structure);
+    }
+
+    /**
+     * One-line force-total summary for commands and logs.
+     *
+     * @return a human-readable count and magnitude summary
+     */
+    public String forceTotalsStatus() {
+        return structureActors.structuresWithForceTotals() + " structure(s) with forces;"
+                + " lastTotalMagnitude=" + structureActors.totalLastForceMagnitude() + " N";
     }
 
     /**

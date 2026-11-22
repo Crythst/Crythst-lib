@@ -22,6 +22,7 @@ final class PortalRenderDiagnostics {
     private static boolean dumped;
     private static long lastSkipLogNanos = -SKIP_LOG_INTERVAL_NANOS;
     private static long lastSurfaceLogNanos = -SKIP_LOG_INTERVAL_NANOS;
+    private static long lastTimingLogNanos = -SKIP_LOG_INTERVAL_NANOS;
 
     private PortalRenderDiagnostics() {
     }
@@ -64,6 +65,14 @@ final class PortalRenderDiagnostics {
 
     static void timings(PortalSnapshot portal, PortalViewTarget target, int sections,
                          double extractMs, double renderMs, long intervalNanos) {
+        if (!PortalCaptureSettings.TRACE) {
+            return;
+        }
+        final long now = System.nanoTime();
+        if (now - lastTimingLogNanos < PortalCaptureSettings.TIMING_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastTimingLogNanos = now;
         Crythst.LOGGER.info(
                 "[portal timings] portal='{}' {}x{} sections={} extract={}ms render={}ms "
                         + "total={}ms scale={} interval={}ms",
@@ -73,6 +82,20 @@ final class PortalRenderDiagnostics {
                 String.format("%.2f", extractMs + renderMs),
                 String.format("%.2f", PortalCaptureSettings.SCALE),
                 intervalNanos / 1_000_000L);
+    }
+
+    /** One aggregated line per second when {@code -Dcrythst.portal.trace=true}. */
+    static void round(int visible, int sections, double costMs, double totalMs,
+                      long intervalNanos) {
+        final long now = System.nanoTime();
+        if (now - lastTimingLogNanos < PortalCaptureSettings.TIMING_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastTimingLogNanos = now;
+        Crythst.LOGGER.info(
+                "[portal] visible={} layer=1 sections={} capture={}ms total={}ms interval={}ms",
+                visible, sections, String.format("%.2f", costMs),
+                String.format("%.2f", totalMs), intervalNanos / 1_000_000L);
     }
 
     /**

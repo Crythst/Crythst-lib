@@ -2,6 +2,9 @@ package io.mikaple.crythst.api.physics;
 
 import io.mikaple.crythst.api.physics.constraint.StructureConstraintConfiguration;
 import io.mikaple.crythst.api.physics.constraint.StructureConstraintHandle;
+import io.mikaple.crythst.api.physics.box.StructureBoxDef;
+import io.mikaple.crythst.api.physics.box.StructureBoxObject;
+import io.mikaple.crythst.api.physics.force.ForceTotals;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.physics.body.BodyHandle;
 import io.mikaple.crythst.physics.constraint.ConstraintDef;
@@ -67,6 +70,18 @@ public final class PhysicsPipeline {
     }
 
     /**
+     * Low-level physics world behind this pipeline.
+     *
+     * <p>Intended for advanced integrations and for the native box/rope
+     * helpers. Do not call {@code step}/{@code advance} through it: Crythst's
+     * fixed-step clock owns simulation timing. Prefer the pipeline operations
+     * for bodies and joints.</p>
+     */
+    public io.mikaple.crythst.physics.world.PhysicsWorld physicsWorld() {
+        return levelPhysics.world();
+    }
+
+    /**
      * Creates a constraint between two structures.
      *
      * <p>Frames, anchors and axes in {@code config} are interpreted in
@@ -96,7 +111,7 @@ public final class PhysicsPipeline {
         }
         final ConstraintDef definition = config.toDefinition(a, b);
         final ConstraintHandle handle = levelPhysics.world().addConstraint(definition);
-        return new StructureConstraintHandle(levelPhysics.world(), handle, a, b);
+        return new StructureConstraintHandle(levelPhysics.world(), handle, a, b, config);
     }
 
     /**
@@ -120,7 +135,7 @@ public final class PhysicsPipeline {
         }
         final ConstraintDef definition = config.toDefinition(a, null);
         final ConstraintHandle handle = levelPhysics.world().addConstraint(definition);
-        return new StructureConstraintHandle(levelPhysics.world(), handle, a, null);
+        return new StructureConstraintHandle(levelPhysics.world(), handle, a, null, config);
     }
 
     /**
@@ -180,6 +195,93 @@ public final class PhysicsPipeline {
     /** Number of constraints in the world. */
     public int constraintCount() {
         return levelPhysics.world().constraintCount();
+    }
+
+    /**
+     * Creates a per-cell mass tracker for a structure.
+     *
+     * <p>The tracker is a lightweight read view. Total mass comes from the
+     * collider (including custom hooks and the structure mass scale); per-cell
+     * masses come from the structure volume.</p>
+     *
+     * @param structure structure registered with this level
+     * @return a mass tracker; server thread only
+     * @throws IllegalArgumentException when the structure is closed or belongs
+     *                                  to another world/level
+     */
+    public StructureMassTracker massTracker(PhysicsStructure structure) {
+        requireStructure(structure, "structure");
+        return StructureMassTracker.of(structure);
+    }
+
+    /**
+     * Force/torque totals recorded for a structure during the most recent
+     * fixed substep.
+     *
+     * <p>Only forces queued through block-entity actor force groups are
+     * recorded. Direct impulses applied through a body handle and the public
+     * pre-step event are not part of this snapshot.</p>
+     *
+     * @param structure structure to query
+     * @return an immutable snapshot, never {@code null}
+     * @throws IllegalArgumentException when the structure belongs to another
+     *                                  world/level
+     */
+    public ForceTotals forceTotals(PhysicsStructure structure) {
+        if (structure == null) {
+            throw new NullPointerException("structure");
+        }
+        if (structure.world() != levelPhysics.world()) {
+            throw new IllegalArgumentException("structure belongs to a different physics world");
+        }
+        return levelPhysics.forceTotals(structure);
+    }
+
+    /**
+     * Force/torque totals for a body id.
+     *
+     * @return the recorded totals, or {@link ForceTotals#empty(long)} for a
+     *         loose body/unknown id
+     */
+    public ForceTotals forceTotals(long bodyId) {
+        for (PhysicsStructure structure : levelPhysics.structures()) {
+            if (structure.body().id() == bodyId) {
+                return levelPhysics.forceTotals(structure);
+            }
+        }
+        return ForceTotals.empty(bodyId);
+    }
+
+    /**
+     * Force/torque totals for every registered structure, in creation order.
+     */
+    public List<ForceTotals> forceTotals() {
+        final List<PhysicsStructure> structures = levelPhysics.structures();
+        final List<ForceTotals> totals = new ArrayList<>(structures.size());
+        for (PhysicsStructure structure : structures) {
+            totals.add(levelPhysics.forceTotals(structure));
+        }
+        return List.copyOf(totals);
+    }
+
+    /**
+     * Creates a loose box rigid body in this pipeline's world.
+     *
+     * @param definition box description
+     * @return a live box handle
+     */
+    public StructureBoxObject createBox(StructureBoxDef definition) {
+        return StructureBoxObject.create(this, definition);
+    }
+
+    /**
+     * Wraps an existing loose box body by id.
+     *
+     * @return the handle, or {@code null} when the id is unknown or names a
+     *         structure body
+     */
+    public @Nullable StructureBoxObject box(long bodyId) {
+        return StructureBoxObject.wrap(this, bodyId);
     }
 
     private void requireStructure(PhysicsStructure structure, String name) {

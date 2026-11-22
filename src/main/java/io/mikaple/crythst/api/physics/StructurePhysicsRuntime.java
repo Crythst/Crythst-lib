@@ -5,17 +5,20 @@ import io.mikaple.crythst.api.block.BlockEntityStructureActor;
 import io.mikaple.crythst.api.block.StructureActorDispatch;
 import io.mikaple.crythst.api.block.StructurePhysicsContext;
 import io.mikaple.crythst.api.physics.force.ForceGroup;
+import io.mikaple.crythst.api.physics.force.ForceTotals;
 import io.mikaple.crythst.api.physics.force.QueuedForceGroup;
 import io.mikaple.crythst.math.Transform3d;
 import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import io.mikaple.crythst.physics.voxel.VoxelColliderData;
 import net.minecraft.server.level.ServerLevel;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -100,6 +103,26 @@ public final class StructurePhysicsRuntime {
     }
 
     /**
+     * Returns the force/torque totals recorded for a structure during the most
+     * recent fixed substep.
+     *
+     * <p>The value is recorded before the per-group accumulators are converted
+     * to impulses, so it is expressed in newtons and {@code N·m}. A structure
+     * with no actor state reports {@link ForceTotals#empty(long)}. The returned
+     * object is immutable.</p>
+     *
+     * @param structure structure to query; may be {@code null}
+     * @return the last substep totals, never {@code null}
+     */
+    public ForceTotals lastTotals(@Nullable PhysicsStructure structure) {
+        if (structure == null) {
+            return ForceTotals.empty(0L);
+        }
+        final StructureState state = states.get(structure);
+        return state == null ? ForceTotals.empty(structure.body().id()) : state.lastTotals;
+    }
+
+    /**
      * Drops cached state for a structure.
      *
      * <p>Called when a structure is removed or refreshed. Safe to call for an
@@ -144,6 +167,32 @@ public final class StructurePhysicsRuntime {
         return count;
     }
 
+    /**
+     * Number of structures with a recorded force snapshot from the most recent
+     * substep. Diagnostic only.
+     */
+    public int structuresWithForceTotals() {
+        int count = 0;
+        for (StructureState state : states.values()) {
+            if (state.lastTotals.isPresent()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Sum of the last-substep total-force magnitudes across all structures, in
+     * newtons. Diagnostic only.
+     */
+    public double totalLastForceMagnitude() {
+        double magnitude = 0.0;
+        for (StructureState state : states.values()) {
+            magnitude += state.lastTotals.forceMagnitude();
+        }
+        return magnitude;
+    }
+
     private final class StructureState {
         private final PhysicsStructure structure;
         private final RigidBodyHandle handle;
@@ -157,6 +206,7 @@ public final class StructurePhysicsRuntime {
         private double timeStepSeconds;
         private MassData massData;
         private VoxelColliderData massDataSource;
+        private ForceTotals lastTotals = ForceTotals.empty(0L);
 
         private StructureState(PhysicsStructure structure) {
             this.structure = structure;
@@ -173,9 +223,26 @@ public final class StructurePhysicsRuntime {
         }
 
         private void applyQueuedForces() {
+            if (groups.isEmpty()) {
+                lastTotals = ForceTotals.empty(structure.body().id());
+                return;
+            }
+            final Vector3d totalForce = new Vector3d();
+            final Vector3d totalTorque = new Vector3d();
+            final Map<ForceGroup, ForceTotals.GroupForce> perGroup = new LinkedHashMap<>();
             for (QueuedForceGroup group : groups.values()) {
+                final Vector3d force = group.accumulatedForce(new Vector3d());
+                final Vector3d torque = group.accumulatedTorque(new Vector3d());
+                totalForce.add(force);
+                totalTorque.add(torque);
+                if (force.lengthSquared() != 0.0 || torque.lengthSquared() != 0.0) {
+                    perGroup.put(group.group(), new ForceTotals.GroupForce(
+                            group.group(), force, torque));
+                }
                 group.applyTo(handle, timeStepSeconds);
             }
+            lastTotals = new ForceTotals(structure.body().id(), timeStepSeconds,
+                    totalForce, totalTorque, perGroup);
         }
 
         private MassData massData() {

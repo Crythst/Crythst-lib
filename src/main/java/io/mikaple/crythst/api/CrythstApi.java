@@ -5,6 +5,8 @@ import io.mikaple.crythst.api.physics.PhysicsPipeline;
 import io.mikaple.crythst.api.physics.RigidBodyHandle;
 import io.mikaple.crythst.api.sublevel.ServerStructureContainer;
 import io.mikaple.crythst.api.sublevel.StructureContainer;
+import io.mikaple.crythst.api.sublevel.ticket.StructureLoadingTickets;
+import io.mikaple.crythst.api.sublevel.tracking.StructureTrackingPoints;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.math.Aabb;
@@ -145,6 +147,26 @@ public final class CrythstApi {
     public static @Nullable io.mikaple.crythst.api.sublevel.view.StructureLevelView view(
             PhysicsStructure structure) {
         return io.mikaple.crythst.api.sublevel.view.StructureLevelViews.of(structure);
+    }
+
+    /**
+     * Acquires a host-chunk loading ticket for a structure.
+     *
+     * @param level        server level owning the structure
+     * @param structure    live structure
+     * @param radiusChunks extra chunk radius around the structure AABB
+     * @return the ticket handle; release it when no longer needed
+     */
+    public static StructureLoadingTickets.StructureLoadingTicket acquireLoadingTicket(
+            ServerLevel level, PhysicsStructure structure, int radiusChunks) {
+        return StructureLoadingTickets.acquire(level, structure, radiusChunks);
+    }
+
+    /**
+     * Persistent tracking points for a server level.
+     */
+    public static StructureTrackingPoints trackingPoints(ServerLevel level) {
+        return StructureTrackingPoints.of(level);
     }
 
     /**

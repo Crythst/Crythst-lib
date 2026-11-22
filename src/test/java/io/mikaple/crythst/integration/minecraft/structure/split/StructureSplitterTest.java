@@ -6,9 +6,16 @@ import io.mikaple.crythst.physics.voxel.MutableVoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelBox;
 import io.mikaple.crythst.physics.voxel.VoxelVolume;
 import io.mikaple.crythst.physics.voxel.VoxelVolumes;
+import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.world.ticks.TickPriority;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -144,6 +151,85 @@ class StructureSplitterTest {
 
         assertThrows(IllegalArgumentException.class,
                 () -> StructureSplitter.findComponents(huge));
+    }
+
+    @Test
+    void splitTicksFollowNonSolidLogicCellsAndPreserveDelayAndOrder() {
+        final IntBounds3 bounds = new IntBounds3(0, 0, 0, 7, 1, 1);
+        final MutableVoxelVolume volume = VoxelVolumes.empty(bounds);
+        volume.setBlock(0, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
+        volume.setBlock(4, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
+        final List<StructureSplitter.Component> components =
+                StructureSplitter.findComponents(volume);
+
+        final Map<StructureSplitter.Cell, Integer> owners = new HashMap<>();
+        for (int i = 0; i < components.size(); i++) {
+            for (StructureSplitter.Cell cell : components.get(i).cells()) {
+                owners.put(cell, i);
+            }
+        }
+
+        final ListTag source = new ListTag();
+        // A solid tick and a non-solid tick (for example a repeater or torch)
+        // near each component. Non-solid cells used to be dropped entirely.
+        source.add(tickTag(0, 0, 0, 3L, TickPriority.NORMAL, 11L));
+        source.add(tickTag(1, 0, 0, 7L, TickPriority.HIGH, 12L));
+        source.add(tickTag(4, 0, 0, 2L, TickPriority.LOW, 13L));
+        source.add(tickTag(5, 0, 0, 9L, TickPriority.NORMAL, 14L));
+
+        final List<ListTag> destinations = new ArrayList<>();
+        destinations.add(new ListTag());
+        destinations.add(new ListTag());
+        StructureSplitter.distributeTicks(source, owners, components, destinations);
+
+        assertEquals(2, destinations.get(0).size());
+        assertEquals(2, destinations.get(1).size());
+        assertTick(destinations.get(0).getCompoundOrEmpty(0), 0, 0, 0, 3L,
+                TickPriority.NORMAL, 11L);
+        assertTick(destinations.get(0).getCompoundOrEmpty(1), 1, 0, 0, 7L,
+                TickPriority.HIGH, 12L);
+        assertTick(destinations.get(1).getCompoundOrEmpty(0), 4, 0, 0, 2L,
+                TickPriority.LOW, 13L);
+        assertTick(destinations.get(1).getCompoundOrEmpty(1), 5, 0, 0, 9L,
+                TickPriority.NORMAL, 14L);
+    }
+
+    @Test
+    void ownerOfUsesNearestComponentAndNeverDropsUnresolvedCells() {
+        final IntBounds3 bounds = new IntBounds3(0, 0, 0, 9, 1, 1);
+        final MutableVoxelVolume volume = VoxelVolumes.empty(bounds);
+        volume.setBlock(0, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
+        volume.setBlock(8, 0, 0, true, BLOCK_MASS, PhysicsMaterial.STONE);
+        final List<StructureSplitter.Component> components =
+                StructureSplitter.findComponents(volume);
+
+        assertEquals(0, StructureSplitter.ownerOf(new StructureSplitter.Cell(1, 0, 0), components));
+        assertEquals(1, StructureSplitter.ownerOf(new StructureSplitter.Cell(7, 0, 0), components));
+        // Equidistant cell: deterministic lowest component index.
+        assertEquals(0, StructureSplitter.ownerOf(new StructureSplitter.Cell(4, 0, 0), components));
+    }
+
+    private static CompoundTag tickTag(int x, int y, int z, long delay,
+                                       TickPriority priority, long order) {
+        final CompoundTag tag = new CompoundTag();
+        tag.putInt("X", x);
+        tag.putInt("Y", y);
+        tag.putInt("Z", z);
+        tag.putString("Type", "minecraft:repeater");
+        tag.putLong("Delay", delay);
+        tag.putInt("Priority", priority.getValue());
+        tag.putLong("Order", order);
+        return tag;
+    }
+
+    private static void assertTick(CompoundTag tag, int x, int y, int z, long delay,
+                                   TickPriority priority, long order) {
+        assertEquals(x, tag.getIntOr("X", 0));
+        assertEquals(y, tag.getIntOr("Y", 0));
+        assertEquals(z, tag.getIntOr("Z", 0));
+        assertEquals(delay, tag.getLongOr("Delay", -1L));
+        assertEquals(priority.getValue(), tag.getIntOr("Priority", 99));
+        assertEquals(order, tag.getLongOr("Order", -1L));
     }
 
     private static VoxelVolume zeroMassVolume(IntBounds3 bounds) {

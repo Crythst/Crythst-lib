@@ -62,6 +62,7 @@ public final class ClientStructureInteraction {
         // entrypoint already calls this method. It must run after vanilla has
         // extracted its own block outline.
         io.mikaple.crythst.client.render.structure.selection.StructureSelectionOutline.register();
+        StructureSignClient.register();
     }
 
     private static boolean onPreAttack(Minecraft client, LocalPlayer player, int clickCount) {

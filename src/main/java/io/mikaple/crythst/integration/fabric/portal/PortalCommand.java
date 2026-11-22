@@ -66,6 +66,9 @@ public final class PortalCommand {
                         .then(Commands.literal("remove")
                                 .then(Commands.argument("name", StringArgumentType.word())
                                         .executes(PortalCommand::remove)))
+                        .then(Commands.literal("move")
+                                .then(Commands.argument("name", StringArgumentType.word())
+                                        .executes(PortalCommand::move)))
                         .then(Commands.literal("list")
                                 .executes(PortalCommand::list))));
     }
@@ -135,8 +138,33 @@ public final class PortalCommand {
         return 1;
     }
 
-    private static int remove(CommandContext<CommandSourceStack> context) {
+    private static int move(CommandContext<CommandSourceStack> context) {
         final CommandSourceStack source = context.getSource();
+        final String name = StringArgumentType.getString(context, "name");
+        final Portal existing = PortalManager.findByName(name);
+        if (existing == null) {
+            source.sendFailure(Component.literal("Crythst: unknown portal '" + name + "'"));
+            return 0;
+        }
+        final Vec3 eye = eyePosition(source);
+        final Vec3 look = lookDirection(source);
+        final PortalPlane plane = PortalPlane.fromLook(
+                new Vector3d(eye.x, eye.y, eye.z),
+                new Vector3d(look.x, look.y, look.z),
+                PLACEMENT_DISTANCE,
+                existing.plane().width(), existing.plane().height());
+        final Portal moved = PortalManager.move(name, plane);
+        if (moved == null) {
+            source.sendFailure(Component.literal("Crythst: could not move portal '" + name + "'"));
+            return 0;
+        }
+        source.sendSuccess(() -> Component.literal(String.format(
+                "Crythst: moved portal '%s' to (%.2f, %.2f, %.2f)",
+                moved.name(), plane.origin().x, plane.origin().y, plane.origin().z)), true);
+        return 1;
+    }
+
+    private static int remove(CommandContext<CommandSourceStack> context) {        final CommandSourceStack source = context.getSource();
         final String name = StringArgumentType.getString(context, "name");
         final Portal removed = PortalManager.remove(name);
         if (removed == null) {

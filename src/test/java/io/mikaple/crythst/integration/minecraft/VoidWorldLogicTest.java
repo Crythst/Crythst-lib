@@ -4,15 +4,21 @@ import io.mikaple.crythst.integration.minecraft.entity.projection.StructureEntit
 import io.mikaple.crythst.math.Transform3d;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.ticks.ScheduledTick;
+import net.minecraft.world.ticks.TickPriority;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Quaterniond;
 import org.joml.Vector3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -168,6 +174,53 @@ class VoidWorldLogicTest {
                 1L, 64, 0, 128, 0, 0, 0, 2, 3, 2);
         assertNotNull(view.toLocalVoxel(new BlockPos(65, 1, 129)));
         assertNull(view.toLocalVoxel(new BlockPos(66, 1, 129)));
+    }
+
+    @Test
+    void dueTicksUsePriorityAndSubTickOrderAcrossChunks() {
+        final List<ScheduledTick<Block>> ticks = new ArrayList<>();
+        ticks.add(new ScheduledTick<>(Blocks.STONE, new BlockPos(1, 0, 0),
+                100L, TickPriority.LOW, 1L));
+        ticks.add(new ScheduledTick<>(Blocks.STONE, new BlockPos(2, 0, 0),
+                95L, TickPriority.NORMAL, 5L));
+        ticks.add(new ScheduledTick<>(Blocks.STONE, new BlockPos(3, 0, 0),
+                120L, TickPriority.NORMAL, 2L));
+        ticks.add(new ScheduledTick<>(Blocks.STONE, new BlockPos(4, 0, 0),
+                110L, TickPriority.HIGH, 9L));
+
+        EmptyPhysicsLevel.sortDueTicks(ticks);
+
+        // All ticks are already due. Vanilla orders them by priority and then
+        // sub-tick, not by how overdue they were (triggerTick).
+        assertEquals(new BlockPos(4, 0, 0), ticks.get(0).pos());
+        assertEquals(new BlockPos(3, 0, 0), ticks.get(1).pos());
+        assertEquals(new BlockPos(2, 0, 0), ticks.get(2).pos());
+        assertEquals(new BlockPos(1, 0, 0), ticks.get(3).pos());
+    }
+
+    @Test
+    void capturedTickTagsSortByPriorityThenSubTick() {
+        final ListTag ticks = new ListTag();
+        ticks.add(tickTag(TickPriority.LOW, 2L));
+        ticks.add(tickTag(TickPriority.HIGH, 9L));
+        ticks.add(tickTag(TickPriority.NORMAL, 7L));
+        ticks.add(tickTag(TickPriority.NORMAL, 3L));
+
+        EmptyPhysicsLevel.sortCapturedTickTags(ticks);
+
+        assertEquals(TickPriority.HIGH.getValue(),
+                ticks.getCompoundOrEmpty(0).getIntOr("Priority", 0));
+        assertEquals(3L, ticks.getCompoundOrEmpty(1).getLongOr("Order", 0L));
+        assertEquals(7L, ticks.getCompoundOrEmpty(2).getLongOr("Order", 0L));
+        assertEquals(TickPriority.LOW.getValue(),
+                ticks.getCompoundOrEmpty(3).getIntOr("Priority", 0));
+    }
+
+    private static CompoundTag tickTag(TickPriority priority, long order) {
+        final CompoundTag tag = new CompoundTag();
+        tag.putInt("Priority", priority.getValue());
+        tag.putLong("Order", order);
+        return tag;
     }
 
     private static Vec3 toVec(Vector3d value) {
