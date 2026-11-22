@@ -516,22 +516,29 @@ PhysicsStructure structure = physics.createStructure(
 
 ---
 
-## 许可
+## 许可与来源声明
 
-Crythst 本身使用 **MIT License**，版权归 mikaple 所有。完整文本见 [LICENSE](LICENSE)。
+Crythst 本身以 **MIT License** 发布，版权归 mikaple 所有。完整文本见 [LICENSE](LICENSE)。  
+本声明是工程来源说明，**不构成法律意见**；正式发布前应进行独立的许可证复核。
 
-设计说明：
+### 与 Sable 的关系
 
-- 本项目的物理层在设计上受到 Sable 所探索的问题空间启发（用体素碰撞形状表示可移动方块结构的刚体仿真）；
-- **没有复制 Sable 或任何 Sable 移植版本的源代码、类布局、注释文本或资源文件**；
-- 贪心体素合并、复合碰撞体、固定步长积分、插值渲染姿态等属于通用技术/公有领域思想，均从零实现。
+- Crythst 是**独立实现**。物理层的问题空间受到 Sable 启发：用体素碰撞形状表示可移动方块结构，并进行刚体仿真。
+- 本仓库**不包含**从 Sable 或任何 Sable 移植版本复制的源代码文件、注释文本或资源文件。就当前审计范围而言，未发现整文件复制或大段连续代码复制；物理后端也完全不同（Crythst 使用 Bullet / libbulletjme，Sable 使用 Rapier / Rust）。
+- 为便于迁移和兼容，**少量公共 API 名称、包结构和术语有意与 Sable 对齐**（例如 `ForceGroup`、`MassData`、`RigidBodyHandle`、`PhysicsPipeline`、约束配置、`VoxelColliderData` 等）。这些类的实现是独立的，但“完全没有类布局/命名对齐”的绝对说法并不准确。
+- 渲染批处理、section 遮挡、选择、空维度方块逻辑等部分参考了 Sable 的设计思路或命名术语；相关算法为独立实现。
+- Sable 本身使用 **PolyForm Shield License 1.0.0**（含 Noncompete 与 Required Notice）。Crythst 不包含 Sable 代码，也不以 Sable 的名义分发。若未来引入任何 Sable 代码，必须按 PolyForm Shield 处理，不能继续仅以 MIT 发布。
 
-第三方组件：
+来源审计与逐项证据见 `docs/license-audit-2026-11-22.md`。该文档是工程审计，不是法律意见。
 
-- **libbulletjme 23.2.0**：BSD 3-Clause（Java/JNI 胶水层），Bullet Physics 为 zlib 许可，V-HACD 为其 BSD 风格许可；
+### 第三方组件
+
+- **libbulletjme 23.2.0**：BSD 3-Clause（Java/JNI 胶水层）；Bullet Physics 为 zlib 许可，V-HACD 为其 BSD 风格许可；
 - **Fabric Loader / Fabric API / Fabric Loom**：Apache License 2.0；
 - **Minecraft**：Mojang/Microsoft 版权，仅作为编译/运行依赖，不随本库分发；
-- **JOML**：MIT，由 Minecraft 在运行时提供。
+- **JOML**：MIT，由 Minecraft 在运行时提供；
+- **EnderTech**：`io.mikaple.crythst.client.render` 下部分 special rendering 改编自 EnderTech，并由同一版权人重新以 MIT 授权；原 EnderTech 项目对第三方仍为 All-Rights-Reserved；
+- **Create-Fly**：仅作为 `compileOnly` 兼容性依赖，不进入运行时 jar；其代码与许可证不随 Crythst 分发。
 
 详见 [NOTICE](NOTICE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 

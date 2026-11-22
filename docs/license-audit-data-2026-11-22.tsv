@@ -1,0 +1,50 @@
+metric	value	notes
+normalized_exact_file_matches_sable	0	strip comments/imports/whitespace then SHA-256
+normalized_exact_file_matches_sable_port	0	strip comments/imports/whitespace then SHA-256
+max_token_5gram_jaccard_sable	0.060	files >=200 tokens
+max_token_5gram_jaccard_sable_port	0.071	files >=200 tokens
+pairs_over_0.05_jaccard_sable	4	files >=200 tokens
+pairs_over_0.05_jaccard_sable_port	7	files >=200 tokens
+max_line_level_matched_lines	13	raw lines incl. brace noise; StructureGather vs SubLevelAssemblyHelper
+raw_brace_only_match_example	32	StructureSavedData vs SubLevelPhysicsSystem matched lines are only closing braces
+max_nontrivial_matched_lines	9	exclude brace/punctuation/short control lines
+max_nontrivial_contiguous_match	6	generic min/max loop
+small_file_max_nontrivial_matched_lines	3	files <=120 code lines
+all_main_java_files_included	370	no size filter
+max_contiguous_line_match	6	generic min/max loop
+exact_comment_line_matches	0	comments >=35 chars
+resource_sha256_matches	0	94 Crythst resources vs 94 Sable resources
+unique_sable_string_literal_matches	0	overlaps are generic words/Minecraft API descriptors
+common_public_class_names_sable	11	see list below
+common_public_class_names_sable_port	12	see list below
+crythst_main_java_files	370	snapshot 2026-11-22; includes working tree
+crythst_main_java_lines	56305	snapshot 2026-11-22; includes working tree
+crythst_test_files	104	snapshot 2026-11-22
+crythst_test_lines	14963	snapshot 2026-11-22
+crythst_tests_passed	596	102 test classes, isolated copy
+sable_java_files	769	upstream 2.0.7
+sable_java_lines	56413	upstream 2.0.7
+sable_rust_lines	5854	Rapier
+sable_port_java_files	574	26.3 port 3.0.0
+sable_port_java_lines	49128	26.3 port 3.0.0
+
+common_class	name	ids_jaccard	line_ratio
+ForceGroup	io.mikaple.crythst.api.physics.force.ForceGroup	0.561	0.091
+RigidBodyHandle	io.mikaple.crythst.api.physics.RigidBodyHandle	0.331	0.133
+QueuedForceGroup	io.mikaple.crythst.api.physics.force.QueuedForceGroup	0.247	0.125
+MassData	io.mikaple.crythst.api.physics.MassData	0.244	0.094
+PhysicsPipeline	io.mikaple.crythst.api.physics.PhysicsPipeline	0.232	0.096
+FreeConstraintConfiguration	io.mikaple.crythst.api.physics.constraint.FreeConstraintConfiguration	0.194	0.093
+DebugRendererMixin	io.mikaple.crythst.mixin.client.DebugRendererMixin	0.194	0.278
+RotaryConstraintConfiguration	io.mikaple.crythst.api.physics.constraint.RotaryConstraintConfiguration	0.185	0.051
+FixedConstraintConfiguration	io.mikaple.crythst.api.physics.constraint.FixedConstraintConfiguration	0.162	0.108
+GenericConstraintConfiguration	io.mikaple.crythst.api.physics.constraint.GenericConstraintConfiguration	0.123	0.075
+VoxelColliderData	io.mikaple.crythst.physics.voxel.VoxelColliderData	0.098	0.020
+
+evidence_refs	path	description
+ForceGroup aliases	api/physics/force/ForceGroup.java	name()/defaultDisplayed() comments explicitly say matching Sable terminology
+StructurePhysicsContext alias	api/block/StructurePhysicsContext.java	getOrCreateForceGroup alias for forceGroup, matching Sable terminology
+Sable citation	client/render/structure/batch/SectionOcclusion.java	cites SubLevelBatchedTerrainRenderer#sable$scanVisibleSections
+Sable citation	integration/minecraft/selection/StructureSelectionIgnore.java	says equivalent of Sable's ClipContextExtension
+Sable citation	client/render/structure/batch/BatchedStructureRenderer.java	cites Sable's Option C
+Sable citation	integration/minecraft/EmptyPhysicsLevel.java	says avoids Sable-style plot

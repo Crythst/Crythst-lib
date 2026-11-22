@@ -33,3 +33,19 @@ https://github.com/stephengold/Libbulletjme/blob/master/LICENSE
 - Project: https://github.com/JOML-CI/JOML
 - License: MIT
 - Usage: public math types. JOML is provided by Minecraft at runtime.
+
+## EnderTech
+
+- Copyright (c) 2026 Mikaple.
+- Usage: portions of the special rendering under
+  `io.mikaple.crythst.client.render` are adapted from EnderTech and relicensed
+  under the MIT License by the same copyright holder.
+- The original EnderTech project remains All-Rights-Reserved for third parties.
+
+## Create-Fly
+
+- Project: https://github.com/LyXith/create-fly-fly
+- Usage: `compileOnly` compatibility dependency via JitPack.
+- It is not bundled in the runtime jar; its code and license are not
+  redistributed by Crythst.
+
