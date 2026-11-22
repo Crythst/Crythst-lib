@@ -1,6 +1,7 @@
 package io.mikaple.crythst.network.portal;
 
 import io.mikaple.crythst.Crythst;
+import io.mikaple.crythst.integration.portal.PortalAnchor;
 import io.mikaple.crythst.integration.portal.PortalPlane;
 import io.mikaple.crythst.integration.portal.PortalShape;
 import io.mikaple.crythst.integration.portal.PortalSnapshot;
@@ -60,6 +61,7 @@ public record PortalSyncPayload(long revision, List<PortalSnapshot> portals)
             buf.writeIdentifier(portal.dimension().identifier());
             writePlane(buf, portal.plane());
             writeOutline(buf, portal.shape());
+            writeAnchor(buf, portal.anchor());
             buf.writeBoolean(portal.linkedPortalId() != null);
             if (portal.linkedPortalId() != null) {
                 buf.writeUUID(portal.linkedPortalId());
@@ -70,6 +72,7 @@ public record PortalSyncPayload(long revision, List<PortalSnapshot> portals)
                     final Identifier destinationDimension =
                             portal.destinationDimension().identifier();
                     buf.writeIdentifier(destinationDimension);
+                    writeAnchor(buf, portal.destinationAnchor());
                 }
             }
         }
@@ -94,11 +97,13 @@ public record PortalSyncPayload(long revision, List<PortalSnapshot> portals)
                 final List<Vector2d> outline = readOutline(buf);
                 final PortalShape shape = outline.isEmpty()
                         ? PortalShape.rectangle(plane) : PortalShape.polygon(plane, outline);
+                final PortalAnchor anchor = readAnchor(buf);
                 final boolean linked = buf.readBoolean();
                 UUID linkedId = null;
                 PortalPlane destinationPlane = null;
                 PortalShape destinationShape = null;
                 ResourceKey<Level> destinationDimension = null;
+                PortalAnchor destinationAnchor = null;
                 if (linked) {
                     linkedId = buf.readUUID();
                     if (buf.readBoolean()) {
@@ -108,10 +113,12 @@ public record PortalSyncPayload(long revision, List<PortalSnapshot> portals)
                                 ? PortalShape.rectangle(destinationPlane)
                                 : PortalShape.polygon(destinationPlane, destinationOutline);
                         destinationDimension = readDimension(buf);
+                        destinationAnchor = readAnchor(buf);
                     }
                 }
                 portals.add(new PortalSnapshot(id, name, dimension, plane, shape, linkedId,
-                        destinationPlane, destinationShape, destinationDimension));
+                        destinationPlane, destinationShape, destinationDimension,
+                        anchor, destinationAnchor));
             }
         } catch (IllegalArgumentException error) {
             throw new DecoderException("Invalid portal snapshot", error);
@@ -173,6 +180,27 @@ public record PortalSyncPayload(long revision, List<PortalSnapshot> portals)
             outline.add(new Vector2d(buf.readDouble(), buf.readDouble()));
         }
         return List.copyOf(outline);
+    }
+
+    private static void writeAnchor(FriendlyByteBuf buf, PortalAnchor anchor) {
+        if (anchor == null) {
+            buf.writeBoolean(false);
+            return;
+        }
+        buf.writeBoolean(true);
+        buf.writeVarLong(anchor.carrierBodyId());
+        writePlane(buf, anchor.localPlane());
+    }
+
+    private static PortalAnchor readAnchor(FriendlyByteBuf buf) {
+        if (!buf.readBoolean()) {
+            return null;
+        }
+        final long carrier = buf.readVarLong();
+        if (carrier <= 0L) {
+            throw new DecoderException("Invalid portal carrier id " + carrier);
+        }
+        return new PortalAnchor(carrier, readPlane(buf));
     }
 
     private static ResourceKey<Level> readDimension(FriendlyByteBuf buf) {

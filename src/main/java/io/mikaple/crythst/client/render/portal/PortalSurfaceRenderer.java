@@ -42,7 +42,7 @@ final class PortalSurfaceRenderer {
         if (minecraft.level == null) {
             return;
         }
-        final List<PortalSnapshot> snapshots = PortalClientCache.get();
+        final List<PortalSnapshot> snapshots = PortalClientCache.effective(System.nanoTime());
         if (snapshots.isEmpty()) {
             return;
         }

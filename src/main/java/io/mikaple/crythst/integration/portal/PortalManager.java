@@ -1,18 +1,26 @@
 package io.mikaple.crythst.integration.portal;
 
 import io.mikaple.crythst.integration.fabric.portal.PortalCommand;
+import io.mikaple.crythst.integration.minecraft.LevelPhysics;
+import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
+import io.mikaple.crythst.math.Transform3d;
+import io.mikaple.crythst.physics.body.BodyHandle;
+import io.mikaple.crythst.physics.structure.PhysicsStructure;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.storage.SavedDataStorage;
+import org.joml.Vector3d;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 
 /**
@@ -107,7 +115,7 @@ public final class PortalManager {
                 }
                 try {
                     final Portal portal = new Portal(record.id(), record.name(),
-                            record.dimension(), record.shape(), record.linkedId());
+                            record.dimension(), record.shape(), record.linkedId(), record.anchor());
                     BY_NAME.put(portal.name(), portal);
                     BY_ID.put(portal.id(), portal);
                     count++;
@@ -153,7 +161,8 @@ public final class PortalManager {
             for (Portal portal : BY_NAME.values()) {
                 records.add(new PortalSavedData.StoredPortal(
                         portal.id(), portal.name(), portal.dimension(),
-                        portal.plane(), portal.linkedPortalId(), portal.shape().outline()));
+                        portal.plane(), portal.linkedPortalId(), portal.shape().outline(),
+                        portal.anchor()));
             }
             return records;
         }
@@ -249,15 +258,201 @@ public final class PortalManager {
             if (existing == null) {
                 return null;
             }
+            // An attached portal keeps riding its carrier: translate the new
+            // world plane into the carrier's local space at the pose it has
+            // right now, so the next sample reproduces this plane.
+            final PhysicsStructure carrier = carrierStructure(existing);
+            final PortalAnchor anchor = existing.anchor() == null || carrier == null
+                    ? existing.anchor()
+                    : PortalAnchor.at(carrier.body().id(), newPlane, carrier.pose());
             final Portal moved = new Portal(existing.id(), existing.name(),
                     existing.dimension(), existing.shape().withPlane(newPlane),
-                    existing.linkedPortalId());
+                    existing.linkedPortalId(), anchor);
             BY_NAME.put(moved.name(), moved);
             BY_ID.put(moved.id(), moved);
             revision++;
             markDirty();
             return moved;
         }
+    }
+
+    /**
+     * Binds a portal to a moving physics structure without moving it.
+     *
+     * <p>The plane the portal occupies right now becomes the anchor's local
+     * plane, so the opening does not jump on attach. From then on the world
+     * plane follows {@code carrier.pose()} — including rotation.</p>
+     *
+     * @return the updated portal, or {@code null} when no portal has that name
+     */
+    public static Portal attach(String name, PhysicsStructure carrier) {
+        Objects.requireNonNull(carrier, "carrier");
+        synchronized (LOCK) {
+            final Portal existing = BY_NAME.get(name);
+            if (existing == null) {
+                return null;
+            }
+            final PortalPlane worldPlane = planeOf(existing);
+            final PortalAnchor anchor =
+                    PortalAnchor.at(carrier.body().id(), worldPlane, carrier.pose());
+            final Portal attached = new Portal(existing.id(), existing.name(),
+                    existing.dimension(), existing.shape().withPlane(worldPlane),
+                    existing.linkedPortalId(), anchor);
+            BY_NAME.put(attached.name(), attached);
+            BY_ID.put(attached.id(), attached);
+            revision++;
+            markDirty();
+            return attached;
+        }
+    }
+
+    /**
+     * Freezes an attached portal at its current world plane and drops the
+     * carrier binding.
+     *
+     * @return the updated portal, or {@code null} when no portal has that name
+     */
+    public static Portal detach(String name) {
+        synchronized (LOCK) {
+            final Portal existing = BY_NAME.get(name);
+            if (existing == null) {
+                return null;
+            }
+            final PortalPlane frozen = planeOf(existing);
+            final Portal detached = new Portal(existing.id(), existing.name(),
+                    existing.dimension(), existing.shape().withPlane(frozen),
+                    existing.linkedPortalId(), (PortalAnchor) null);
+            BY_NAME.put(detached.name(), detached);
+            BY_ID.put(detached.id(), detached);
+            revision++;
+            markDirty();
+            return detached;
+        }
+    }
+
+    /**
+     * The world plane of a portal right now.
+     *
+     * <p>For a static portal this is {@link Portal#plane()}. For an attached
+     * portal it is sampled from the carrier pose, and the stored plane is used
+     * only while the carrier is not loaded.</p>
+     */
+    public static PortalPlane planeOf(Portal portal) {
+        if (portal == null) {
+            return null;
+        }
+        final PortalAnchor anchor = portal.anchor();
+        if (anchor == null) {
+            return portal.plane();
+        }
+        final PhysicsStructure carrier = carrierStructure(portal);
+        return carrier == null ? portal.plane() : anchor.worldPlane(carrier.pose());
+    }
+
+    /** The live opening of a portal: its outline re-expressed on the live plane. */
+    public static PortalShape shapeOf(Portal portal) {
+        if (portal == null) {
+            return null;
+        }
+        return portal.shape().withPlane(planeOf(portal));
+    }
+
+    /**
+     * The structure carrying this portal, or {@code null} for a static portal
+     * and for an attached portal whose carrier is not currently simulated.
+     */
+    public static PhysicsStructure carrierStructure(Portal portal) {
+        if (portal == null) {
+            return null;
+        }
+        final PortalAnchor anchor = portal.anchor();
+        if (anchor == null) {
+            return null;
+        }
+        final LevelPhysics physics = physicsFor(portal.dimension());
+        if (physics == null) {
+            return null;
+        }
+        for (PhysicsStructure structure : physics.structures()) {
+            if (structure.body().id() == anchor.carrierBodyId()) {
+                return structure;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * World-space velocity of the portal's carrier material point at
+     * {@code worldPoint}, or a zero vector for a static portal.
+     *
+     * <p>The teleporter subtracts the entry carrier velocity and adds the exit
+     * carrier velocity so an entity that steps off a moving platform arrives
+     * with the destination platform's motion instead of being flung.</p>
+     */
+    public static Vector3d carrierVelocity(Portal portal, Vector3d worldPoint) {
+        final Vector3d result = new Vector3d();
+        final PhysicsStructure carrier = carrierStructure(portal);
+        if (carrier == null) {
+            return result;
+        }
+        final BodyHandle body = carrier.body();
+        result.set(body.linearVelocity());
+        final Vector3d angular = body.angularVelocity();
+        if (angular.lengthSquared() > 1.0e-9) {
+            final Vector3d offset = new Vector3d(worldPoint).sub(body.transform().position());
+            result.add(new Vector3d(angular).cross(offset));
+        }
+        return result;
+    }
+
+    private static LevelPhysics physicsFor(ResourceKey<Level> dimension) {
+        final MinecraftServer server = activeServer;
+        if (server == null || dimension == null) {
+            return null;
+        }
+        final ServerLevel level = server.getLevel(dimension);
+        return level == null ? null : MinecraftPhysics.getIfPresent(level);
+    }
+
+    /**
+     * Finds the structure whose simulated origin is closest to {@code position}.
+     *
+     * <p>Used by {@code /crythst portal attach} when no body id is given. The
+     * comparison uses the structure body origin, not its cell bounds, which is
+     * good enough for a command helper.</p>
+     *
+     * @return the closest structure within {@code maxDistance}, or {@code null}
+     */
+    public static PhysicsStructure nearestStructure(ResourceKey<Level> dimension,
+                                                     Vector3d position, double maxDistance) {
+        final LevelPhysics physics = physicsFor(dimension);
+        if (physics == null || position == null) {
+            return null;
+        }
+        PhysicsStructure best = null;
+        double bestSquared = maxDistance <= 0.0 ? Double.MAX_VALUE : maxDistance * maxDistance;
+        for (PhysicsStructure structure : physics.structures()) {
+            final double distance = structure.pose().position().distanceSquared(position);
+            if (distance <= bestSquared) {
+                bestSquared = distance;
+                best = structure;
+            }
+        }
+        return best;
+    }
+
+    /** The structure with this body id in {@code dimension}, or {@code null}. */
+    public static PhysicsStructure structureByBody(ResourceKey<Level> dimension, long bodyId) {
+        final LevelPhysics physics = physicsFor(dimension);
+        if (physics == null) {
+            return null;
+        }
+        for (PhysicsStructure structure : physics.structures()) {
+            if (structure.body().id() == bodyId) {
+                return structure;
+            }
+        }
+        return null;
     }
 
     /** Moves a portal and replaces its opening shape. */
@@ -268,7 +463,7 @@ public final class PortalManager {
                 return null;
             }
             final Portal moved = new Portal(existing.id(), existing.name(),
-                    existing.dimension(), newShape, existing.linkedPortalId());
+                    existing.dimension(), newShape, existing.linkedPortalId(), existing.anchor());
             BY_NAME.put(moved.name(), moved);
             BY_ID.put(moved.id(), moved);
             revision++;
@@ -339,7 +534,7 @@ public final class PortalManager {
         synchronized (LOCK) {
             final List<PortalSnapshot> result = new ArrayList<>(BY_NAME.size());
             for (Portal portal : BY_NAME.values()) {
-                result.add(PortalSnapshot.of(portal, BY_ID.get(portal.linkedPortalId())));
+                result.add(resolvedSnapshot(portal, BY_ID.get(portal.linkedPortalId())));
             }
             return List.copyOf(result);
         }
@@ -350,11 +545,27 @@ public final class PortalManager {
             final List<PortalSnapshot> result = new ArrayList<>();
             for (Portal portal : BY_NAME.values()) {
                 if (portal.dimension().equals(dimension)) {
-                    result.add(PortalSnapshot.of(portal, BY_ID.get(portal.linkedPortalId())));
+                    result.add(resolvedSnapshot(portal, BY_ID.get(portal.linkedPortalId())));
                 }
             }
             return List.copyOf(result);
         }
+    }
+
+    /**
+     * Snapshot with live planes for attached portals. The anchors are kept so
+     * the client can keep re-sampling them at frame rate; only the planes are
+     * resolved here for the very first frame after a sync.
+     */
+    private static PortalSnapshot resolvedSnapshot(Portal portal, Portal destination) {
+        final PortalSnapshot raw = PortalSnapshot.of(portal, destination);
+        if (!raw.moving()) {
+            return raw;
+        }
+        return raw.withPlanes(
+                planeOf(portal), shapeOf(portal),
+                destination == null ? null : planeOf(destination),
+                destination == null ? null : shapeOf(destination));
     }
 
     public static int size() {

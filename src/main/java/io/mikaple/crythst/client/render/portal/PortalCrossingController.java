@@ -80,7 +80,7 @@ public final class PortalCrossingController {
                 centre.y - (player.getY() - player.yo),
                 centre.z - (player.getZ() - player.zo));
 
-        final List<PortalSnapshot> snapshots = PortalClientCache.get();
+        final List<PortalSnapshot> snapshots = PortalClientCache.effective(System.nanoTime());
         for (PortalSnapshot portal : snapshots) {
             if (!portal.dimension().equals(minecraft.level.dimension())
                     || !portal.linked()

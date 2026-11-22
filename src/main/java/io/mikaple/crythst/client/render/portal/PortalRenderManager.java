@@ -159,7 +159,7 @@ public final class PortalRenderManager {
             return;
         }
         final CameraRenderState mainCamera = mainState.cameraRenderState;
-        final List<PortalSnapshot> snapshots = PortalClientCache.get();
+        final List<PortalSnapshot> snapshots = PortalClientCache.effective(lastExtractStartNanos);
         if (snapshots.isEmpty()) {
             layers = List.of();
             lastVisiblePortals = 0;
@@ -284,7 +284,7 @@ public final class PortalRenderManager {
         final Vector3d parentPosition = new Vector3d(
                 parentCamera.pos.x, parentCamera.pos.y, parentCamera.pos.z);
         final Set<UUID> ancestors = Set.of(parent.id());
-        for (PortalSnapshot portal : PortalClientCache.get()) {
+        for (PortalSnapshot portal : PortalClientCache.effective(lastExtractStartNanos)) {
             if (rendered.contains(portal.id())
                     || !portal.dimension().equals(level.dimension())
                     || !portal.viewableIn(level.dimension())) {

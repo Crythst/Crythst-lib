@@ -108,7 +108,7 @@ public final class PortalTeleportFade {
         final Vector3d current = new Vector3d(eye.x, eye.y, eye.z);
         final Vector3d previous = new Vector3d(
                 player.xo, player.yo + player.getEyeHeight(), player.zo);
-        for (PortalSnapshot snapshot : PortalClientCache.get()) {
+        for (PortalSnapshot snapshot : PortalClientCache.effective(System.nanoTime())) {
             if (!snapshot.dimension().equals(minecraft.level.dimension())) {
                 continue;
             }

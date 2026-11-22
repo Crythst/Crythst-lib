@@ -451,7 +451,9 @@ stencil attachment 参数。因此本项目使用 **mask attachment + composite*
 - 玩家/普通实体/投射物 swept 穿越、载具乘客、物理体 pose/速度/角速度、跨维度实体传送；
 - 10 tick 冷却与出口防回穿；
 - 多人完整快照同步（含 shape/link/pose）；
-- `PortalManager.move` 移动传送门；
+- `PortalManager.move` 移动传送门，以及 `PortalManager.attach`/`detach` 与
+  `PortalAnchor` 的每 tick/每帧自动跟随（服务端用 `PhysicsStructure#pose()`，
+  客户端用 `ClientStructureCache#interpolatedPose`）；
 - 跨维度**传送**（实体）。
 
 未实现 / 受限：
@@ -463,8 +465,9 @@ stencil attachment 参数。因此本项目使用 **mask attachment + composite*
 - **OIT / see-through / always-on-top**：目标 pass 只走 classic opaque/translucent
   和 solid/translucent/after-terrain feature phase；未复制高级透明阶段。
 - **方块破坏覆盖、transient block、目标端 gizmo**：未提交。
-- **移动传送门自动绑定**：`PortalManager.move` 已可用，但没有每 tick 自动跟随
-  `PhysicsStructure` 载具的绑定层。
+- **移动传送门自动绑定**：已实现（`PortalAnchor`：载体 body id + 载体局部平面；
+  服务端每 tick、客户端每帧采样载体位姿）；`/crythst portal attach|detach` 控制绑定。
+  载体内部的相对速度继承与跨维度载体仍是后续工作。
 - **跨维度物理体**：物理世界按维度独立，当前跳过跨维度物理体。
 - **水/拴绳细节**：跨维度传送会解除拴绳；同维度保留，交由 vanilla leash tick。
 - **游戏内自动测试/截图回归**：本仓库没有 Fabric client-gametest，且本次未运行
@@ -482,6 +485,6 @@ stencil attachment 参数。因此本项目使用 **mask attachment + composite*
 2. 把目标 sky/cloud 改成接受 `RenderPass.RenderArea` 的 scoped pass，去掉全屏 snapshot。
 3. 若 RenderPearl 后续暴露 stencil state，把 mask 层替换为真正的 stencil 层栈。
 4. 目标 pass 补齐 OIT、see-through、always-on-top、block breaking、transient blocks。
-5. 为移动传送门增加 `PhysicsStructure` 每 tick pose 绑定。
+5. ~~为移动传送门增加 `PhysicsStructure` 每 tick pose 绑定~~（已实现，见第 9 节）；
 6. 添加 Fabric client gametest：固定 A/B portal，逐帧记录相机位置并断言无 >0.5 格跳变，
    洞口内截图包含目标端独有方块、洞口外像素不变。

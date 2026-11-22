@@ -197,8 +197,18 @@ authoritative `player.connection.teleport(...)` correction.
   notice, not a target position.
 - `PortalManager.move(name, plane)` updates the pose without changing the UUID
   or link; clients receive the new pose in the next full snapshot.
-- A moving carrier (physics structure/script) must call `move`; automatic
-  per-tick binding to a `PhysicsStructure` is not wired yet.
+- A moving carrier is bound with `PortalManager.attach(name, structure)` (or
+  `/crythst portal attach <name> [bodyId]`). The portal then stores a
+  `PortalAnchor` — the carrier body id plus the plane in the carrier's local
+  space — instead of an absolute plane. Nothing is re-broadcast per tick: the
+  server resolves the world plane from `PhysicsStructure#pose()` at teleport
+  time, and the client resolves it from
+  `ClientStructureCache#interpolatedPose(bodyId, nowNanos)` once per frame
+  through `PortalClientCache.effective(nowNanos)`. `detach` freezes the portal
+  at its current world plane.
+- The carrier bodies themselves are never teleported by their own portals, and
+  an entity stepping out of a carried portal inherits the exit carrier's
+  velocity so it is not left behind.
 
 ## 8. Feature flags
 

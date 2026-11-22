@@ -26,6 +26,7 @@ public final class Portal {
     private final ResourceKey<Level> dimension;
     private final PortalPlane plane;
     private final PortalShape shape;
+    private final PortalAnchor anchor;
     private volatile UUID linkedPortalId;
 
     public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane) {
@@ -39,17 +40,28 @@ public final class Portal {
 
     public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalShape shape,
                   UUID linkedPortalId) {
-        this(id, name, dimension, shape.plane(), shape, linkedPortalId);
+        this(id, name, dimension, shape.plane(), shape, linkedPortalId, null);
+    }
+
+    public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalShape shape,
+                  UUID linkedPortalId, PortalAnchor anchor) {
+        this(id, name, dimension, shape.plane(), shape, linkedPortalId, anchor);
     }
 
     public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane,
                   PortalShape shape, UUID linkedPortalId) {
+        this(id, name, dimension, plane, shape, linkedPortalId, null);
+    }
+
+    public Portal(UUID id, String name, ResourceKey<Level> dimension, PortalPlane plane,
+                  PortalShape shape, UUID linkedPortalId, PortalAnchor anchor) {
         this.id = Objects.requireNonNull(id, "id");
         this.name = validateName(name);
         this.dimension = Objects.requireNonNull(dimension, "dimension");
         this.plane = Objects.requireNonNull(plane, "plane");
         this.shape = Objects.requireNonNull(shape, "shape");
         this.linkedPortalId = linkedPortalId;
+        this.anchor = anchor;
     }
 
     private static String validateName(String name) {
@@ -87,6 +99,24 @@ public final class Portal {
     /** Linked portal id, or {@code null} when unlinked. */
     public UUID linkedPortalId() {
         return linkedPortalId;
+    }
+
+    /**
+     * The moving carrier of this portal, or {@code null} for a static portal.
+     *
+     * <p>When an anchor is present {@link #plane()} is only the pose the portal
+     * was last published with; the live world plane has to be sampled from the
+     * carrier through {@link PortalAnchor#worldPlane}. Use
+     * {@code PortalManager#planeOf(Portal)} on the server and the resolved
+     * snapshot on the client.</p>
+     */
+    public PortalAnchor anchor() {
+        return anchor;
+    }
+
+    /** True when this portal rides on a moving physics structure. */
+    public boolean attached() {
+        return anchor != null;
     }
 
     public boolean linked() {

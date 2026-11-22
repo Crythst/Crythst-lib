@@ -139,10 +139,16 @@ public final class PortalTeleporter {
                 || !Float.isFinite(payload.yaw()) || !Float.isFinite(payload.pitch())) {
             return;
         }
+        // A carried portal has no fixed plane: everything below must use the
+        // live pose, otherwise the prediction check would fight the carrier.
+        final PortalPlane entryPlane = PortalManager.planeOf(portal);
+        final PortalPlane exitPlane = PortalManager.planeOf(destination);
+        final PortalShape entryShape = portal.shape().withPlane(entryPlane);
+
         // The samples must be close to the entry opening, and the eye must be
         // consistent with the body centre. This bounds both replay and spoofing.
-        if (portal.plane().distanceSquared(payload.currentCentre()) > 64.0
-                || portal.plane().distanceSquared(payload.previousCentre()) > 64.0
+        if (entryPlane.distanceSquared(payload.currentCentre()) > 64.0
+                || entryPlane.distanceSquared(payload.previousCentre()) > 64.0
                 || payload.eye().distanceSquared(payload.currentCentre()) > 16.0) {
             return;
         }
@@ -161,9 +167,9 @@ public final class PortalTeleporter {
         final Vector3d serverPrevious = previousTraversalPoint(player);
         final Vector3d serverCurrent = traversalPoint(player);
         final PortalCrossing.Crossing serverCrossing = PortalCrossing.findCrossing(
-                portal.shape(), serverPrevious, serverCurrent);
+                entryShape, serverPrevious, serverCurrent);
         final PortalCrossing.Crossing clientCrossing = PortalCrossing.findCrossing(
-                portal.shape(), payload.previousCentre(), payload.currentCentre());
+                entryShape, payload.previousCentre(), payload.currentCentre());
         final boolean serverInside = serverCrossing != null && serverCrossing.inside();
         final boolean clientInside = clientCrossing != null && clientCrossing.inside();
         final Vec3 serverCentre = player.getBoundingBox().getCenter();
@@ -182,7 +188,7 @@ public final class PortalTeleporter {
             return;
         }
         final PortalTransform transform =
-                PortalTransform.between(portal.plane(), destination.plane());
+                PortalTransform.between(entryPlane, exitPlane);
         // Placement, velocity and rotation come from the server player, never
         // from a client-supplied target vector.
         final Vec3 serverEyePos = player.getEyePosition();
@@ -201,6 +207,13 @@ public final class PortalTeleporter {
         final double speedSquared = velocity.lengthSquared();
         if (speedSquared > MAX_CLIENT_TRAVERSAL_SPEED_SQUARED) {
             velocity.mul(MAX_CLIENT_TRAVERSAL_SPEED / Math.sqrt(speedSquared));
+        }
+        // Stepping out of a moving carrier's portal must not drop the platform's
+        // motion, or the player is left behind at the exit.
+        final Vector3d exitCarrierVelocity = PortalManager.carrierVelocity(
+                destination, new Vector3d(feet.x, feet.y, feet.z));
+        if (exitCarrierVelocity.lengthSquared() > 1.0e-6) {
+            velocity.add(exitCarrierVelocity);
         }
         final float[] rotation = PortalTransform.yawPitch(transform.transformDirection(
                 PortalTransform.viewDirection(player.getYRot(), player.getXRot())));
@@ -269,9 +282,17 @@ public final class PortalTeleporter {
                     continue;
                 }
 
+                // A portal that rides a physics structure has no fixed plane:
+                // sample the live carrier pose instead of the stored plane, so a
+                // crossing is tested against the pose the solver just produced.
+                final PortalPlane entryPlane = PortalManager.planeOf(portal);
+                final PortalPlane exitPlane = PortalManager.planeOf(destination);
+                final PortalShape entryShape = portal.shape().withPlane(entryPlane);
+                final PortalShape exitShape = destination.shape().withPlane(exitPlane);
+
                 // One rigid transform preserves the local direction of travel.
                 final PortalTransform transform =
-                        PortalTransform.between(portal.plane(), destination.plane());
+                        PortalTransform.between(entryPlane, exitPlane);
 
                 // Entities first: they are cheap and keep the player experience
                 // consistent even when the physics backend is unavailable.
@@ -284,11 +305,11 @@ public final class PortalTeleporter {
                     final Vector3d beforePoint = previousTraversalPoint(entity);
                     final Vector3d afterPoint = traversalPoint(entity);
                     final PortalCrossing.Crossing crossing =
-                            PortalCrossing.findCrossing(portal.shape(), beforePoint, afterPoint);
+                            PortalCrossing.findCrossing(entryShape, beforePoint, afterPoint);
                     final Integer ready = ENTITY_READY.get(entity.getUUID());
                     final boolean cooldown = ready != null && tick < ready;
                     final boolean nearPlayer = entity instanceof ServerPlayer
-                            && portal.plane().distanceSquared(afterPoint)
+                            && entryPlane.distanceSquared(afterPoint)
                             <= NEAR_PLAYER_LOG_DISTANCE_SQUARED;
 
                     String result = "no crossing";
@@ -299,7 +320,8 @@ public final class PortalTeleporter {
                         result = "cooldown";
                     } else if (crossing != null) {
                         teleported = teleportEntity(
-                                entity, level, destination, destinationLevel, transform, crossing);
+                                entity, level, destination, destinationLevel, transform,
+                                entryPlane, exitShape, crossing);
                         if (teleported) {
                             teleportedEntities.add(entity.getUUID());
                             ENTITY_READY.put(entity.getUUID(), tick + COOLDOWN_TICKS);
@@ -310,7 +332,7 @@ public final class PortalTeleporter {
                     }
 
                     if (nearPlayer) {
-                        logNearPlayerAttempt(portal, (ServerPlayer) entity,
+                        logNearPlayerAttempt(portal, entryPlane, (ServerPlayer) entity,
                                 crossing, beforePoint, afterPoint,
                                 cooldown, true, result);
                     } else if (crossing != null) {
@@ -322,8 +344,8 @@ public final class PortalTeleporter {
                 if (!destination.dimension().equals(level.dimension())) {
                     continue;
                 }
-                teleportBodies(level, portal, destination, transform, tick,
-                        teleportedBodies);
+                teleportBodies(level, portal, destination, entryPlane, entryShape,
+                        exitPlane, exitShape, transform, tick, teleportedBodies);
             }
         }
     }
@@ -353,7 +375,7 @@ public final class PortalTeleporter {
                 crossing.inside(), crossing.frontToBack(), result);
     }
 
-    private static void logNearPlayerAttempt(Portal portal, ServerPlayer player,
+    private static void logNearPlayerAttempt(Portal portal, PortalPlane plane, ServerPlayer player,
                                              PortalCrossing.Crossing crossing,
                                              Vector3d beforePoint, Vector3d afterPoint,
                                              boolean cooldown, boolean linkResolved,
@@ -365,7 +387,6 @@ public final class PortalTeleporter {
         }
         PLAYER_ATTEMPT_LOG.put(player.getUUID(), now);
 
-        final PortalPlane plane = portal.plane();
         final Vec3 eye = player.getEyePosition();
         final boolean eyeInside = plane.contains(
                 new Vector3d(eye.x, eye.y, eye.z), PLANE_THICKNESS);
@@ -413,7 +434,9 @@ public final class PortalTeleporter {
 
     private static boolean teleportEntity(Entity entity, ServerLevel level,
                                           Portal destination, ServerLevel destinationLevel,
-                                          PortalTransform transform, PortalCrossing.Crossing crossing) {
+                                          PortalTransform transform, PortalPlane entryPlane,
+                                          PortalShape exitShape,
+                                          PortalCrossing.Crossing crossing) {
         final Vector3d velocity = new Vector3d(
                 entity.getDeltaMovement().x,
                 entity.getDeltaMovement().y,
@@ -438,8 +461,17 @@ public final class PortalTeleporter {
             final Vector3d entryLocal = transform.entry().local(
                     new Vector3d(entity.getX(), entity.getY(), entity.getZ()));
             target.add(PortalTeleportMath.exitBias(
-                    destination.shape().plane(), transformedVelocity, entryLocal)
+                    exitShape.plane(), transformedVelocity, entryLocal)
                     .mul(ENTITY_EXIT_OFFSET));
+        }
+
+        // A portal riding a moving carrier hands its own motion to whatever
+        // steps out of it. Without this, an entity that crossed the portal of a
+        // moving platform would arrive with the platform's velocity missing
+        // and get left behind (or flung) at the exit.
+        final Vector3d exitCarrierVelocity = PortalManager.carrierVelocity(destination, target);
+        if (exitCarrierVelocity.lengthSquared() > 1.0e-6) {
+            transformedVelocity.add(exitCarrierVelocity);
         }
 
         final double fallDistance = entity.fallDistance;
@@ -544,6 +576,8 @@ public final class PortalTeleporter {
     }
 
     private static void teleportBodies(ServerLevel level, Portal portal, Portal destination,
+                                       PortalPlane entryPlane, PortalShape entryShape,
+                                       PortalPlane exitPlane, PortalShape exitShape,
                                        PortalTransform transform, int tick,
                                        Set<String> teleportedBodies) {
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(level);
@@ -551,12 +585,21 @@ public final class PortalTeleporter {
             return;
         }
 
+        // The carriers themselves must never be treated as travellers: a portal
+        // carried by structure S would otherwise teleport S through itself.
+        final PortalAnchor entryAnchor = portal.anchor();
+        final PortalAnchor exitAnchor = destination.anchor();
+
         final List<BodyHandle> bodies = List.copyOf(physics.world().bodies());
         for (BodyHandle body : bodies) {
             if (body.userData() instanceof TerrainBody
                     || body.type() == BodyType.STATIC
                     || body.removeRequested()
                     || !body.inWorld()) {
+                continue;
+            }
+            if (entryAnchor != null && entryAnchor.matches(body.id())
+                    || exitAnchor != null && exitAnchor.matches(body.id())) {
                 continue;
             }
 
@@ -569,11 +612,11 @@ public final class PortalTeleporter {
             final boolean inside;
             if (previous != null && tick - previous.tick() <= 2) {
                 final PortalCrossing.Crossing crossing = PortalCrossing.findCrossing(
-                        portal.shape(), previous.centre(), centre);
+                        entryShape, previous.centre(), centre);
                 crossed = crossing != null;
                 inside = crossing != null && crossing.inside();
             } else {
-                crossed = portal.shape().contains(centre, PLANE_THICKNESS);
+                crossed = entryShape.contains(centre, PLANE_THICKNESS);
                 inside = crossed;
             }
             if (!crossed || !inside) {
@@ -591,11 +634,18 @@ public final class PortalTeleporter {
 
             final Vector3d linear = transform.transformDirection(new Vector3d(body.linearVelocity()));
             final Vector3d angular = transform.transformDirection(new Vector3d(body.angularVelocity()));
+            // A body leaving a moving carrier inherits the exit carrier's motion,
+            // the same way an entity does.
+            final Vector3d exitCarrierVelocity = PortalManager.carrierVelocity(
+                    destination, transform.transformPoint(centre));
+            if (exitCarrierVelocity.lengthSquared() > 1.0e-6) {
+                linear.add(exitCarrierVelocity);
+            }
             final Vector3d gravityOverride = body.gravityOverride();
             final Vector3d transformedGravity = gravityOverride == null ? null
                     : transform.transformDirection(gravityOverride);
             final Vector3d push = PortalTeleportMath.exitBias(
-                    destination.shape().plane(), linear, portal.plane().local(centre));
+                    exitShape.plane(), linear, entryPlane.local(centre));
 
             final PhysicsStructure structure = body.userData() instanceof PhysicsStructure s ? s : null;
 

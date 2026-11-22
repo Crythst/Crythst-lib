@@ -40,10 +40,12 @@ public final class PortalSavedData extends SavedData {
             CompoundTag.CODEC.xmap(PortalSavedData::new, PortalSavedData::tag),
             DataFixTypes.LEVEL);
 
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
     private static final String KEY_VERSION = "version";
     private static final String KEY_PORTALS = "portals";
     private static final String KEY_OUTLINE = "outline";
+    private static final String KEY_ANCHOR = "anchor";
+    private static final String KEY_CARRIER = "carrier";
     private static final int MAX_OUTLINE_POINTS = 64;
 
     private CompoundTag data;
@@ -123,7 +125,38 @@ public final class PortalSavedData extends SavedData {
         }
         final PortalPlane plane = new PortalPlane(origin, normal, right, width, height);
         final UUID linked = parseUuid(entry.getStringOr("linked", ""));
-        return new StoredPortal(id, name, dimension, plane, linked, outline);
+        final PortalAnchor anchor = legacyDirection ? null : readAnchor(entry);
+        return new StoredPortal(id, name, dimension, plane, linked, outline, anchor);
+    }
+
+    /**
+     * Reads the optional moving-carrier binding. Version-4 files written by a
+     * static-only server have no {@code anchor} tag at all.
+     */
+    private static PortalAnchor readAnchor(CompoundTag entry) {
+        if (!entry.contains(KEY_ANCHOR)) {
+            return null;
+        }
+        final CompoundTag anchor = entry.getCompoundOrEmpty(KEY_ANCHOR);
+        final long carrier = anchor.getLongOr(KEY_CARRIER, 0L);
+        if (carrier <= 0L) {
+            return null;
+        }
+        final Vector3d origin = readVector(anchor, "o");
+        final Vector3d normal = readVector(anchor, "n");
+        final Vector3d right = readVector(anchor, "r");
+        final double width = anchor.getDoubleOr("width", Double.NaN);
+        final double height = anchor.getDoubleOr("height", Double.NaN);
+        if (!isFinite(origin) || !isFinite(normal) || !isFinite(right)
+                || !Double.isFinite(width) || !Double.isFinite(height)) {
+            return null;
+        }
+        try {
+            return new PortalAnchor(carrier,
+                    new PortalPlane(origin, normal, right, width, height));
+        } catch (IllegalArgumentException error) {
+            return null;
+        }
     }
 
     private static List<Vector2d> readOutline(CompoundTag entry) {
@@ -197,6 +230,18 @@ public final class PortalSavedData extends SavedData {
             if (portal.linkedId() != null) {
                 entry.putString("linked", portal.linkedId().toString());
             }
+            if (portal.anchor() != null) {
+                final PortalAnchor anchor = portal.anchor();
+                final PortalPlane local = anchor.localPlane();
+                final CompoundTag anchorTag = new CompoundTag();
+                anchorTag.putLong(KEY_CARRIER, anchor.carrierBodyId());
+                writeVector(anchorTag, "o", local.origin());
+                writeVector(anchorTag, "n", local.normal());
+                writeVector(anchorTag, "r", local.right());
+                anchorTag.putDouble("width", local.width());
+                anchorTag.putDouble("height", local.height());
+                entry.put(KEY_ANCHOR, anchorTag);
+            }
             list.add(entry);
         }
         root.put(KEY_PORTALS, list);
@@ -211,17 +256,29 @@ public final class PortalSavedData extends SavedData {
 
     /**
      * One persisted portal definition.
+     *
+     * <p>{@code anchor} is the optional moving-carrier binding. It lives in the
+     * saved data instead of being recomputed so a restart reattaches the portal
+     * to the same physics body even if the carrier moved while the world was
+     * unloaded.</p>
      */
     public record StoredPortal(UUID id, String name, ResourceKey<Level> dimension,
-                               PortalPlane plane, UUID linkedId, List<Vector2d> outline) {
+                               PortalPlane plane, UUID linkedId, List<Vector2d> outline,
+                               PortalAnchor anchor) {
         public StoredPortal {
             outline = outline == null ? List.of() : List.copyOf(outline);
         }
 
-        /** Version-1 compatible constructor: rectangular opening. */
+        /** Version-1/2 compatible constructor: rectangular static opening. */
         public StoredPortal(UUID id, String name, ResourceKey<Level> dimension,
                             PortalPlane plane, UUID linkedId) {
-            this(id, name, dimension, plane, linkedId, List.of());
+            this(id, name, dimension, plane, linkedId, List.of(), null);
+        }
+
+        /** Version-3 compatible constructor: shaped static opening. */
+        public StoredPortal(UUID id, String name, ResourceKey<Level> dimension,
+                            PortalPlane plane, UUID linkedId, List<Vector2d> outline) {
+            this(id, name, dimension, plane, linkedId, outline, null);
         }
 
         /** Applies the persisted outline when one exists. */
