@@ -11,6 +11,8 @@
 - 平台：Windows / macOS / Linux（x86_64、arm64）+ Android（FCL、PojavLauncher 等）
 
 > 功能模组可以把 Crythst 作为底层依赖，只取需要的模块；也可以同时使用物理结构、渲染、交互和同步，构建“会移动/会倒塌/可交互的方块世界”。
+>
+> 代码谱系上，Crythst 位于 **Sable（上游）→ sable-port（中游）→ Crythst（下游）** 这条链的末端；它不是前两者的 fork，也不把它们的代码作为依赖。详见 [上中下游关系](#上中下游关系)。
 
 ## 30 秒了解 Crythst
 
@@ -38,10 +40,11 @@ Crythst 不提供：
 ### 新读者阅读顺序
 
 1. 先看下面的 [快速开始](#快速开始)，把库跑起来；
-2. 读 [docs/architecture.md](docs/architecture.md) 了解服务端/客户端、物理世界和渲染的分层；
-3. 做功能模组时看 [docs/api.md](docs/api.md) 和 [docs/api-cookbook.md](docs/api-cookbook.md)；
-4. 做移动结构玩法时看 [docs/player-structure-interaction.md](docs/player-structure-interaction.md)、[docs/entity-physics-collision.md](docs/entity-physics-collision.md) 和 [docs/void-level-ticking.md](docs/void-level-ticking.md)；
-5. 评估 Sable / Create Aeronautics 兼容性时看 [API_GAP_ANALYSIS.md](API_GAP_ANALYSIS.md)。
+2. 读 [上中下游关系](#上中下游关系)，明确上游 Sable / 中游 sable-port / 下游 Crythst 的边界与许可证；
+3. 读 [docs/architecture.md](docs/architecture.md) 了解服务端/客户端、物理世界和渲染的分层；
+4. 做功能模组时看 [docs/api.md](docs/api.md) 和 [docs/api-cookbook.md](docs/api-cookbook.md)；
+5. 做移动结构玩法时看 [docs/player-structure-interaction.md](docs/player-structure-interaction.md)、[docs/entity-physics-collision.md](docs/entity-physics-collision.md) 和 [docs/void-level-ticking.md](docs/void-level-ticking.md)；
+6. 评估 Sable / Create Aeronautics 兼容性时看 [API_GAP_ANALYSIS.md](API_GAP_ANALYSIS.md)。
 
 ## 关键概念
 
@@ -54,21 +57,23 @@ Crythst 不提供：
 | 辅助 void level | 每个宿主维度懒创建的真实 `ServerLevel`，保存结构方块副本并运行原版方块逻辑 |
 | 客户端快照 | 多人环境下客户端拿到的只读结构/姿态数据，用于渲染、选择和预测 |
 
-## 与 Sable / sable-port 的关系
+## 上中下游关系
 
-Crythst 是**独立实现**，不是 Sable 或 sable-port 的 fork，也不包含它们的代码。
+Crythst 位于 **Sable → sable-port → Crythst** 的生态下游，但它不是前两者的 fork，也不依赖它们的代码。
 
-- **Sable** 是上游项目，探索“可移动方块结构的刚体仿真”，使用 **PolyForm Shield License 1.0.0**。
-- **sable-port** 是 Sable 面向 Fabric 的移植/适配版本，同样使用 **PolyForm Shield License 1.0.0**。
-- **sable-port 与 Crythst 由同一作者（mikaple）维护**。这解释了少量 API 名称/术语对齐的由来：作者可以在自己拥有版权的代码与 API 设计之间做迁移和兼容。  
-  但这一事实**不改变 Sable 上游代码的 PolyForm Shield 条款**；Crythst 仍然不复制 Sable 或 sable-port 的源代码、注释或资源。
-- Crythst 的设计问题空间受到二者启发；批量渲染、section 遮挡、选择、辅助方块逻辑等部分参考了其思路和术语，但代码独立实现。
-- 本仓库未复制 Sable/sable-port 的源代码、注释或资源文件；当前审计未发现整文件或大段连续代码复制。
-- 少量公共 API 名称、包结构和术语有意对齐（如 `ForceGroup`、`MassData`、`RigidBodyHandle`、`PhysicsPipeline`、约束配置、`VoxelColliderData`），这些类的实现是独立的。
-- Crythst 不提供 `dev.ryanhcode.sable.*` 兼容包；面向 Sable 的模组需要按 Crythst API 移植。
-- 若未来引入任何 Sable/sable-port 代码，必须按 PolyForm Shield 处理，不能继续仅以 MIT 发布。
+| 层级 | 项目 | 维护者 | 许可证 | 与 Crythst 的关系 |
+| --- | --- | --- | --- | --- |
+| **上游** | `ryanhcode/sable` | RyanHCode | PolyForm Shield 1.0.0 | 问题空间/API 术语参考；不是 Crythst 的代码来源或依赖 |
+| **中游** | `LyXith/sable-port` | **mikaple（与 Crythst 同一作者）** | PolyForm Shield 1.0.0 | Sable 的 26.3 Fabric 移植；不是依赖；当前审计未发现 Crythst 复制其源代码 |
+| **下游** | `Crythst` | **mikaple** | MIT | 独立实现；少量 API 名称/包结构/类布局/术语有意对齐 |
 
-来源与证据见 `docs/license-audit-2026-11-22.md`。以上是工程来源说明，**不构成法律意见**。
+关键边界：
+
+- **同一作者 ≠ 同一许可证**：sable-port 中来自 Sable 上游的衍生内容仍受 PolyForm Shield 约束，不能因为作者相同就整体改为 MIT。
+- **Crythst 的 MIT 只覆盖 Crythst 原创代码**；不提供 `dev.ryanhcode.sable.*` 兼容包。
+- 当前审计未发现复制 Sable/sable-port 的整文件、大段连续代码、注释或资源；少量通用代码模式和 API/类布局对齐见 `docs/license-audit-2026-11-22.md`。
+- 未来若引入前两者的代码，必须按 PolyForm Shield 处理或重写。
+- sable-port 的 git 历史起点是导入的 `2.0.3-fabric.26.3-port`，不是从 `ryanhcode/sable` 直接 fork；这里的“下游”不代表 git 合并或代码依赖。
 
 ## 模块
 
@@ -91,7 +96,7 @@ Crythst 是**独立实现**，不是 Sable 或 sable-port 的 fork，也不包�
 
 - [30 秒了解 Crythst](#30-秒了解-crythst)
 - [关键概念](#关键概念)
-- [与 Sable / sable-port 的关系](#与-sable--sable-port-的关系)
+- [上中下游关系](#上中下游关系)
 - [模块](#模块)
 - [核心能力](#核心能力)
 - [平台支持](#平台支持)
@@ -580,25 +585,13 @@ PhysicsStructure structure = physics.createStructure(
 
 ## 许可与来源声明
 
-Crythst 本身以 **MIT License** 发布，版权归 mikaple 所有。完整文本见 [LICENSE](LICENSE)。  
-本声明是工程来源说明，**不构成法律意见**；正式发布前应进行独立的许可证复核。
+Crythst 以 **MIT License** 发布，版权归 mikaple 所有，完整文本见 [LICENSE](LICENSE)。
 
-### 来源声明
+来源关系见 [上中下游关系](#上中下游关系)。当前审计未发现复制 Sable/sable-port 的源文件、注释或资源；存在少量通用代码模式，以及有意对齐的 API 名称/包结构/类布局/术语，详见 `docs/license-audit-2026-11-22.md`。Sable/sable-port 使用 PolyForm Shield 1.0.0；sable-port 与 Crythst 同一作者，但这不会重新授权 sable-port 中来自 Sable 上游的衍生内容；未来若引入其代码，必须按 PolyForm Shield 处理或重写。
 
-Crythst 是独立实现，不是 Sable 或 sable-port 的 fork，也不包含它们的源代码、注释或资源。设计问题空间受到 Sable/sable-port 启发，少量公共 API 名称、包结构和术语有意对齐；详细边界与证据见上文 [与 Sable / sable-port 的关系](#与-sable--sable-port-的关系) 和 `docs/license-audit-2026-11-22.md`。Sable 与 sable-port 均使用 PolyForm Shield License 1.0.0；若未来引入其代码，必须按其条款处理，不能继续仅以 MIT 发布。
+第三方组件：libbulletjme（BSD 3-Clause）、Fabric（Apache 2.0）、Minecraft（Mojang，测试素材已从发布 jar 排除）、JOML（MIT）、EnderTech（由同一版权人重新以 MIT 授权）、Create-Fly（仅 compileOnly）、Sable/sable-port（参考项目，不是依赖）。详见 [NOTICE](NOTICE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-来源审计是工程说明，不是法律意见；正式发布前应进行独立的许可证复核。
-
-### 第三方组件
-
-- **libbulletjme 23.2.0**：BSD 3-Clause（Java/JNI 胶水层）；Bullet Physics 为 zlib 许可，V-HACD 为其 BSD 风格许可；
-- **Fabric Loader / Fabric API / Fabric Loom**：Apache License 2.0；
-- **Minecraft**：Mojang/Microsoft 版权，仅作为编译/运行依赖，不随本库分发；
-- **JOML**：MIT，由 Minecraft 在运行时提供；
-- **EnderTech**：`io.mikaple.crythst.client.render` 下部分 special rendering 改编自 EnderTech，并由同一版权人重新以 MIT 授权；原 EnderTech 项目对第三方仍为 All-Rights-Reserved；
-- **Create-Fly**：仅作为 `compileOnly` 兼容性依赖，不进入运行时 jar；其代码与许可证不随 Crythst 分发。
-
-详见 [NOTICE](NOTICE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+以上是工程来源说明，**不构成法律意见**；正式发布前应进行独立的许可证复核。
 
 ---
 
@@ -619,14 +612,14 @@ Crythst 是独立实现，不是 Sable 或 sable-port 的 fork，也不包含它
 - F3+F6 分层的 `crythst:physics*` 调试渲染（默认关闭）和 `crythst:structure_target` 屏幕文本；
 - native API v2：结构容器/观察者/命令参数、客户端 render view/pose provider/clip/pick/tracking、世界空间组装/拆解、方块实体 actor + force group、`StructureMath`；
 - 结构持久化（含方块实体 NBT）、多人结构同步；
-- 沉浸式传送门 v1（传送、玩家/实体/物理体、动画表面）。
+- 沉浸式传送门 v1：实体/玩家/物理体传送、真实目标场景捕获（递归深度 1）、持久化、客户端黑屏过渡、程序化表面回退。
 
 下一步：
 
-- 传送门“看到另一侧”的实时视口、递归/模板缓冲；
-- 移动传送门、跨维度传送、传送门持久化与同步；
+- 传送门递归 >1、模板缓冲/逐像素洞口、移动传送门、跨维度物理体、多人传送门同步；
+- 传送门捕获性能：降低捕获频率/分辨率、复用 UBO 与资源池，避免捕获 pass 的 UBO 重建；
 - 结构方块实体客户端渲染与更完整的 BE tick；
-- native API 后续：constraints、ropes、box objects、loading tickets、tracking points、force totals/debug UI；
+- native API 后续：ropes、box objects、loading tickets、tracking points、force totals/debug UI；
 - 真正的 swept OBB 玩家移动求解（`PlayerObbCollision` 当前仍是移动后校正）；
 - 更多 Create 渲染/交互兼容和性能剖析。
 

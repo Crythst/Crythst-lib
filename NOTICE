@@ -1,42 +1,45 @@
 Crythst
 Copyright (c) 2026 mikaple
 
-This project is an independent implementation.
+Project lineage
+---------------
+Upstream: Sable (https://github.com/ryanhcode/sable), RyanHCode,
+PolyForm Shield License 1.0.0.
 
-The design of the physics layer is *inspired by* the problem space explored by
-Sable (https://github.com/ryanhcode/sable) and its Fabric port sable-port --
-namely, rigid-body simulation of moving block structures built from voxel
-collision shapes. No source code, comment text, or resource file from Sable or
-sable-port was copied into this repository. A small number of public API names,
-package structures and terms are intentionally aligned with Sable for migration
-and compatibility (for example ForceGroup, MassData, RigidBodyHandle,
-PhysicsPipeline, constraint configurations and VoxelColliderData). Their
-implementations are independent.
+Midstream: sable-port (https://github.com/LyXith/sable-port), a Minecraft 26.3
+Fabric port/adaptation of Sable, maintained by mikaple (the same author as
+Crythst), PolyForm Shield License 1.0.0. Its git history began from an imported
+2.0.3-fabric.26.3-port, not from a direct fork of ryanhcode/sable.
 
-sable-port and Crythst are maintained by the same author (mikaple). This
-explains the intentional API/term alignment, but it does not change the
-PolyForm Shield terms that apply to upstream Sable code; Crythst still contains
-no copied Sable or sable-port source, comments, or resources.
-Ideas, public Minecraft/Fabric APIs, and general physics techniques (greedy
-voxel meshing, compound colliders, fixed-timestep integration, interpolated
-rendering poses) were implemented from scratch.
+Downstream: Crythst (this repository), maintained by mikaple, MIT License.
 
-Sable and sable-port are licensed under the PolyForm Shield License 1.0.0
-(including a noncompete and required-notice term). Crythst contains no Sable
-or sable-port code and is not distributed under those names. If any such code
-is introduced in the future, it must be handled under the PolyForm Shield terms
-and cannot remain MIT-only.
+Crythst is not a fork of, or dependency on, Sable or sable-port. The current
+engineering audit found no copied Sable/sable-port source files, comments, or
+resources. A small number of public API names, package structures,
+class/record layouts, and terms are intentionally aligned for compatibility;
+the implementations are independent. Limited generic code patterns are
+documented in docs/license-audit-2026-11-22.md.
 
-This notice is an engineering provenance statement, not legal advice. Review
-the licensing with qualified counsel before release. See
-docs/license-audit-2026-11-22.md for evidence and residual risks.
+Same author does not relicense Sable-derived material in sable-port. If any
+Sable/sable-port code is introduced later, it must follow the PolyForm Shield
+terms, including required notices and the noncompete term, and cannot remain
+MIT-only.
 
-Third-party components keep their own licenses; see THIRD_PARTY_NOTICES.md.
+This is an engineering provenance notice, not legal advice. Consult qualified
+counsel before release. Third-party components keep their own licenses; see
+THIRD_PARTY_NOTICES.md.
 
-Special rendering notice
-------------------------
-The item/block special-rendering pieces under io.mikaple.crythst.client.render
-are adapted from EnderTech, Copyright (c) 2026 Mikaple, the copyright holder of
-this repository. They are relicensed here under the MIT License together with
-the rest of Crythst. The original EnderTech project remains All-Rights-Reserved
-for third parties.
+Special rendering
+-----------------
+The item/block special-rendering pieces under
+io.mikaple.crythst.client.render are adapted from EnderTech, Copyright (c) 2026
+Mikaple, the copyright holder of this repository. They are relicensed here
+under MIT together with the rest of Crythst. The original EnderTech project
+remains All-Rights-Reserved for third parties.
+
+Minecraft-derived test assets
+-----------------------------
+The grayscale/colorized PNGs under assets/crythst/textures/test are
+development/test fixtures derived from Minecraft assets. They are excluded
+from the distributed mod jar by build.gradle and remain subject to
+Mojang/Microsoft terms; do not redistribute them separately as Crythst assets.
