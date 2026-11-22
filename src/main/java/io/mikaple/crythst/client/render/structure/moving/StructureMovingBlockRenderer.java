@@ -95,12 +95,15 @@ public final class StructureMovingBlockRenderer {
                     poseStack.mulPose(matrix);
                     final Direction direction = moving.direction();
                     final float progress = moving.progress();
-                    // The matrix already contains the block scale, so the
-                    // piston offset is expressed in block-local units.
+                    // PistonMovingBlockEntity#getExtendedProgress: extending
+                    // moves from -1 to 0, retracting from +1 to 0. The entity
+                    // is stored at the destination cell.
+                    final float extended = moving.extending()
+                            ? progress - 1.0f : 1.0f - progress;
                     poseStack.translate(
-                            direction.getStepX() * progress,
-                            direction.getStepY() * progress,
-                            direction.getStepZ() * progress);
+                            direction.getStepX() * extended,
+                            direction.getStepY() * extended,
+                            direction.getStepZ() * extended);
                     context.submitNodeCollector().submitMovingBlock(poseStack, state, 0);
                 } finally {
                     poseStack.popPose();
