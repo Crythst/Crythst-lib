@@ -207,11 +207,7 @@ public final class StructureMotionSolver {
 
                     final boolean floor = hit.normal().y > VERTICAL_DOT;
                     final boolean ceiling = hit.normal().y < -VERTICAL_DOT;
-                    final double horizontalMotion = Math.hypot(step.x, step.z);
-                    final boolean movingInto = horizontalMotion > 1.0e-6
-                            && hit.normal().x * step.x + hit.normal().z * step.z < -1.0e-9;
-                    if (!floor && !ceiling && !stepped && movingInto
-                            && Math.abs(hit.normal().y) <= 0.5
+                    if (!floor && !ceiling && !stepped
                             && input.onGround() && input.stepHeight() > 0.01) {
                         final Aabb lifted = candidate.offset(
                                 new Vector3d(0.0, input.stepHeight(), 0.0));
@@ -219,25 +215,14 @@ public final class StructureMotionSolver {
                                 lifted, candidate.center(), structure.pose(), structure.boxes(),
                                 structure.parts(), structure.blockScale(), policy);
                         if (liftHit == null || liftHit.penetration() <= CONTACT_SLOP) {
-                            // Do not step into empty space: there must be a
-                            // floor somewhere within the step height below the
-                            // lifted box. Vanilla auto-step only happens when
-                            // the player can actually stand on the target.
-                            final Aabb probe = lifted.offset(
-                                    new Vector3d(0.0, -(input.stepHeight() + 0.01), 0.0));
-                            final EntityStructureSolver.Hit floorHit = EntityStructureSolver.resolve(
-                                    probe, lifted.center(), structure.pose(), structure.boxes(),
-                                    structure.parts(), structure.blockScale(), policy);
-                            if (floorHit != null && floorHit.normal().y > VERTICAL_DOT) {
-                                // Step onto the obstacle instead of stopping at its side.
-                                candidate = lifted;
-                                allowed.y += input.stepHeight();
-                                stepped = true;
-                                support = true;
-                                below = true;
-                                vertical = true;
-                                break;
-                            }
+                            // Step onto the obstacle instead of stopping at its side.
+                            candidate = lifted;
+                            allowed.y += input.stepHeight();
+                            stepped = true;
+                            support = true;
+                            below = true;
+                            vertical = true;
+                            break;
                         }
                     }
 

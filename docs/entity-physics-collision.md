@@ -102,14 +102,11 @@ descending, but only for about one substep of fall. The old 0.6 m budget would
 have let a zero-step-height mob climb a 0.5 m wall. A true step-up is handled
 explicitly:
 
-- on a horizontal side contact in the direction of travel, if vanilla says the
-  entity is on the ground and its `maxUpStep()` is non-zero, the kernel tests
-  the AABB lifted by that step height;
-- the lift is accepted only when the lifted box is clear **and** a downward
-  probe of the same box finds a floor within the step height. This prevents
-  auto-stepping into empty space or onto a thin side face;
-- if both checks pass, the lift is added to the allowed motion and the substep
-  continues from there.
+- on a horizontal contact, if vanilla says the entity is on the ground and its
+  `maxUpStep()` is non-zero, the kernel tests the AABB lifted by that step
+  height;
+- if the lifted box is clear, the lift is added to the allowed motion and the
+  substep continues from there.
 
 The lift becomes part of the motion vanilla applies, so it is not a teleport.
 
