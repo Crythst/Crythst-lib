@@ -25,6 +25,8 @@ public final class EntityStructureSolver {
     /** Legacy default: penetration shallower than this is treated as contact. */
     public static final double DEFAULT_SLOP = 1.0e-4;
     private static final double TIE_EPSILON = 1.0e-6;
+    /** Minimum world-up component of a face normal that can support an entity. */
+    public static final double MIN_SUPPORT_NORMAL_Y = 0.55;
     /**
      * World-up support is preferred over a shallower sideways exit when the
      * entity is descending or resting. This is the depth up to which a support
@@ -178,6 +180,19 @@ public final class EntityStructureSolver {
     public static Hit resolve(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
                               List<VoxelBox> boxes, List<VoxelCellPart> parts,
                               double blockScale, Policy policy) {
+        return resolve(entityBox, previousCenter, pose, boxes, parts, blockScale, policy, false);
+    }
+
+    /** Resolves a movement substep using the previous box to classify contacts. */
+    public static Hit resolveMovement(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
+                                      List<VoxelBox> boxes, List<VoxelCellPart> parts,
+                                      double blockScale, Policy policy) {
+        return resolve(entityBox, previousCenter, pose, boxes, parts, blockScale, policy, true);
+    }
+
+    private static Hit resolve(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
+                               List<VoxelBox> boxes, List<VoxelCellPart> parts,
+                               double blockScale, Policy policy, boolean movement) {
         if (policy == null) {
             throw new IllegalArgumentException("policy is required");
         }
@@ -185,7 +200,7 @@ public final class EntityStructureSolver {
                 || policy.maxBoxes() <= 0 || blockScale <= 0.0) {
             return null;
         }
-        final Resolver resolver = new Resolver(entityBox, previousCenter, pose, blockScale, policy);
+        final Resolver resolver = new Resolver(entityBox, previousCenter, pose, blockScale, policy, movement);
         for (VoxelBox box : boxes) {
             resolver.accept(box.minX(), box.minY(), box.minZ(),
                     box.sizeX(), box.sizeY(), box.sizeZ());
@@ -222,6 +237,8 @@ public final class EntityStructureSolver {
         private final Transform3d pose;
         private final double blockScale;
         private final Policy policy;
+        private final boolean movement;
+        private final double minimumOverlap;
         private final double safeMargin;
         private final double hx;
         private final double hy;
@@ -240,11 +257,13 @@ public final class EntityStructureSolver {
         private boolean exhausted;
 
         private Resolver(Aabb entityBox, Vector3d previousCenter, Transform3d pose,
-                         double blockScale, Policy policy) {
+                         double blockScale, Policy policy, boolean movement) {
             this.previousCenter = previousCenter;
             this.pose = pose;
             this.blockScale = blockScale;
             this.policy = policy;
+            this.movement = movement;
+            this.minimumOverlap = movement ? Math.max(EPSILON, policy.slop()) : EPSILON;
             this.safeMargin = policy.margin();
             final Vector3d min = entityBox.min();
             final Vector3d max = entityBox.max();
@@ -311,15 +330,19 @@ public final class EntityStructureSolver {
             }
 
             boxBest.reset();
+            final double boxProjectionY = worldHalfY;
+            final double overlapY = hy + boxProjectionY - Math.abs(dy);
+            if (overlapY <= minimumOverlap) {
+                return;
+            }
+            final boolean wasBesideBox = movement && previousDelta != null
+                    && hy + boxProjectionY - Math.abs(previousDelta.y) > policy.supportLimit();
             // Entity face axes (world X/Y/Z).
             if (!considerFaceAxis(dx, dy, dz, hx,
                     hbx * Math.abs(b0.x) + hby * Math.abs(b1.x) + hbz * Math.abs(b2.x),
-                    1.0, 0.0, 0.0, boxBest, previousDelta, false)) {
+                    1.0, 0.0, 0.0, boxBest, previousDelta, false, wasBesideBox, policy.slop(), minimumOverlap)) {
                 return;
             }
-            final double boxProjectionY = hbx * Math.abs(b0.y)
-                    + hby * Math.abs(b1.y) + hbz * Math.abs(b2.y);
-            final double overlapY = hy + boxProjectionY - Math.abs(dy);
             // A support contact is an upward escape that is shallow enough to
             // be a floor/step. It wins over a shallower sideways exit, which
             // is what used to shove a landing player off a corner.
@@ -327,40 +350,40 @@ public final class EntityStructureSolver {
                     && dy >= 0.0
                     && overlapY > policy.slop()
                     && overlapY <= policy.supportLimit();
-            if (!considerFaceAxis(dx, dy, dz, hy, boxProjectionY,
-                    0.0, 1.0, 0.0, boxBest, previousDelta, support)) {
-                return;
+            // A tilted box's vertical bound describes its highest corner,
+            // even when that corner is outside the entity's footprint. In
+            // movement, use the box faces to classify contact at that edge.
+            if (!movement || Math.abs(b0.y) > 1.0 - EPSILON
+                    || Math.abs(b1.y) > 1.0 - EPSILON || Math.abs(b2.y) > 1.0 - EPSILON) {
+                considerFaceAxis(dx, dy, dz, hy, boxProjectionY,
+                        0.0, 1.0, 0.0, boxBest, previousDelta, support, false, policy.slop(), minimumOverlap);
             }
             if (!considerFaceAxis(dx, dy, dz, hz,
                     hbx * Math.abs(b0.z) + hby * Math.abs(b1.z) + hbz * Math.abs(b2.z),
-                    0.0, 0.0, 1.0, boxBest, previousDelta, false)) {
+                    0.0, 0.0, 1.0, boxBest, previousDelta, false, wasBesideBox, policy.slop(), minimumOverlap)) {
                 return;
             }
 
             // Structure face axes.
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b0.x) + hy * Math.abs(b0.y) + hz * Math.abs(b0.z),
-                    hbx, b0.x, b0.y, b0.z, boxBest, previousDelta, false)) {
+                    hbx, b0.x, b0.y, b0.z, boxBest, previousDelta, false, wasBesideBox, policy.slop(), minimumOverlap)) {
                 return;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b1.x) + hy * Math.abs(b1.y) + hz * Math.abs(b1.z),
-                    hby, b1.x, b1.y, b1.z, boxBest, previousDelta, false)) {
+                    hby, b1.x, b1.y, b1.z, boxBest, previousDelta, false, wasBesideBox, policy.slop(), minimumOverlap)) {
                 return;
             }
             if (!considerFaceAxis(dx, dy, dz,
                     hx * Math.abs(b2.x) + hy * Math.abs(b2.y) + hz * Math.abs(b2.z),
-                    hbz, b2.x, b2.y, b2.z, boxBest, previousDelta, false)) {
+                    hbz, b2.x, b2.y, b2.z, boxBest, previousDelta, false, wasBesideBox, policy.slop(), minimumOverlap)) {
                 return;
             }
 
-            // A box whose chosen exit is shallower than the contact slop is
-            // merely resting against the entity. Skipping it here (rather than
-            // inside offer) keeps the support selection intact: a real landing
-            // is still resolved even when a different axis of the same box
-            // merely grazes the surface.
+            // Overlap queries retain their original tolerance at the chosen exit.
             if (boxBest.isValid() && boxBest.depth > policy.slop()) {
-                globalBest.merge(boxBest);
+                globalBest.merge(boxBest, movement);
             }
         }
 
@@ -481,22 +504,25 @@ public final class EntityStructureSolver {
                                             double entityProjection, double boxProjection,
                                             double axisX, double axisY, double axisZ,
                                             Best best, Vector3d previousDelta,
-                                            boolean support) {
+                                            boolean support, boolean wasBesideBox, double slop,
+                                            double minimumOverlap) {
         final double distance = dx * axisX + dy * axisY + dz * axisZ;
         // Unnormalized cross axes are not passed here, so the distance is in
         // metres and can be compared directly with the projected half extents.
         final double overlap = entityProjection + boxProjection - Math.abs(distance);
-        if (overlap <= EPSILON) {
+        // A resting overlap along one axis cannot block a movement along
+        // another axis, even when that axis would be preferred for support.
+        if (overlap <= minimumOverlap) {
             return false;
         }
         double sign = distance >= 0.0 ? 1.0 : -1.0;
+        final double previousDistance = previousDelta == null ? 0.0
+                : previousDelta.x * axisX + previousDelta.y * axisY + previousDelta.z * axisZ;
         // The previous-centre hint only matters while the entity's centre is
         // still inside this box's slab. Once the centre is clearly outside the
         // box the current side is unambiguous, and a stale/interpolated hint
         // must not push the entity back into the surface.
         if (previousDelta != null && Math.abs(distance) < boxProjection - 1.0e-4) {
-            final double previousDistance = previousDelta.x * axisX
-                    + previousDelta.y * axisY + previousDelta.z * axisZ;
             // Near a face plane the previous side is numerically ambiguous.
             // Falling back to the current centre prevents float noise from
             // pushing an entity deeper into a wall.
@@ -504,7 +530,17 @@ public final class EntityStructureSolver {
                 sign = previousDistance >= 0.0 ? 1.0 : -1.0;
             }
         }
-        best.offer(overlap, axisX * sign, axisY * sign, axisZ * sign, support);
+        // On descent, resolve the continuous wall beside the entity before
+        // a neighbouring box can turn the seam into a floor.
+        final double previousOverlap = entityProjection + boxProjection - Math.abs(previousDistance);
+        final boolean enteredSide = previousDelta != null
+                && (wasBesideBox || dy > previousDelta.y + EPSILON)
+                && Math.abs(axisY) <= MIN_SUPPORT_NORMAL_Y
+                && previousOverlap <= slop
+                && overlap > slop;
+        final double sideEntry = enteredSide
+                ? -previousOverlap / (overlap - previousOverlap) : Double.POSITIVE_INFINITY;
+        best.offer(overlap, axisX * sign, axisY * sign, axisZ * sign, support, sideEntry);
         return true;
     }
 
@@ -515,6 +551,7 @@ public final class EntityStructureSolver {
         double ny;
         double nz;
         boolean support;
+        double sideEntry = Double.POSITIVE_INFINITY;
 
         void reset() {
             depth = Double.POSITIVE_INFINITY;
@@ -522,42 +559,47 @@ public final class EntityStructureSolver {
             ny = 0.0;
             nz = 0.0;
             support = false;
+            sideEntry = Double.POSITIVE_INFINITY;
         }
 
-        void offer(double overlap, double x, double y, double z, boolean support) {
-            if (support) {
-                // A support exit beats any sideways escape, however shallow
-                // the latter is. Otherwise a landing on the edge of a floor is
-                // pushed off sideways instead of being placed on top.
-                if (!this.support || overlap < depth - TIE_EPSILON) {
-                    depth = overlap;
-                    nx = x;
-                    ny = y;
-                    nz = z;
-                    this.support = true;
-                }
+        void offer(double overlap, double x, double y, double z, boolean support, double sideEntry) {
+            final boolean enteredSide = Double.isFinite(sideEntry);
+            final boolean hadSide = Double.isFinite(this.sideEntry);
+            if (hadSide && !enteredSide) {
                 return;
             }
-            if (this.support) {
+            if (this.support && !support && !enteredSide) {
                 return;
             }
-            // Prefer an upward escape when two axes are equally shallow. This
-            // keeps entities resting on top of a structure instead of being
-            // squeezed sideways by floating-point ties.
-            final boolean better = overlap < depth - TIE_EPSILON
+            final boolean better = (enteredSide && !hadSide)
+                    || (support && !this.support)
+                    || overlap < depth - TIE_EPSILON
                     || (Math.abs(overlap - depth) <= TIE_EPSILON && y > 0.9 && ny < 0.5);
             if (better) {
                 depth = overlap;
                 nx = x;
                 ny = y;
                 nz = z;
+                this.support = support;
+                this.sideEntry = sideEntry;
             }
         }
 
-        void merge(Best other) {
-            if (other.isValid()) {
-                offer(other.depth, other.nx, other.ny, other.nz, other.support);
+        void merge(Best other, boolean movement) {
+            if (!other.isValid()) {
+                return;
             }
+            // Clear the side first reached during this substep. Its correction
+            // can remove a later overlap with the end face at a wall seam.
+            if (movement && Double.isFinite(other.sideEntry) && Double.isFinite(sideEntry)) {
+                if (other.sideEntry > sideEntry + TIE_EPSILON) {
+                    return;
+                }
+                if (other.sideEntry < sideEntry - TIE_EPSILON) {
+                    reset();
+                }
+            }
+            offer(other.depth, other.nx, other.ny, other.nz, other.support, other.sideEntry);
         }
 
         boolean isValid() {

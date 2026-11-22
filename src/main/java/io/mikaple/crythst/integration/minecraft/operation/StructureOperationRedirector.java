@@ -6,6 +6,7 @@ import io.mikaple.crythst.integration.minecraft.EmptyPhysicsLevel;
 import io.mikaple.crythst.integration.minecraft.LevelPhysics;
 import io.mikaple.crythst.integration.minecraft.MinecraftPhysics;
 import io.mikaple.crythst.integration.minecraft.PlayerGravity;
+import io.mikaple.crythst.integration.minecraft.entity.placement.StructureEntityPlacement;
 import io.mikaple.crythst.integration.minecraft.gameevent.StructurePlayerProgress;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureFeedback;
 import io.mikaple.crythst.integration.minecraft.interaction.StructureInteraction;
@@ -22,6 +23,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
@@ -69,7 +71,7 @@ public final class StructureOperationRedirector {
     public enum Status {
         /** {@code useVoidLevelOperations} is off. */
         DISABLED,
-        /** The structure/auxiliary block is unavailable; use the custom path. */
+        /** The auxiliary block is unavailable or the item uses custom placement. */
         NOT_HANDLED,
         /** The operation ran in the void level and was mirrored. */
         HANDLED,
@@ -120,9 +122,8 @@ public final class StructureOperationRedirector {
      *
      * <p>{@link Status#HANDLED} and {@link Status#FAILED} already ran vanilla
      * logic (or deliberately decided not to edit), so falling back would apply
-     * a second edit. Only a disabled redirect, an unavailable auxiliary region
-     * and an out-of-bounds placement are safe to retry; the last one uses the
-     * volume-expanding custom placement.</p>
+     * a second edit. The remaining outcomes can use the custom path, for
+     * example to place an entity on the structure or expand the volume.</p>
      */
     public static boolean shouldFallback(Status status) {
         return status == Status.DISABLED
@@ -185,50 +186,17 @@ public final class StructureOperationRedirector {
             return Result.of(Status.FAILED);
         }
         final ItemStack stack = player.getItemInHand(hand);
-        if (stack.getItem() instanceof BlockItem
-                && !placementTargetInsideVolume(mapped, hit, stack)) {
-            return Result.of(Status.OUT_OF_BOUNDS);
-        }
-        if (stack.getItem() instanceof BlockItem) {
-            final var bounds = mapped.structure().volume().bounds();
-            int tx = hit.adjacentX();
-            int ty = hit.adjacentY();
-            int tz = hit.adjacentZ();
-            if (!bounds.contains(tx, ty, tz)) {
-                // Replaceable clicked cell (grass/water) is the placement target.
-                tx = hit.voxelX();
-                ty = hit.voxelY();
-                tz = hit.voxelZ();
-            }
-            final ServerLevel hostLevel = (ServerLevel) player.level();
-            if (StructurePlacementValidation.worldObstructed(hostLevel,
-                    mapped.structure().pose(), mapped.structure().blockScale(),
-                    tx, ty, tz)) {
-                return Result.of(Status.FAILED);
-            }
-        }
         final ServerLevel hostLevel = (ServerLevel) player.level();
         final LevelPhysics physics = MinecraftPhysics.getIfPresent(hostLevel);
         final boolean projecting = physics != null
                 && physics.beginAuxiliaryAudioProjection(mapped.structure());
-        // Block placement derives its orientation from the player's view and
-        // horizontal facing. The auxiliary level is structure-local, so expose
-        // the gravity-adjusted look and yaw in that frame for the duration of
-        // the call. The real rotation is restored before the server tick sends
-        // position packets, so the player never sees a camera snap.
-        final LookRestore look = stack.getItem() instanceof BlockItem
-                ? LookRestore.apply(player, mapped.structure()) : null;
         try {
-            final InteractionResult interaction = performUse(player, mapped, stack, hand);
-            return new Result(Status.HANDLED, interaction);
+            return performUse(player, hostLevel, hit, mapped, stack, hand);
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Void-level use failed for structure body #{}",
                     mapped.structure().body().id(), t);
             return Result.of(Status.FAILED);
         } finally {
-            if (look != null) {
-                look.restore(player);
-            }
             if (projecting) {
                 physics.endAuxiliaryAudioProjection();
             }
@@ -240,10 +208,10 @@ public final class StructureOperationRedirector {
      * Vanilla use order with an explicit level, so every context resolves to
      * the auxiliary copy instead of the host world.
      */
-    private static InteractionResult performUse(ServerPlayer player, Mapped mapped,
-                                                ItemStack stack, InteractionHand hand) {
+    private static Result performUse(ServerPlayer player, ServerLevel hostLevel,
+                                     StructureBlockHitResult hit, Mapped mapped,
+                                     ItemStack stack, InteractionHand hand) {
         final ServerLevel auxiliary = mapped.live().level();
-        final BlockPos pos = mapped.live().pos();
         final BlockState state = mapped.live().state();
         final BlockHitResult auxiliaryHit = mapped.auxiliaryHit();
         final ItemStack usedStack = stack.copy();
@@ -260,7 +228,7 @@ public final class StructureOperationRedirector {
                     player, mapped.structure(), mapped.live(), auxiliaryHit,
                     stack, hand, mapped.voxelX(), mapped.voxelY(), mapped.voxelZ());
             if (signResult != null && signResult.consumesAction()) {
-                return signResult;
+                return new Result(Status.HANDLED, signResult);
             }
             result = state.useItemOn(stack, auxiliary, player, hand, auxiliaryHit);
             if (result == null) {
@@ -274,33 +242,69 @@ public final class StructureOperationRedirector {
                     StructurePlayerProgress.triggerDefaultBlockUse(player,
                             mapped.structure(), mapped.voxelX(), mapped.voxelY(),
                             mapped.voxelZ());
-                    return empty;
+                    return new Result(Status.HANDLED, empty);
                 }
             }
             if (result.consumesAction()) {
                 StructurePlayerProgress.triggerItemUsedOnBlock(player,
                         mapped.structure(), mapped.voxelX(), mapped.voxelY(),
                         mapped.voxelZ(), usedStack);
-                return result;
+                return new Result(Status.HANDLED, result);
             }
         }
         // Mirror vanilla ServerPlayerGameMode: only a non-empty stack that is
         // off cooldown runs ItemStack#useOn, and creative must not lose items.
         if (stack.isEmpty() || player.getCooldowns().isOnCooldown(stack)) {
-            return result;
+            return new Result(Status.HANDLED, result);
         }
+        final AuxiliaryUseOnContext context = new AuxiliaryUseOnContext(
+                auxiliary, player, hand, stack, auxiliaryHit);
+        if (stack.getItem() instanceof BlockItem) {
+            // Only item placement uses a structure-local view direction and a
+            // placement target. A lever or chest can consume the click first.
+            final PhysicsStructure structure = mapped.structure();
+            final LookRestore look = LookRestore.apply(player, structure);
+            try {
+                final BlockPos target = new BlockPlaceContext(context).getClickedPos();
+                final BlockPos offset = target.subtract(mapped.live().pos());
+                final int x = hit.voxelX() + offset.getX();
+                final int y = hit.voxelY() + offset.getY();
+                final int z = hit.voxelZ() + offset.getZ();
+                if (!structure.volume().bounds().contains(x, y, z)) {
+                    return Result.of(Status.OUT_OF_BOUNDS);
+                }
+                if (StructurePlacementValidation.worldObstructed(hostLevel,
+                        structure.pose(), structure.blockScale(), x, y, z)) {
+                    return Result.of(Status.FAILED);
+                }
+                return useStack(player, mapped.structure(), mapped.voxelX(),
+                        mapped.voxelY(), mapped.voxelZ(), stack, context,
+                        usedStack, result);
+            } finally {
+                look.restore(player);
+            }
+        }
+        if (StructureEntityPlacement.handles(stack.getItem())) {
+            return Result.of(Status.NOT_HANDLED);
+        }
+        return useStack(player, mapped.structure(), mapped.voxelX(),
+                mapped.voxelY(), mapped.voxelZ(), stack, context, usedStack, result);
+    }
+
+    private static Result useStack(ServerPlayer player, PhysicsStructure structure,
+                                   int voxelX, int voxelY, int voxelZ,
+                                   ItemStack stack, AuxiliaryUseOnContext context,
+                                   ItemStack usedStack, InteractionResult blockResult) {
         final int count = stack.getCount();
-        final InteractionResult item = stack.useOn(new AuxiliaryUseOnContext(
-                auxiliary, player, hand, stack, auxiliaryHit));
+        final InteractionResult item = stack.useOn(context);
         if (player.hasInfiniteMaterials() && stack.getCount() != count) {
             stack.setCount(count);
         }
         if (item != null && item.consumesAction()) {
-            StructurePlayerProgress.triggerItemUsedOnBlock(player,
-                    mapped.structure(), mapped.voxelX(), mapped.voxelY(),
-                    mapped.voxelZ(), usedStack);
+            StructurePlayerProgress.triggerItemUsedOnBlock(player, structure,
+                    voxelX, voxelY, voxelZ, usedStack);
         }
-        return item == null ? result : item;
+        return new Result(Status.HANDLED, item == null ? blockResult : item);
     }
 
     /**
@@ -442,25 +446,6 @@ public final class StructureOperationRedirector {
                 auxiliaryPos.getY() + localY,
                 auxiliaryPos.getZ() + localZ),
                 hit.localFace(), auxiliaryPos, false);
-    }
-
-    private static boolean placementTargetInsideVolume(Mapped mapped,
-                                                        StructureBlockHitResult hit,
-                                                        ItemStack stack) {
-        if (!(stack.getItem() instanceof BlockItem)) {
-            return true;
-        }
-        final var bounds = mapped.structure().volume().bounds();
-        final int adjacentX = hit.adjacentX();
-        final int adjacentY = hit.adjacentY();
-        final int adjacentZ = hit.adjacentZ();
-        if (bounds.contains(adjacentX, adjacentY, adjacentZ)) {
-            return true;
-        }
-        // Replaceable blocks (tall grass, snow layer, ...) are targeted at the
-        // clicked voxel rather than the adjacent cell.
-        return bounds.contains(hit.voxelX(), hit.voxelY(), hit.voxelZ())
-                && mapped.live().state().canBeReplaced();
     }
 
     /**

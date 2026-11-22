@@ -159,32 +159,24 @@ public final class StructureInteractionEvents {
     /**
      * Shared right-click routing for the Fabric callbacks.
      *
-     * <p>Block items and ordinary use items first run vanilla
-     * {@code ServerPlayerGameMode.useItemOn} against the auxiliary void level.
-     * A handled/failed redirect consumes the click; an out-of-bounds block
-     * placement or an unavailable auxiliary region/chunk falls back to the
-     * legacy custom path. Entity items keep the structure-surface handler
-     * because vanilla would spawn them in the copied block cell.</p>
+     * <p>The auxiliary block gets the first chance to handle the click.
+     * Entity placement, placement outside the copied volume and unavailable
+     * auxiliary chunks use the custom paths.</p>
      */
     private static InteractionResult useStructure(
             net.minecraft.server.level.ServerPlayer player,
             StructureBlockHitResult hit, ItemStack stack) {
         final boolean placementItem = StructureItemUse.shouldHandleStructureUse(stack);
-        final boolean redirectable = StructureOperationRedirector.enabled()
-                && (!placementItem || stack.getItem() instanceof BlockItem);
-        if (redirectable) {
+        if (StructureOperationRedirector.enabled()) {
             if (!StructureInteraction.beginInteraction(player)) {
                 // The payload or the other use callback already ran this click.
-                return InteractionResult.SUCCESS_SERVER;
+                return InteractionResult.CONSUME;
             }
             final StructureOperationRedirector.Result result =
                     StructureOperationRedirector.useOn(player, hit, InteractionHand.MAIN_HAND);
-            if (result.handled()
-                    || result.status() == StructureOperationRedirector.Status.FAILED) {
-                return InteractionResult.SUCCESS_SERVER;
-            }
             if (!StructureOperationRedirector.shouldFallback(result.status())) {
-                return InteractionResult.SUCCESS_SERVER;
+                return StructureInteraction.shouldSwingForUse(result.interaction())
+                        ? InteractionResult.SUCCESS_SERVER : InteractionResult.CONSUME;
             }
             // OUT_OF_BOUNDS placement and NOT_HANDLED (unloaded aux chunk)
             // continue to the legacy custom path below.
@@ -193,12 +185,15 @@ public final class StructureInteractionEvents {
         if (!placementItem) {
             // Empty hand, tools, buckets, food, ...: fallback vanilla block-use
             // against the structure side table/live block.
-            return StructureInteraction.interactBlock(player, hit).consumesAction()
-                    ? InteractionResult.SUCCESS_SERVER
-                    : InteractionResult.PASS;
+            final InteractionResult result = StructureInteraction.interactBlock(player, hit);
+            if (!result.consumesAction()) {
+                return InteractionResult.PASS;
+            }
+            return StructureInteraction.shouldSwingForUse(result)
+                    ? InteractionResult.SUCCESS_SERVER : result;
         }
         if (!StructureInteraction.beginPlacement(player)) {
-            return InteractionResult.SUCCESS_SERVER;
+            return InteractionResult.CONSUME;
         }
         if (stack.getItem() instanceof BlockItem) {
             final StructureInteraction.PlaceResult result = StructureInteraction.placeBlock(

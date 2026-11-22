@@ -73,11 +73,15 @@ import net.minecraft.world.ticks.LevelChunkTicks;
 import net.minecraft.world.ticks.ScheduledTick;
 import net.minecraft.world.ticks.TickPriority;
 import net.minecraft.world.level.storage.DerivedLevelData;
+import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.ServerLevelData;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -103,12 +107,15 @@ import java.util.function.BiConsumer;
  * an empty {@link FlatLevelSource}, and vanilla {@code tickChunk} does the block
  * work.</p>
  *
- * <p>The level is marked {@code noSave} and is never registered in the server
- * level map. It is intended for logic, not for players or rendering.</p>
+ * <p>The level lives in a temporary storage directory and is never registered
+ * in the server level map. Its chunks and entities are transient.</p>
  */
 public final class EmptyPhysicsLevel implements AutoCloseable {
     /** Gap between reserved structure regions, in blocks. */
     private static final int REGION_MARGIN = 16;
+    /** Raw writes while staging or clearing a structure copy. */
+    private static final int REGION_COPY_FLAGS =
+            Block.UPDATE_CLIENTS | Block.UPDATE_SKIP_ALL_SIDEEFFECTS;
 
     /**
      * Simulation-only ticket level that makes vanilla consider a chunk
@@ -340,6 +347,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
 
     private final AuxiliaryServerLevel level;
     private final ServerLevel hostLevel;
+    private final Path storageDirectory;
+    private final LevelStorageSource.LevelStorageAccess storage;
     private final Map<Long, Integer> activeChunks = new HashMap<>();
     /**
      * Chunk object whose vanilla tick containers were last registered. Keeping
@@ -404,9 +413,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
         StructureEntityProjection.Result project(RegionView region, Entity entity);
     }
 
-    private EmptyPhysicsLevel(AuxiliaryServerLevel level, ServerLevel hostLevel) {
+    private EmptyPhysicsLevel(AuxiliaryServerLevel level, ServerLevel hostLevel,
+                              Path storageDirectory, LevelStorageSource.LevelStorageAccess storage) {
         this.level = level;
         this.hostLevel = hostLevel;
+        this.storageDirectory = storageDirectory;
+        this.storage = storage;
         synchronized (ACTIVE) {
             ACTIVE.add(this);
         }
@@ -418,6 +430,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
      *         skipped)
      */
     public static EmptyPhysicsLevel create(ServerLevel host) {
+        Path storageDirectory = null;
+        LevelStorageSource.LevelStorageAccess storage = null;
         try {
             final MinecraftServer server = host.getServer();
             final MinecraftServerAccessor accessor = (MinecraftServerAccessor) server;
@@ -439,14 +453,21 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             final ResourceKey<Level> key = ResourceKey.create(Registries.DIMENSION,
                     Identifier.fromNamespaceAndPath(Crythst.MOD_ID,
                             "void_" + hostId.getNamespace() + "_" + hostId.getPath()));
+            // Chunk and entity I/O can write data even when ServerLevel.noSave
+            // is set. Region coordinates restart at zero with each copy.
+            storageDirectory = Files.createTempDirectory("crythst-void-");
+            storage = LevelStorageSource.createDefault(storageDirectory).createAccess("world");
             final AuxiliaryServerLevel voidLevel = new AuxiliaryServerLevel(
-                    server, accessor.crythst$executor(), accessor.crythst$storageSource(),
+                    server, accessor.crythst$executor(), storage,
                     data, key, stem, false, host.getSeed(), List.of(), false, host);
             voidLevel.noSave = true;
-            final EmptyPhysicsLevel auxiliary = new EmptyPhysicsLevel(voidLevel, host);
+            final EmptyPhysicsLevel auxiliary = new EmptyPhysicsLevel(voidLevel, host, storageDirectory, storage);
             voidLevel.attach(auxiliary);
             return auxiliary;
         } catch (Throwable t) {
+            if (storageDirectory != null) {
+                deleteStorage(storageDirectory, storage);
+            }
             Crythst.LOGGER.warn("Could not create the auxiliary void level for {}; "
                     + "structure block ticking is disabled", host.dimension().identifier(), t);
             return null;
@@ -525,10 +546,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                                 worldY,
                                 baseZ + (z - bounds.minZ()));
                         ensureChunk(pos);
-                        // Copy states first with no neighbour updates. The
-                        // region is not complete yet, so a live update could
-                        // break unsupported blocks before their support exists.
-                        if (!level.setBlock(pos, state, 2)) {
+                        // Wake the copy only after all of its support blocks exist.
+                        if (!level.setBlock(pos, state, REGION_COPY_FLAGS)) {
                             continue;
                         }
                         region.copiedPositions.add(pos.asLong());
@@ -605,7 +624,12 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             try {
                 state.onPlace(level, pos, air, false);
                 level.updateNeighborsAt(pos, state.getBlock());
-                final FluidState fluid = state.getFluidState();
+                final BlockState live = level.getBlockState(pos);
+                // Staging skips shape updates. Apply them with the complete
+                // grid in place so attachments and connections see their support.
+                live.updateNeighbourShapes(level, pos, Block.UPDATE_CLIENTS, Block.UPDATE_LIMIT - 1);
+                live.updateIndirectNeighbourShapes(level, pos, Block.UPDATE_CLIENTS, Block.UPDATE_LIMIT - 1);
+                final FluidState fluid = level.getFluidState(pos);
                 if (!fluid.isEmpty()) {
                     level.scheduleTick(pos, fluid.getType(),
                             Math.max(1, fluid.getType().getTickDelay(level)));
@@ -1093,6 +1117,24 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                     blockEntity.saveWithFullMetadata(level.registryAccess()));
         }
         return data == null ? Map.of() : data;
+    }
+
+    /** Rebases saved offsets from the old copy to the replacement volume. */
+    static Map<BlockPos, CompoundTag> rebaseBlockEntityData(Map<BlockPos, CompoundTag> data,
+                                                          RegionView oldRegion,
+                                                          IntBounds3 newBounds) {
+        final Map<BlockPos, CompoundTag> rebased = new LinkedHashMap<>();
+        for (var entry : data.entrySet()) {
+            final BlockPos offset = entry.getKey();
+            final int x = oldRegion.volumeMinX() + offset.getX();
+            final int y = oldRegion.volumeMinY() + offset.getY();
+            final int z = oldRegion.volumeMinZ() + offset.getZ();
+            if (newBounds.contains(x, y, z)) {
+                rebased.put(new BlockPos(x - newBounds.minX(), y - newBounds.minY(),
+                        z - newBounds.minZ()), entry.getValue());
+            }
+        }
+        return rebased;
     }
 
     /**
@@ -2857,6 +2899,23 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
             level.close();
         } catch (Throwable t) {
             Crythst.LOGGER.warn("Error closing auxiliary void level", t);
+        } finally {
+            deleteStorage(storageDirectory, storage);
+        }
+    }
+
+    private static void deleteStorage(Path directory, @Nullable LevelStorageSource.LevelStorageAccess storage) {
+        try {
+            if (storage != null) {
+                try (storage) {
+                    storage.deleteLevel();
+                }
+            } else {
+                Files.deleteIfExists(directory.resolve("world"));
+            }
+            Files.deleteIfExists(directory);
+        } catch (IOException failure) {
+            Crythst.LOGGER.warn("Could not delete auxiliary void-level storage {}", directory, failure);
         }
     }
 
@@ -3234,7 +3293,8 @@ public final class EmptyPhysicsLevel implements AutoCloseable {
                         }
                         final BlockPos pos = new BlockPos(x, y, z);
                         if (!level.getBlockState(pos).isAir()) {
-                            level.setBlock(pos, air, 2);
+                            // Clearing the copy must not break attachments or drop inventories.
+                            level.setBlock(pos, air, REGION_COPY_FLAGS);
                         }
                     }
                 }

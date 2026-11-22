@@ -5,9 +5,10 @@ import io.mikaple.crythst.physics.material.PhysicsMaterial;
 import io.mikaple.crythst.physics.voxel.IntBounds3;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import org.jetbrains.annotations.Nullable;
 
 /**
- * Editable, stateful volume used when a persisted structure is restored.
+ * Editable, stateful volume for restored structures and split components.
  *
  * <p>Keeping the block states on the volume itself is important: the auxiliary
  * ticking level copies blocks during {@code PhysicsStructure} construction,
@@ -20,16 +21,14 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
     private final PhysicsMaterial[] materials;
     /** Lazily populated overrides; the source snapshot provides the base state. */
     private final BlockState[] states;
-    private final SavedStructureVolume source;
+    private final @Nullable SavedStructureVolume source;
+
+    public RestoredStructureVolume(IntBounds3 bounds) {
+        this(bounds, null);
+    }
 
     public RestoredStructureVolume(SavedStructureVolume snapshot) {
-        this.source = snapshot;
-        this.bounds = snapshot.bounds();
-        final int cells = Math.toIntExact(bounds.volume());
-        this.solid = new boolean[cells];
-        this.mass = new double[cells];
-        this.materials = new PhysicsMaterial[cells];
-        this.states = new BlockState[cells];
+        this(snapshot.bounds(), snapshot);
         for (int y = bounds.minY(); y < bounds.maxY(); y++) {
             for (int z = bounds.minZ(); z < bounds.maxZ(); z++) {
                 for (int x = bounds.minX(); x < bounds.maxX(); x++) {
@@ -47,6 +46,16 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
                 }
             }
         }
+    }
+
+    private RestoredStructureVolume(IntBounds3 bounds, @Nullable SavedStructureVolume source) {
+        this.bounds = bounds;
+        this.source = source;
+        final int cells = Math.toIntExact(bounds.volume());
+        this.solid = new boolean[cells];
+        this.mass = new double[cells];
+        this.materials = new PhysicsMaterial[cells];
+        this.states = new BlockState[cells];
     }
 
     @Override
@@ -83,7 +92,7 @@ public final class RestoredStructureVolume implements StatefulVoxelVolume {
         if (!solid[index]) {
             return Blocks.AIR.defaultBlockState();
         }
-        final BlockState sourceState = source.blockState(x, y, z);
+        final BlockState sourceState = source == null ? null : source.blockState(x, y, z);
         return sourceState == null ? Blocks.STONE.defaultBlockState() : sourceState;
     }
 

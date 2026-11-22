@@ -29,6 +29,8 @@ import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.packs.PackType;
@@ -773,24 +775,36 @@ public final class BatchedStructureRenderer {
     }
 
     private static int lightAt(double x, double y, double z) {
-        final Minecraft client = Minecraft.getInstance();
-        if (client.level == null) {
+        final ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
             return LightCoordsUtil.FULL_BRIGHT;
         }
-        try {
-            final BlockPos pos = BlockPos.containing(x, y, z);
-            // A section centre is often inside a solid block (the structure
-            // itself), where the lightmap stores 0. Vanilla samples the
-            // neighbouring air face for a block; take the maximum of the six
-            // neighbours as a cheap, smooth approximation.
-            int light = LightCoordsUtil.getLightCoords(client.level, pos);
-            for (net.minecraft.core.Direction direction : net.minecraft.core.Direction.values()) {
-                light = LightCoordsUtil.max(light,
-                        LightCoordsUtil.getLightCoords(client.level, pos.relative(direction)));
+        final BlockPos pos = BlockPos.containing(x, y, z);
+        // Sample neighbouring air as well as the centre, which may lie inside
+        // terrain. Ignore unavailable columns without brightening real shadows.
+        int light = sampleWorldLight(level, pos);
+        for (Direction direction : Direction.values()) {
+            final int neighbour = sampleWorldLight(level, pos.relative(direction));
+            if (neighbour >= 0) {
+                light = light < 0 ? neighbour : LightCoordsUtil.max(light, neighbour);
             }
+        }
+        if (light >= 0) {
             return light;
+        }
+        return level.dimensionType().hasSkyLight() ? LightCoordsUtil.FULL_SKY : 0;
+    }
+
+    /** Returns -1 for unavailable light data. Zero is a valid sample. */
+    static int sampleWorldLight(Level level, BlockPos pos) {
+        try {
+            if (!level.isLoaded(pos) || !level.getLightEngine()
+                    .lightOnInColumn(SectionPos.getZeroNode(SectionPos.asLong(pos)))) {
+                return -1;
+            }
+            return LightCoordsUtil.getLightCoords(level, pos);
         } catch (RuntimeException ignored) {
-            return LightCoordsUtil.FULL_BRIGHT;
+            return -1;
         }
     }
 }

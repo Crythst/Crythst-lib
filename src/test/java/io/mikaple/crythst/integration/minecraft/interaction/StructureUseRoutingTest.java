@@ -44,6 +44,16 @@ class StructureUseRoutingTest {
     }
 
     @Test
+    void rightClickSwingsOnlyWhenItsResultRequestsAnAnimation() {
+        assertFalse(StructureInteraction.shouldSwingForUse(InteractionResult.PASS));
+        assertFalse(StructureInteraction.shouldSwingForUse(InteractionResult.TRY_WITH_EMPTY_HAND));
+        assertFalse(StructureInteraction.shouldSwingForUse(InteractionResult.FAIL));
+        assertFalse(StructureInteraction.shouldSwingForUse(InteractionResult.CONSUME));
+        assertTrue(StructureInteraction.shouldSwingForUse(InteractionResult.SUCCESS));
+        assertTrue(StructureInteraction.shouldSwingForUse(InteractionResult.SUCCESS_SERVER));
+    }
+
+    @Test
     void realBlockInFrontWins() {
         final StructureBlockHitResult hit = hit(5.0);
         // The structure is 5 blocks away but a real block is only 4 away.

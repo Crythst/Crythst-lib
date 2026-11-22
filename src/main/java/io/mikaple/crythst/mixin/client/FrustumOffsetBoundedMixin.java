@@ -18,7 +18,7 @@ import org.spongepowered.asm.mixin.Shadow;
  */
 @Mixin(Frustum.class)
 public abstract class FrustumOffsetBoundedMixin {
-    /** The 8-block camera cube step used by vanilla's offsetFrustum. */
+    /** Distance moved along the view vector for each vanilla offset iteration. */
     private static final double STEP = 4.0;
     private static final int MAX_OFFSET_ITERATIONS = 256;
 
@@ -42,14 +42,18 @@ public abstract class FrustumOffsetBoundedMixin {
         if (cubeSize <= 0 || this.intersection == null || this.viewVector == null) {
             return (Frustum) (Object) this;
         }
+        final double originalX = this.camX;
+        final double originalY = this.camY;
+        final double originalZ = this.camZ;
+        // Offset the frustum around the cube containing the original camera.
+        // Recomputing the cube as the frustum moves makes it chase the offset.
+        final double minX = Math.floor(originalX / cubeSize) * cubeSize;
+        final double minY = Math.floor(originalY / cubeSize) * cubeSize;
+        final double minZ = Math.floor(originalZ / cubeSize) * cubeSize;
+        final double maxX = Math.ceil(originalX / cubeSize) * cubeSize;
+        final double maxY = Math.ceil(originalY / cubeSize) * cubeSize;
+        final double maxZ = Math.ceil(originalZ / cubeSize) * cubeSize;
         for (int iteration = 0; iteration < MAX_OFFSET_ITERATIONS; iteration++) {
-            final double minX = Math.floor(this.camX / cubeSize) * cubeSize;
-            final double minY = Math.floor(this.camY / cubeSize) * cubeSize;
-            final double minZ = Math.floor(this.camZ / cubeSize) * cubeSize;
-            final double maxX = Math.ceil(this.camX / cubeSize) * cubeSize;
-            final double maxY = Math.ceil(this.camY / cubeSize) * cubeSize;
-            final double maxZ = Math.ceil(this.camZ / cubeSize) * cubeSize;
-
             final int result = this.intersection.intersectAab(
                     (float) (minX - this.camX),
                     (float) (minY - this.camY),
@@ -64,6 +68,9 @@ public abstract class FrustumOffsetBoundedMixin {
             this.camY -= this.viewVector.y * STEP;
             this.camZ -= this.viewVector.z * STEP;
         }
+        this.camX = originalX;
+        this.camY = originalY;
+        this.camZ = originalZ;
         return (Frustum) (Object) this;
     }
 }

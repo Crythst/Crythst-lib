@@ -106,6 +106,147 @@ class StructureMotionSolverTest {
     }
 
     @Test
+    void jumpingIntoAWallKeepsVerticalSpeedAcrossABoxSeam() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 2, 2), box(0, 2, 0, 1, 2, 2)), 1.0);
+        final Vector3d jump = new Vector3d(-0.3, 0.42, 0.0);
+        final StructureMotionSolver.Result result = solve(
+                entityBox(1.0, 0.0, 0.2, 1.6, 1.8, 0.8), jump, true, 0.6, source);
+
+        assertTrue(result.horizontalCollision());
+        assertFalse(result.stepped());
+        assertEquals(0.0, result.motion().x, EPS);
+        assertEquals(jump.y, result.motion().y, EPS);
+        assertEquals(jump.y, StructureMotionSolver.filterVelocity(jump, result.contacts()).y, EPS);
+    }
+
+    @Test
+    void holdingForwardAgainstAWallPreservesExactYOnEveryRisingTick() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 4, 2)), 1.0);
+        Aabb player = entityBox(1.0, 0.0, 0.2, 1.6, 1.8, 0.8);
+        double jumpY = 0.42f;
+        for (int tick = 0; tick < 6; tick++) {
+            final var result = solve(player, new Vector3d(-0.3, jumpY, 0.0), tick == 0, 0.6, source);
+            assertTrue(result.horizontalCollision());
+            assertFalse(result.verticalCollision());
+            assertEquals(jumpY, result.motion().y, "vanilla compares Y exactly on tick " + tick);
+            player = player.offset(result.motion());
+            jumpY = (jumpY - 0.08) * 0.98f;
+        }
+    }
+
+    @Test
+    void nearlyUprightWallDoesNotReportAVerticalCollision() {
+        final Transform3d pose = Transform3d.of(new Vector3d(), new Quaterniond().rotateZ(1.0e-6));
+        final StructureCollisionSource source = source(pose, List.of(box(0, 0, 0, 1, 4, 2)), 1.0);
+        final double jumpY = 0.42f;
+        final var result = solve(entityBox(1.0, 1.5, 0.2, 1.6, 3.3, 0.8),
+                new Vector3d(-0.3, jumpY, 0.0), true, 0.6, source);
+
+        assertTrue(result.horizontalCollision());
+        assertFalse(result.verticalCollision());
+        assertEquals(jumpY, result.motion().y);
+    }
+
+    @Test
+    void pressingAgainstASteepWallDoesNotInterruptTheFall() {
+        final Transform3d pose = Transform3d.of(new Vector3d(), new Quaterniond().rotateZ(Math.toRadians(8.0)));
+        final StructureCollisionSource source = source(pose, List.of(box(0, 0, 0, 1, 8, 2)), 1.0);
+        final Vector3d motion = new Vector3d(-0.2, -0.17, 0.0);
+        final var result = solve(entityBox(0.61, 3.0, 0.2, 1.21, 4.8, 0.8), motion,
+                false, 0.6, source);
+
+        assertTrue(result.horizontalCollision());
+        assertFalse(result.verticalCollisionBelow());
+        assertFalse(result.support());
+        assertEquals(motion.y, result.motion().y);
+        assertEquals(motion.y, StructureMotionSolver.filterVelocity(motion, result.contacts()).y);
+    }
+
+    @Test
+    void fallingBesideTheUpperEdgeOfASteepFaceDoesNotLandOnItsWorldBounds() {
+        final Transform3d pose = Transform3d.of(new Vector3d(), new Quaterniond().rotateX(Math.toRadians(75.0)));
+        final StructureCollisionSource source = source(pose, List.of(box(0, 0, 0, 2, 1, 8)), 1.0);
+        final Vector3d motion = new Vector3d(0.0, -0.16, -0.004);
+        final Aabb player = entityBox(0.2, 0.265, 0.971, 0.8, 2.065, 1.571);
+        for (boolean onGround : new boolean[]{false, true}) {
+            final var result = solve(player, motion, onGround, 0.6, source);
+            assertTrue(result.horizontalCollision());
+            assertFalse(result.support());
+            assertFalse(result.stepped());
+            assertEquals(motion.y, result.motion().y);
+        }
+    }
+
+    @Test
+    void fallingOntoTheShallowFaceOfTheSameTiltedWallStillLands() {
+        final Transform3d pose = Transform3d.of(new Vector3d(), new Quaterniond().rotateX(Math.toRadians(75.0)));
+        final StructureCollisionSource source = source(pose, List.of(box(0, 0, 0, 2, 1, 8)), 1.0);
+        final Vector3d motion = new Vector3d(0.0, -0.4, 0.0);
+        final var result = solve(entityBox(0.2, 0.4, 0.3, 0.8, 2.2, 0.9), motion,
+                false, 0.6, source);
+
+        assertTrue(result.verticalCollisionBelow());
+        assertTrue(result.support());
+        assertTrue(result.contacts().getFirst().normal().y > 0.9);
+    }
+
+    @Test
+    void fallingAlongASeamInAVerticalWallDoesNotLandOnTheLowerBox() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 2, 2), box(0, 2, 0, 1, 2, 2)), 1.0);
+        final Vector3d motion = new Vector3d(-0.2, -0.17, 0.0);
+        final var result = solve(entityBox(1.0, 2.01, 0.2, 1.6, 3.81, 0.8), motion,
+                false, 0.6, source);
+
+        assertTrue(result.horizontalCollision());
+        assertFalse(result.support());
+        assertEquals(motion.y, result.motion().y);
+    }
+
+    @Test
+    void grazingASeamWithSlowInwardMotionDoesNotBrieflyStopTheFall() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 2, 2), box(0, 2, 0, 1, 2, 2)), 1.0);
+        Aabb player = entityBox(0.9995, 2.005, 0.2, 1.5995, 3.805, 0.8);
+        final Vector3d motion = new Vector3d(-0.004, -0.06, 0.05);
+        for (int tick = 0; tick < 4; tick++) {
+            final var result = solve(player, motion, false, 0.6, source);
+            assertFalse(result.verticalCollision(), "unexpected contact on tick " + tick);
+            assertEquals(motion.y, result.motion().y);
+            assertEquals(motion.z, result.motion().z);
+            player = player.offset(result.motion());
+        }
+    }
+
+    @Test
+    void slidingAlongAWallDoesNotCatchOnTheNextBox() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 4, 2), box(0, 0, 2, 1, 4, 2)), 1.0);
+        final Vector3d motion = new Vector3d(-0.08, 0.0, 0.10);
+        final var result = solve(entityBox(1.0, 1.0, 1.39, 1.6, 2.8, 1.99), motion,
+                false, 0.6, source);
+
+        assertTrue(result.horizontalCollision());
+        assertEquals(motion.z, result.motion().z);
+        assertEquals(motion.z, StructureMotionSolver.filterVelocity(motion, result.contacts()).z);
+    }
+
+    @Test
+    void jumpingIntoAWallStillStopsUnderARealCeiling() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 0, 0, 1, 4, 2), box(1, 2, 0, 2, 1, 2)), 1.0);
+        final Vector3d jump = new Vector3d(-0.3, 0.42, 0.0);
+        final StructureMotionSolver.Result result = solve(
+                entityBox(1.0, 0.0, 0.2, 1.6, 1.8, 0.8), jump, true, 0.6, source);
+
+        assertEquals(0.0, result.motion().x, EPS);
+        assertEquals(0.2, result.motion().y, EPS);
+        assertEquals(0.0, StructureMotionSolver.filterVelocity(jump, result.contacts()).y, EPS);
+    }
+
+    @Test
     void floorProvidesSupportWithoutSidewaysPush() {
         final StructureCollisionSource source = source(Transform3d.identity(),
                 List.of(box(0, 0, 0, 4, 1, 4)), 1.0);
@@ -172,6 +313,21 @@ class StructureMotionSolverTest {
         assertTrue(result.motion().y > 0.5, "step lift is part of the allowed motion: "
                 + result.motion());
         assertTrue(result.motion().x < 0.0, "forward motion continues after the step");
+    }
+
+    @Test
+    void contactFreeStepUpStillUsesTheSolvedMotion() {
+        final StructureCollisionSource source = source(Transform3d.identity(),
+                List.of(box(0, 1, 0, 1, 1, 8)), 0.5);
+        final StructureMotionSolver.Result result = solve(
+                entityBox(0.51, 0.5, 0.2, 1.11, 2.3, 0.8),
+                new Vector3d(-0.2, 0.0, 0.0),
+                true, 0.6, source);
+
+        assertTrue(result.stepped());
+        assertTrue(result.contacts().isEmpty());
+        assertTrue(result.touched(), "the movement path must retain the step-up");
+        assertEquals(0.6, result.motion().y, 1.0e-9);
     }
 
     @Test
